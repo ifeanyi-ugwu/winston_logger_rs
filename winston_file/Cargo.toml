@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2024"
 description = "file transport for winston"
 license = "MIT"
+repository = "https://github.com/ifeanyi-ugwu/winston_file"
 
 [dependencies]
 logform = { version = "0.6.2", path = "../logform" }
