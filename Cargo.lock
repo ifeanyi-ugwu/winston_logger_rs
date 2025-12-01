@@ -1255,18 +1255,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "logform"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d936781a5851d944659e4a8634ce6dcfa892baa6bb9cf387c792fee4193632da"
-dependencies = [
- "chrono",
- "colored",
- "regex",
- "serde_json",
-]
-
-[[package]]
 name = "macro_magic"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3143,13 +3131,13 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "log",
- "logform 0.6.2",
+ "logform",
  "parking_lot",
  "serde",
  "serde_json",
  "serial_test",
- "winston_file 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "winston_transport 0.6.0",
+ "winston_file",
+ "winston_transport",
 ]
 
 [[package]]
@@ -3158,42 +3146,30 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "flate2",
- "logform 0.6.2",
+ "logform",
  "tempfile",
- "winston_transport 0.6.0",
+ "winston_transport",
 ]
 
 [[package]]
 name = "winston_file"
 version = "0.2.0"
 dependencies = [
- "logform 0.6.2",
+ "logform",
  "serde_json",
- "winston_proxy_transport 0.4.0",
- "winston_transport 0.6.0",
-]
-
-[[package]]
-name = "winston_file"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79f5dd72a6fb5f491a61c3de7417a27e9ae23be4a4147161335dc83ad07fcf"
-dependencies = [
- "logform 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde_json",
- "winston_proxy_transport 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "winston_transport 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "winston_proxy_transport",
+ "winston_transport",
 ]
 
 [[package]]
 name = "winston_http"
 version = "0.3.0"
 dependencies = [
- "logform 0.6.2",
+ "logform",
  "reqwest",
  "serde_json",
- "winston_proxy_transport 0.4.0",
- "winston_transport 0.6.0",
+ "winston_proxy_transport",
+ "winston_transport",
 ]
 
 [[package]]
@@ -3204,30 +3180,20 @@ dependencies = [
  "chrono",
  "dotenv",
  "futures",
- "logform 0.6.2",
+ "logform",
  "mongodb",
  "serde",
  "serde_json",
  "tokio",
- "winston_transport 0.6.0",
+ "winston_transport",
 ]
 
 [[package]]
 name = "winston_proxy_transport"
 version = "0.4.0"
 dependencies = [
- "logform 0.6.2",
- "winston_transport 0.6.0",
-]
-
-[[package]]
-name = "winston_proxy_transport"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afe06865efbed7213d7cbebf2319b811ef337d2392ea85c617aac29a5b1b7af3"
-dependencies = [
- "logform 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "winston_transport 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "logform",
+ "winston_transport",
 ]
 
 [[package]]
@@ -3237,23 +3203,7 @@ dependencies = [
  "chrono",
  "dateparser",
  "jsonpath-rust",
- "logform 0.6.2",
- "parse_datetime",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "winston_transport"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633b9a0c85c302d1633a8e0192e5d454e2c914a1b3345bbed9478fcd76827324"
-dependencies = [
- "chrono",
- "dateparser",
- "jsonpath-rust",
- "logform 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "logform",
  "parse_datetime",
  "regex",
  "serde",

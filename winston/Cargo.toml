@@ -18,7 +18,7 @@ logform = { version = "0.6.2", path = "../logform" }
 parking_lot = "0.12.3"
 serde = { version = "1.0.208", features = ["derive"] }
 serde_json = "1.0.125"
-winston_file = "0.2.0"
+winston_file = { version = "0.2.0", path = "../winston_file" }
 winston_transport = { version = "0.6.0", path = "../winston_transport" }
 
 [dev-dependencies]
