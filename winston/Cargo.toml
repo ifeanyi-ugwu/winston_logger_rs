@@ -14,12 +14,12 @@ categories = ["development-tools::debugging"]
 chrono = "0.4.38"
 crossbeam-channel = "0.5.13"
 log = { version = "0.4.28", optional = true }
-logform = { version = "0.6.2" }
+logform = { version = "0.6.2", path = "../logform" }
 parking_lot = "0.12.3"
 serde = { version = "1.0.208", features = ["derive"] }
 serde_json = "1.0.125"
 winston_file = "0.2.0"
-winston_transport = { version = "0.6.0" }
+winston_transport = { version = "0.6.0", path = "../winston_transport" }
 
 [dev-dependencies]
 criterion = "0.5.1"
