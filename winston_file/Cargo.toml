@@ -1,0 +1,12 @@
+[package]
+name = "winston_file"
+version = "0.2.0"
+edition = "2024"
+description = "file transport for winston"
+license = "MIT"
+
+[dependencies]
+logform = "0.6.2"
+serde_json = "1.0.145"
+winston_proxy_transport = "0.4.0"
+winston_transport = "0.6.0"

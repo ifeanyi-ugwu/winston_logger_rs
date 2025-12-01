@@ -1,0 +1,20 @@
+[package]
+name = "winston_http"
+version = "0.3.0"
+edition = "2021"
+description = "winston-http for rust"
+license = "MIT"
+documentation = "https://docs.rs/winston_http"
+repository = "https://github.com/ifeanyi-ugwu/winston_http_rs"
+authors = ["ifeanyi ugwu"]
+keywords = ["winston", "transport"]
+categories = ["development-tools::debugging"]
+
+[dependencies]
+logform = { version = "0.6.2", features = ["serde"] }
+reqwest = { version = "0.12.15", features = ["blocking", "json"] }
+winston_proxy_transport = "0.4.0"
+winston_transport = "0.6.0"
+
+[dev-dependencies]
+serde_json = "1.0.140"

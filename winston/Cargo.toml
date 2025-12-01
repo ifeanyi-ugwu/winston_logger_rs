@@ -1,0 +1,38 @@
+[package]
+name = "winston"
+version = "0.7.1"
+edition = "2021"
+description = "winston for rust"
+license = "MIT"
+documentation = "https://docs.rs/winston"
+repository = "https://github.com/ifeanyi-ugwu/winston_rs"
+authors = ["ifeanyi ugwu"]
+keywords = ["winston", "logger", "logging"]
+categories = ["development-tools::debugging"]
+
+[dependencies]
+chrono = "0.4.38"
+crossbeam-channel = "0.5.13"
+log = { version = "0.4.28", optional = true }
+logform = { version = "0.6.2" }
+parking_lot = "0.12.3"
+serde = { version = "1.0.208", features = ["derive"] }
+serde_json = "1.0.125"
+winston_file = "0.2.0"
+winston_transport = { version = "0.6.0" }
+
+[dev-dependencies]
+criterion = "0.5.1"
+serial_test = "3.2.0"
+
+[[bench]]
+name = "logger_benchmark"
+harness = false
+
+[profile.bench]
+debug = true
+
+[features]
+log-backend = ["log"]
+#log-backend-kv = ["log-backend", "log/kv"]
+log-backend-kv = ["log-backend", "log/kv_unstable"]

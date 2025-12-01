@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "logform",
+    "winston",
+    "winston_daily_rotate_file",
+    "winston_file",
+    "winston_http",
+    "winston_mongodb",
+    "winston_proxy_transport",
+    "winston_transport",
+]

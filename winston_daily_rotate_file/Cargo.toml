@@ -1,0 +1,18 @@
+[package]
+name = "winston_daily_rotate_file"
+version = "0.4.0"
+edition = "2021"
+description = "winston-daily-rotate-file for rust"
+license = "MIT"
+documentation = "https://docs.rs/winston_daily_rotate_file"
+repository = "https://github.com/ifeanyi-ugwu/winston_daily_rotate_file_rs"
+authors = ["ifeanyi ugwu"]
+
+[dependencies]
+chrono = "0.4.39"
+flate2 = "1.0.35"
+logform = "0.6.2"
+winston_transport = "0.6.0"
+
+[dev-dependencies]
+tempfile = "3.17.1"
