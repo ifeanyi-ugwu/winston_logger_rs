@@ -1,0 +1,61 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: 'Crate to publish'
+        required: true
+        type: choice
+        options:
+          - logform
+          - winston_transport
+          - winston_file
+          - winston_daily_rotate_file
+          - winston_http
+          - winston_mongodb
+          - winston_proxy_transport
+          - winston
+      level:
+        description: 'Version level'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install cargo-release
+        run: cargo install cargo-release
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo release ${{ inputs.level }} --package ${{ inputs.crate }} --execute --no-confirm
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.crate }}-v${{ steps.version.outputs.version }}
+          generate_release_notes: true
