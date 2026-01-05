@@ -93,6 +93,22 @@ impl LogInfo {
             "meta": self.meta,
         })
     }
+
+    /// Returns a flattened JSON representation where metadata fields are at the root level.
+    /// This is used by transports for consistent serialization and querying.
+    /// Users query fields directly without "meta." prefix.
+    pub fn to_flat_value(&self) -> Value {
+        let mut flat = serde_json::Map::new();
+        flat.insert("level".to_string(), Value::String(self.level.clone()));
+        flat.insert("message".to_string(), Value::String(self.message.clone()));
+
+        // Merge all metadata fields at root level
+        for (key, value) in &self.meta {
+            flat.insert(key.clone(), value.clone());
+        }
+
+        Value::Object(flat)
+    }
 }
 
 #[macro_export]
