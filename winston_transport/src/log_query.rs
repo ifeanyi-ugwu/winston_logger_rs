@@ -6,6 +6,8 @@ use regex::Regex;
 use serde_json::Value;
 use std::str::FromStr;
 
+use crate::query_dsl::dlc::alpha::a::QueryNode;
+
 // todo: the matches, extract_timestamp, and sort methods and functions was
 // created as a result of the FileTransport, there is a high chance it wont be used else where
 // this is as observed when creating the `MongoDDTransport`
@@ -19,6 +21,7 @@ pub struct LogQuery {
     pub levels: Vec<String>,
     pub fields: Vec<String>,
     pub search_term: Option<Regex>,
+    pub filter: Option<QueryNode>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +147,7 @@ impl LogQuery {
             fields: Vec::new(),
             levels: Vec::new(),
             search_term: None,
+            filter: None,
         }
     }
 
@@ -203,6 +207,11 @@ impl LogQuery {
         self
     }
 
+    pub fn filter<T: Into<QueryNode>>(mut self, filter: T) -> Self {
+        self.filter = Some(filter.into());
+        self
+    }
+
     fn extract_timestamp(entry: &LogInfo) -> Option<DateTime<Utc>> {
         entry.meta.get("timestamp").and_then(|value| match value {
             Value::String(ts_str) => parse(&ts_str).ok().map(|dt| dt.with_timezone(&Utc)),
@@ -246,6 +255,13 @@ impl LogQuery {
         // Check search term in message
         if let Some(ref regex) = self.search_term {
             if !regex.is_match(&entry.message) {
+                return false;
+            }
+        }
+
+        // Check DSL filter
+        if let Some(ref filter) = self.filter {
+            if !filter.evaluate(&entry.to_value()) {
                 return false;
             }
         }
@@ -469,5 +485,48 @@ mod test {
             query2.until.unwrap(),
             Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn test_filter_inclusion() {
+        use crate::query_dsl::dlc::alpha::a::prelude::*;
+        use crate::{and, field_logic as fl, field_query as fq};
+        use serde_json::json;
+
+        let query = LogQuery::new()
+            .levels(vec!["info", "error"])
+            .from("2024-04-01T00:00:00Z")
+            .until("2024-04-02T00:00:00Z")
+            .search_term("(?i)database")
+            .filter(and!(
+                fq!("meta.user.age", fl!(and, gt(18), lt(65))),
+                fq!("meta.user.status", eq("active"))
+            ))
+            .filter(json!({
+              "$and": [
+                {
+                  "meta.user.age": {
+                    "$and": [
+                      { "$gt": 18 },
+                      { "$lt": 65 }
+                    ]
+                  }
+                },
+                {
+                  "meta.user.status": {
+                    "$eq": "active"
+                  }
+                }
+              ]
+            }));
+
+        let log_entry = LogInfo::from_value(
+            json!({
+                "level": "info",
+                "message": "Database connection established",
+                "meta": { "user": { "age": 30, "status": "active" }, "timestamp": "2024-04-01T12:30:00Z" }}),
+        ).unwrap();
+
+        assert!(query.matches(&log_entry));
     }
 }
