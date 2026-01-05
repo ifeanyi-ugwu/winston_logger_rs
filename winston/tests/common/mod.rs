@@ -107,7 +107,21 @@ impl Transport<LogInfo> for MockTransport {
         let logs = self.logs.lock().unwrap();
         Ok(logs
             .iter()
-            .filter(|log| options.matches(log))
+            .filter(|log| {
+                // Check level filtering
+                if !options.levels.is_empty() && !options.levels.contains(&log.level) {
+                    return false;
+                }
+
+                // Check DSL filter if present
+                if let Some(ref filter) = options.filter {
+                    if !filter.evaluate(&log.to_flat_value()) {
+                        return false;
+                    }
+                }
+
+                true
+            })
             .cloned()
             .collect())
     }
