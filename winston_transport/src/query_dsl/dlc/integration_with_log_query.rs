@@ -158,7 +158,7 @@ impl LogQuery {
         true
     }
 
-    pub fn sort(&self, entries: &mut Vec<LogInfo>) {
+    pub fn sort(&self, entries: &mut [LogInfo]) {
         match self.order {
             Order::Ascending => {
                 entries.sort_by(|a, b| Self::extract_timestamp(a).cmp(&Self::extract_timestamp(b)))

@@ -128,11 +128,8 @@ impl FromStr for FieldPath {
                                 None
                             } else if part == "*]" {
                                 Some(PathSegment::ArrayWildcard)
-                            } else if part.ends_with(']') {
-                                part[..part.len() - 1]
-                                    .parse()
-                                    .map(PathSegment::ArrayIndex)
-                                    .ok()
+                            } else if let Some(stripped) = part.strip_suffix(']') {
+                                stripped.parse().map(PathSegment::ArrayIndex).ok()
                             } else {
                                 Some(PathSegment::Field(part.to_string()))
                             }
@@ -177,8 +174,8 @@ mod tests {
             (Value::Array(actual_arr), Value::Array(expected_arr)) => {
                 let mut actual_sorted = actual_arr.clone();
                 let mut expected_sorted = expected_arr.clone();
-                actual_sorted.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
-                expected_sorted.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+                actual_sorted.sort_by_key(|a| a.to_string());
+                expected_sorted.sort_by_key(|a| a.to_string());
 
                 assert_eq!(actual_sorted, expected_sorted, "{context}");
             }
@@ -231,7 +228,7 @@ mod tests {
         let result = field_path.extract(&json_data);
 
         assert_json_eq(
-            &Some(Value::Array(vec![
+            &Value::Array(vec![
                 Value::String("Alice".into()),
                 Value::Object(
                     serde_json::json!({ "city": "NY", "zipcode": "10001" })
@@ -240,8 +237,7 @@ mod tests {
                         .clone(),
                 ),
                 Value::Number(30.into()),
-            ]))
-            .unwrap(),
+            ]),
             &result.unwrap(),
             format!("Failed for path: {}", "user.*").as_str(),
         );

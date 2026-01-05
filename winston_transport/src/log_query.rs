@@ -263,11 +263,11 @@ mod test {
             second: u32,
         }
 
-        impl Into<DateTime<Utc>> for MyCustomTimeInput {
-            fn into(self) -> DateTime<Utc> {
-                let naive = NaiveDate::from_ymd_opt(self.year, self.month, self.day)
+        impl From<MyCustomTimeInput> for DateTime<Utc> {
+            fn from(val: MyCustomTimeInput) -> Self {
+                let naive = NaiveDate::from_ymd_opt(val.year, val.month, val.day)
                     .unwrap()
-                    .and_hms_opt(self.hour, self.minute, self.second)
+                    .and_hms_opt(val.hour, val.minute, val.second)
                     .unwrap();
                 Utc.from_utc_datetime(&naive)
             }
