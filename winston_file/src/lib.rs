@@ -135,15 +135,17 @@ impl FileTransport {
 
         // Check search term in message
         if let Some(ref regex) = query.search_term
-            && !regex.is_match(&entry.message) {
-                return false;
-            }
+            && !regex.is_match(&entry.message)
+        {
+            return false;
+        }
 
         // Check DSL filter
         if let Some(ref filter) = query.filter
-            && !filter.evaluate(&entry.to_flat_value()) {
-                return false;
-            }
+            && !filter.evaluate(&entry.to_flat_value())
+        {
+            return false;
+        }
 
         true
     }
@@ -206,17 +208,18 @@ impl Transport<LogInfo> for FileTransport {
         for (index, line) in reader.lines().enumerate() {
             let line = line.map_err(|e| format!("Failed to read line {}: {}", index, e))?;
             if let Some(entry) = self.parse_log_entry(&line)
-                && self.matches_query(query, &entry) {
-                    // Skip lines until the start position
-                    if index >= start {
-                        results.push(entry);
-                    }
-
-                    // Stop reading if the limit is reached
-                    if results.len() >= limit && limit != 0 {
-                        break;
-                    }
+                && self.matches_query(query, &entry)
+            {
+                // Skip lines until the start position
+                if index >= start {
+                    results.push(entry);
                 }
+
+                // Stop reading if the limit is reached
+                if results.len() >= limit && limit != 0 {
+                    break;
+                }
+            }
         }
 
         // Apply sorting to the results
@@ -266,9 +269,10 @@ impl Drop for FileTransport {
     fn drop(&mut self) {
         // Attempt to flush any remaining logs before dropping
         if let Ok(mut file) = self.file.lock()
-            && let Err(e) = file.flush() {
-                eprintln!("Error flushing log file during drop: {}", e);
-            }
+            && let Err(e) = file.flush()
+        {
+            eprintln!("Error flushing log file during drop: {}", e);
+        }
     }
 }
 

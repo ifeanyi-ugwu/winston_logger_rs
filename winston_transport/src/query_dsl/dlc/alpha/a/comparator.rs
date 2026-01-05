@@ -42,11 +42,7 @@ impl Comparator {
         self.evaluate(vec![field_value], expected_value)
     }
 
-    pub fn evaluate(
-        &self,
-        field_value: Vec<&Value>,
-        expected_value: &Option<QueryValue>,
-    ) -> bool {
+    pub fn evaluate(&self, field_value: Vec<&Value>, expected_value: &Option<QueryValue>) -> bool {
         for val in field_value {
             match (self, expected_value) {
                 (Comparator::Equals, Some(expected)) => {

@@ -29,7 +29,6 @@ pub fn colors() -> HashMap<String, String> {
 }
 */
 pub fn levels() -> HashMap<String, usize> {
-    
     HashMap::from([
         ("error".to_string(), 0),
         ("warn".to_string(), 1),
@@ -40,7 +39,6 @@ pub fn levels() -> HashMap<String, usize> {
 }
 
 pub fn colors() -> HashMap<String, String> {
-    
     HashMap::from([
         ("error".to_string(), "red".to_string()),
         ("warn".to_string(), "yellow".to_string()),
