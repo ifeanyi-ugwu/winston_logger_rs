@@ -1,12 +1,15 @@
 //use std::collections::HashMap;
+use chrono::{DateTime, Utc};
+use dateparser::parse;
 use logform::{Format, LogInfo};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use winston_proxy_transport::Proxy;
-use winston_transport::{LogQuery, Transport};
+use winston_transport::{LogQuery, Order, Transport};
 
 pub struct FileTransportOptions {
     pub level: Option<String>,
@@ -91,6 +94,73 @@ impl FileTransport {
             meta,
         })
     }
+
+    /// Extracts timestamp from a log entry's metadata.
+    /// Returns None if timestamp is missing or cannot be parsed.
+    fn extract_timestamp(entry: &LogInfo) -> Option<DateTime<Utc>> {
+        entry.meta.get("timestamp").and_then(|value| match value {
+            Value::String(ts_str) => parse(&ts_str).ok().map(|dt| dt.with_timezone(&Utc)),
+            _ => None,
+        })
+    }
+
+    /// Checks if a log entry matches all query criteria.
+    /// Evaluates level, timestamp range, search term, and DSL filter.
+    fn matches_query(&self, query: &LogQuery, entry: &LogInfo) -> bool {
+        // Check level
+        if !query.levels.is_empty() && !query.levels.contains(&entry.level) {
+            return false;
+        }
+
+        // Check timestamp range
+        if let Some(from) = query.from {
+            if let Some(timestamp) = Self::extract_timestamp(entry) {
+                if timestamp < from {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        if let Some(until) = query.until {
+            if let Some(timestamp) = Self::extract_timestamp(entry) {
+                if timestamp > until {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        // Check search term in message
+        if let Some(ref regex) = query.search_term {
+            if !regex.is_match(&entry.message) {
+                return false;
+            }
+        }
+
+        // Check DSL filter
+        if let Some(ref filter) = query.filter {
+            if !filter.evaluate(&entry.to_flat_value()) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Sorts log entries by timestamp according to query order.
+    fn sort_results(&self, query: &LogQuery, entries: &mut Vec<LogInfo>) {
+        match query.order {
+            Order::Ascending => {
+                entries.sort_by(|a, b| Self::extract_timestamp(a).cmp(&Self::extract_timestamp(b)))
+            }
+            Order::Descending => {
+                entries.sort_by(|a, b| Self::extract_timestamp(b).cmp(&Self::extract_timestamp(a)))
+            }
+        }
+    }
 }
 
 impl Transport<LogInfo> for FileTransport {
@@ -138,7 +208,7 @@ impl Transport<LogInfo> for FileTransport {
         for (index, line) in reader.lines().enumerate() {
             let line = line.map_err(|e| format!("Failed to read line {}: {}", index, e))?;
             if let Some(entry) = self.parse_log_entry(&line) {
-                if query.matches(&entry) {
+                if self.matches_query(query, &entry) {
                     // Skip lines until the start position
                     if index >= start {
                         results.push(entry);
@@ -153,7 +223,7 @@ impl Transport<LogInfo> for FileTransport {
         }
 
         // Apply sorting to the results
-        query.sort(&mut results);
+        self.sort_results(query, &mut results);
 
         // Project fields if specified
         let results = if !query.fields.is_empty() {

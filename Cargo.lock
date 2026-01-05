@@ -3155,6 +3155,8 @@ dependencies = [
 name = "winston_file"
 version = "0.2.0"
 dependencies = [
+ "chrono",
+ "dateparser",
  "logform",
  "serde_json",
  "winston_proxy_transport",
