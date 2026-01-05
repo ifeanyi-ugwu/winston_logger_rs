@@ -130,22 +130,10 @@ macro_rules! log_info {
 
 impl fmt::Display for LogInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.level, self.message)?;
-
-        if !self.meta.is_empty() {
-            write!(f, " {{")?;
-            let mut first = true;
-            for (key, value) in &self.meta {
-                if !first {
-                    write!(f, ", ")?;
-                }
-                write!(f, "{}: {}", key, value)?;
-                first = false;
-            }
-            write!(f, "}}")?;
-        }
-
-        Ok(())
+        // Only write the message field, which has already been formatted by formatters.
+        // Formatters are responsible for including level, timestamp, and other fields
+        // in the message as needed.
+        write!(f, "{}", self.message)
     }
 }
 
