@@ -479,27 +479,27 @@ impl Comparator {
         false
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn compare_values(&self, actual: &Value, expected: &QueryValue) -> bool {
         match (actual, expected) {
             (Value::String(actual_str), QueryValue::String(expected_str)) => {
                 actual_str == expected_str
             }
             (Value::Number(actual_num), QueryValue::Number(expected_num)) => {
+                // TODO: Refactor number comparison to be lossless.
+                // Current f64 conversion may lose precision for large u64/i64 values.
+                // Consider using serde_json::Number's internal comparison or a decimal crate. i.e probably by storing a string or a serde_json::Number in QueryValue::Number
                 actual_num.as_f64().unwrap_or_default() == *expected_num
             }
             (Value::Bool(actual_bool), QueryValue::Boolean(expected_bool)) => {
                 actual_bool == expected_bool
             }
             (Value::Array(actual_array), QueryValue::Array(expected_array)) => {
-                if actual_array.len() != expected_array.len() {
-                    return false;
-                }
-                for (a, b) in actual_array.iter().zip(expected_array.iter()) {
-                    if !self.compare_values(a, b) {
-                        return false;
-                    }
-                }
-                true
+                actual_array.len() == expected_array.len()
+                    && actual_array
+                        .iter()
+                        .zip(expected_array.iter())
+                        .all(|(a, b)| self.compare_values(a, b))
             }
             (Value::String(actual_str), QueryValue::Regex(expected_regex)) => {
                 expected_regex.is_match(actual_str)
