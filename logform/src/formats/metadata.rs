@@ -11,6 +11,12 @@ pub struct MetadataFormat {
     fill_with: HashSet<String>,
 }
 
+impl Default for MetadataFormat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetadataFormat {
     pub fn new() -> Self {
         MetadataFormat {

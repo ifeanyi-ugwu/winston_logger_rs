@@ -146,7 +146,7 @@ impl Proxy<LogInfo> for HttpTransport {
                 .filter_map(|log| fmt.transform(log.clone()))
                 .collect()
         } else {
-            logs.iter().cloned().collect()
+            logs.to_vec()
         };
 
         // Convert to flat representation for consistent serialization
@@ -175,6 +175,12 @@ impl Proxy<LogInfo> for HttpTransport {
 
 pub struct HttpTransportBuilder {
     options: HttpTransportOptions,
+}
+
+impl Default for HttpTransportBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpTransportBuilder {

@@ -99,7 +99,7 @@ impl FileTransport {
     /// Returns None if timestamp is missing or cannot be parsed.
     fn extract_timestamp(entry: &LogInfo) -> Option<DateTime<Utc>> {
         entry.meta.get("timestamp").and_then(|value| match value {
-            Value::String(ts_str) => parse(&ts_str).ok().map(|dt| dt.with_timezone(&Utc)),
+            Value::String(ts_str) => parse(ts_str).ok().map(|dt| dt.with_timezone(&Utc)),
             _ => None,
         })
     }
@@ -134,18 +134,16 @@ impl FileTransport {
         }
 
         // Check search term in message
-        if let Some(ref regex) = query.search_term {
-            if !regex.is_match(&entry.message) {
+        if let Some(ref regex) = query.search_term
+            && !regex.is_match(&entry.message) {
                 return false;
             }
-        }
 
         // Check DSL filter
-        if let Some(ref filter) = query.filter {
-            if !filter.evaluate(&entry.to_flat_value()) {
+        if let Some(ref filter) = query.filter
+            && !filter.evaluate(&entry.to_flat_value()) {
                 return false;
             }
-        }
 
         true
     }
@@ -207,8 +205,8 @@ impl Transport<LogInfo> for FileTransport {
 
         for (index, line) in reader.lines().enumerate() {
             let line = line.map_err(|e| format!("Failed to read line {}: {}", index, e))?;
-            if let Some(entry) = self.parse_log_entry(&line) {
-                if self.matches_query(query, &entry) {
+            if let Some(entry) = self.parse_log_entry(&line)
+                && self.matches_query(query, &entry) {
                     // Skip lines until the start position
                     if index >= start {
                         results.push(entry);
@@ -219,7 +217,6 @@ impl Transport<LogInfo> for FileTransport {
                         break;
                     }
                 }
-            }
         }
 
         // Apply sorting to the results
@@ -268,11 +265,10 @@ impl Transport<LogInfo> for FileTransport {
 impl Drop for FileTransport {
     fn drop(&mut self) {
         // Attempt to flush any remaining logs before dropping
-        if let Ok(mut file) = self.file.lock() {
-            if let Err(e) = file.flush() {
+        if let Ok(mut file) = self.file.lock()
+            && let Err(e) = file.flush() {
                 eprintln!("Error flushing log file during drop: {}", e);
             }
-        }
     }
 }
 
@@ -384,6 +380,12 @@ pub struct FileTransportBuilder {
     level: Option<String>,
     format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     filename: Option<PathBuf>,
+}
+
+impl Default for FileTransportBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FileTransportBuilder {

@@ -106,7 +106,7 @@ where
 
         let flush_batch = |batch: &mut Vec<L>| -> Result<(), String> {
             if !batch.is_empty() {
-                transport.log_batch(batch.drain(..).collect());
+                transport.log_batch(std::mem::take(batch));
                 transport.flush() // propagate flush error
             } else {
                 Ok(())

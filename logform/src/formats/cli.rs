@@ -8,6 +8,12 @@ pub struct CliFormat {
     padder: Padder,
 }
 
+impl Default for CliFormat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CliFormat {
     pub fn new() -> Self {
         let levels: HashSet<String> = config::cli::levels().into_keys().collect();

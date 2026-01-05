@@ -10,6 +10,12 @@ pub struct LoggerBuilder {
     options: LoggerOptions,
 }
 
+impl Default for LoggerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoggerBuilder {
     pub fn new() -> Self {
         LoggerBuilder {

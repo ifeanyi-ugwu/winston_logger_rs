@@ -7,7 +7,7 @@ pub struct FieldPath {
 }
 
 impl FieldPath {
-    pub fn extract<'a>(&self, value: &'a Value) -> Option<Value> {
+    pub fn extract(&self, value: &Value) -> Option<Value> {
         let mut current_values = vec![value];
 
         for segment in &self.segments {

@@ -40,6 +40,12 @@ pub struct Colorizer {
     message: bool,
 }
 
+impl Default for Colorizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Colorizer {
     fn init_colors() {
         INIT.call_once(|| {

@@ -82,7 +82,7 @@ where
 
         self.transport
             .flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(|e| io::Error::other(e))
     }
 }
 
@@ -169,7 +169,7 @@ where
 
         self.transport
             .flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(|e| io::Error::other(e))
     }
 }
 

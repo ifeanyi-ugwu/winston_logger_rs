@@ -39,6 +39,12 @@ impl FromStr for Order {
     }
 }
 
+impl Default for LogQuery {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogQuery {
     pub fn new() -> Self {
         LogQuery {
@@ -107,7 +113,7 @@ impl LogQuery {
 
     fn extract_timestamp(entry: &LogInfo) -> Option<DateTime<Utc>> {
         entry.meta.get("timestamp").and_then(|value| match value {
-            Value::String(ts_str) => parse(&ts_str).ok().map(|dt| dt.with_timezone(&Utc)),
+            Value::String(ts_str) => parse(ts_str).ok().map(|dt| dt.with_timezone(&Utc)),
             _ => None,
         })
     }

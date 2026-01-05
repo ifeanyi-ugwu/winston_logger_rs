@@ -8,6 +8,12 @@ pub struct PrettyPrinter {
     colorize: bool,
 }
 
+impl Default for PrettyPrinter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PrettyPrinter {
     pub fn new() -> Self {
         PrettyPrinter { colorize: false }

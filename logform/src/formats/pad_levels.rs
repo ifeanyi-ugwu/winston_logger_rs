@@ -10,6 +10,12 @@ pub struct Padder {
     paddings: HashMap<String, String>,
 }
 
+impl Default for Padder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Padder {
     pub fn new() -> Self {
         let levels: HashSet<String> = crate::config::rust::levels().into_keys().collect();

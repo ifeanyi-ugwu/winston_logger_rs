@@ -180,7 +180,7 @@ impl Logger {
                             .options
                             .transports
                             .as_ref()
-                            .map_or(false, |t| !t.is_empty())
+                            .is_some_and(|t| !t.is_empty())
                     };
 
                     if !has_transports {
@@ -233,7 +233,7 @@ impl Logger {
                         .options
                         .transports
                         .as_ref()
-                        .map_or(false, |t| !t.is_empty())
+                        .is_some_and(|t| !t.is_empty())
                     {
                         drop(state); // Release read lock
                         Self::process_buffered_entries(&shared_state, &buffer);
@@ -285,7 +285,7 @@ impl Logger {
         if let Some(transports) = &options.transports {
             for (_handle, transport) in transports {
                 // Check if this transport cares about the level
-                let effective_level = transport.get_level().or_else(|| options.level.as_ref());
+                let effective_level = transport.get_level().or(options.level.as_ref());
 
                 if let (Some(levels), Some(effective_level)) = (&options.levels, effective_level) {
                     if let (Some(entry_sev), Some(required_sev)) = (

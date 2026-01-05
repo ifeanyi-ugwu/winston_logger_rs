@@ -91,8 +91,8 @@ impl FieldNode {
         match self {
             FieldNode::Comparison(comp) => comp.evaluate(field_value),
             FieldNode::Logic(logic) => match logic.operator {
-                LogicalOperator::And => logic.conditions.iter().all(|c| c.evaluate(&field_value)),
-                LogicalOperator::Or => logic.conditions.iter().any(|c| c.evaluate(&field_value)),
+                LogicalOperator::And => logic.conditions.iter().all(|c| c.evaluate(field_value)),
+                LogicalOperator::Or => logic.conditions.iter().any(|c| c.evaluate(field_value)),
             },
         }
     }
