@@ -459,7 +459,10 @@ mod tests {
                             log_entry1.get("message").and_then(Value::as_str),
                             Some("Test log 1 in batch")
                         );
-                        assert!(log_entry1.get("timestamp").is_some(),"Timestamp should be at root level");
+                        assert!(
+                            log_entry1.get("timestamp").is_some(),
+                            "Timestamp should be at root level"
+                        );
                     }
                     if let Some(log_entry2) = batch_array.get(1) {
                         assert_eq!(
@@ -470,7 +473,10 @@ mod tests {
                             log_entry2.get("message").and_then(Value::as_str),
                             Some("Test log 2 in batch")
                         );
-                        assert!(log_entry2.get("timestamp").is_some(),"Timestamp should be at root level");
+                        assert!(
+                            log_entry2.get("timestamp").is_some(),
+                            "Timestamp should be at root level"
+                        );
                     }
                 } else {
                     panic!("Received data is not an array as expected for batching");
@@ -516,7 +522,10 @@ mod tests {
                 if let Some(msg) = entry.get("message").and_then(Value::as_str) {
                     if msg == "Test log for flush" {
                         assert_eq!(entry.get("level").and_then(Value::as_str), Some("info"));
-                        assert!(entry.get("timestamp").is_some(),"Timestamp should be at root level");
+                        assert!(
+                            entry.get("timestamp").is_some(),
+                            "Timestamp should be at root level"
+                        );
                         found_log = true;
                         break;
                     }
@@ -607,7 +616,10 @@ mod tests {
                 body.get("message").and_then(Value::as_str),
                 Some("Test with custom headers")
             );
-            assert!(body.get("timestamp").is_some(),"Timestamp should be at root level");
+            assert!(
+                body.get("timestamp").is_some(),
+                "Timestamp should be at root level"
+            );
         }
 
         drop(transport);
