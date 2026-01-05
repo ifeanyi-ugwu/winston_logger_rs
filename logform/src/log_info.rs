@@ -251,7 +251,8 @@ mod display_tests {
     #[test]
     fn test_display_without_meta() {
         let log = LogInfo::new("INFO", "Test message");
-        assert_eq!(format!("{}", log), "[INFO] Test message");
+        // Display only outputs the message field (formatters handle full formatting)
+        assert_eq!(format!("{}", log), "Test message");
     }
 
     #[test]
@@ -260,10 +261,9 @@ mod display_tests {
             .with_meta("retry", 3)
             .with_meta("host", "example.com");
 
+        // Display only outputs the message field (formatters handle full formatting)
         let display = format!("{}", log);
-        assert!(display.starts_with("[ERROR] Connection failed {"));
-        assert!(display.contains("retry: 3"));
-        assert!(display.contains("host: \"example.com\""));
+        assert_eq!(display, "Connection failed");
     }
 
     #[test]
