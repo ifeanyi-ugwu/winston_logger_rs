@@ -67,10 +67,16 @@ impl HttpTransport {
         }
 
         // Send single log or batch of logs
+        // Convert to flat representation for consistent serialization
         let response = if formatted_logs.len() == 1 {
-            request.json(&formatted_logs[0])
+            let flat_log = formatted_logs[0].to_flat_value();
+            request.json(&flat_log)
         } else {
-            request.json(&formatted_logs)
+            let flat_logs: Vec<_> = formatted_logs
+                .iter()
+                .map(|log| log.to_flat_value())
+                .collect();
+            request.json(&flat_logs)
         }
         .send()
         .map_err(|e| format!("Failed to send log(s): {}", e))?;
@@ -143,7 +149,13 @@ impl Proxy<LogInfo> for HttpTransport {
             logs.iter().cloned().collect()
         };
 
-        let mut req = self.client.post(&self.options.url).json(&formatted_logs);
+        // Convert to flat representation for consistent serialization
+        let flat_logs: Vec<_> = formatted_logs
+            .iter()
+            .map(|log| log.to_flat_value())
+            .collect();
+
+        let mut req = self.client.post(&self.options.url).json(&flat_logs);
 
         if let Some(headers) = &self.options.headers {
             for (k, v) in headers {
@@ -447,11 +459,7 @@ mod tests {
                             log_entry1.get("message").and_then(Value::as_str),
                             Some("Test log 1 in batch")
                         );
-                        assert!(log_entry1
-                            .get("meta")
-                            .and_then(Value::as_object)
-                            .and_then(|meta| meta.get("timestamp"))
-                            .is_some());
+                        assert!(log_entry1.get("timestamp").is_some(),"Timestamp should be at root level");
                     }
                     if let Some(log_entry2) = batch_array.get(1) {
                         assert_eq!(
@@ -462,11 +470,7 @@ mod tests {
                             log_entry2.get("message").and_then(Value::as_str),
                             Some("Test log 2 in batch")
                         );
-                        assert!(log_entry2
-                            .get("meta")
-                            .and_then(Value::as_object)
-                            .and_then(|meta| meta.get("timestamp"))
-                            .is_some());
+                        assert!(log_entry2.get("timestamp").is_some(),"Timestamp should be at root level");
                     }
                 } else {
                     panic!("Received data is not an array as expected for batching");
@@ -512,11 +516,7 @@ mod tests {
                 if let Some(msg) = entry.get("message").and_then(Value::as_str) {
                     if msg == "Test log for flush" {
                         assert_eq!(entry.get("level").and_then(Value::as_str), Some("info"));
-                        assert!(entry
-                            .get("meta")
-                            .and_then(Value::as_object)
-                            .and_then(|meta| meta.get("timestamp"))
-                            .is_some());
+                        assert!(entry.get("timestamp").is_some(),"Timestamp should be at root level");
                         found_log = true;
                         break;
                     }
@@ -607,11 +607,7 @@ mod tests {
                 body.get("message").and_then(Value::as_str),
                 Some("Test with custom headers")
             );
-            assert!(body
-                .get("meta")
-                .and_then(Value::as_object)
-                .and_then(|meta| meta.get("timestamp"))
-                .is_some());
+            assert!(body.get("timestamp").is_some(),"Timestamp should be at root level");
         }
 
         drop(transport);
