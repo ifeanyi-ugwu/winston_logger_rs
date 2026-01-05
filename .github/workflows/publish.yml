@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       crate:
-        description: 'Crate to publish'
+        description: "Crate to publish"
         required: true
         type: choice
         options:
@@ -17,13 +17,17 @@ on:
           - winston_proxy_transport
           - winston
       level:
-        description: 'Version level'
+        description: "Version level"
         required: true
         type: choice
         options:
           - patch
           - minor
           - major
+          - alpha
+          - beta
+          - rc
+          - release
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,9 +57,3 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo release ${{ inputs.level }} --package ${{ inputs.crate }} --execute --no-confirm
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ inputs.crate }}-v${{ steps.version.outputs.version }}
-          generate_release_notes: true
