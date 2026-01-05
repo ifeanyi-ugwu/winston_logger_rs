@@ -11,7 +11,7 @@ use std::{
 enum TransportMessage<L> {
     Log(L),
     Flush(Sender<Result<(), String>>),
-    Query(LogQuery, Sender<Result<Vec<L>, String>>),
+    Query(Box<LogQuery>, Sender<Result<Vec<L>, String>>),
     Shutdown,
 }
 
@@ -128,7 +128,10 @@ where
         let (response_sender, response_receiver) = mpsc::channel();
 
         self.sender
-            .send(TransportMessage::Query(options.clone(), response_sender))
+            .send(TransportMessage::Query(
+                Box::new(options.clone()),
+                response_sender,
+            ))
             .map_err(|_| "Failed to send query message to background thread")?;
 
         response_receiver
