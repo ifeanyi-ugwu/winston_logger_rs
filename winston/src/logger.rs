@@ -327,19 +327,9 @@ impl Logger {
 
     pub fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
         let state = self.shared_state.read();
-        let buffer = self.buffer.lock().unwrap();
         let mut results = Vec::new();
 
-        // First, query the buffered entries
-        results.extend(
-            buffer
-                .iter()
-                .filter(|entry| options.matches(&***entry))
-                .map(|arc| (**arc).clone())
-                .collect::<Vec<_>>(),
-        );
-
-        // Then, query each transport
+        // Query each transport
         if let Some(transports) = &state.options.transports {
             for (_handle, transport) in transports {
                 match transport.get_transport().query(options) {
