@@ -80,7 +80,7 @@ where
             self.transport.log(log_entry);
         }
 
-        self.transport.flush().map_err(|e| io::Error::other(e))
+        self.transport.flush().map_err(io::Error::other)
     }
 }
 
@@ -165,7 +165,7 @@ where
             self.transport.log(log_entry);
         }
 
-        self.transport.flush().map_err(|e| io::Error::other(e))
+        self.transport.flush().map_err(io::Error::other)
     }
 }
 
