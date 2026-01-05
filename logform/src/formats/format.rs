@@ -45,20 +45,6 @@ mod tests {
         }
     }
 
-    struct NonEmpty;
-
-    impl Format for NonEmpty {
-        type Input = String;
-
-        fn transform(&self, input: String) -> Option<Self::Input> {
-            if input.is_empty() {
-                None
-            } else {
-                Some(input)
-            }
-        }
-    }
-
     struct ReverseFormat;
     impl Format for ReverseFormat {
         type Input = String;

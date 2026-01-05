@@ -153,10 +153,7 @@ impl Format for Colorizer {
     }
 }
 
-fn apply_color<'a>(
-    message: impl Into<colored::ColoredString>,
-    color: &str,
-) -> colored::ColoredString {
+fn apply_color(message: impl Into<colored::ColoredString>, color: &str) -> colored::ColoredString {
     let message = message.into();
     match color {
         "black" => message.black(),
