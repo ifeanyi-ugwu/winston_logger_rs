@@ -182,8 +182,6 @@ fn test_log_backend_mixed_with_winston() {
 #[test]
 #[cfg(feature = "log-backend-kv")]
 fn test_log_backend_with_key_values() {
-    use log::kv::Source;
-
     let transport = MockTransport::new();
 
     let logger = Logger::builder().transport(transport.clone()).build();
