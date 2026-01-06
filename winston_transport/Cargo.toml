@@ -13,7 +13,7 @@ categories = ["development-tools::debugging"]
 [dependencies]
 chrono = "0.4.38"
 dateparser = "0.2.1"
-logform = { version = "0.6.2", path = "../logform" }
+logform.workspace = true
 parse_datetime = "0.6.0"
 regex = "1.11.1"
 serde_json = "1.0.127"

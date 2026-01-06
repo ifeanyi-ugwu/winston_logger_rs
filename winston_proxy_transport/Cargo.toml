@@ -9,5 +9,5 @@ repository = "https://github.com/ifeanyi-ugwu/winston_proxy_transport_rs"
 authors = ["ifeanyi ugwu"]
 
 [dependencies]
-logform = { version = "0.6.2", path = "../logform" }
-winston_transport = { version = "0.7.0", path = "../winston_transport" }
+logform.workspace = true
+winston_transport.workspace = true
