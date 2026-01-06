@@ -84,6 +84,7 @@ fn test_meta_macro_creates_vec() {
 
 #[test]
 fn test_meta_macro_with_different_types() {
+    #[allow(clippy::approx_constant)]
     let metadata = meta!(
         string_val = "text",
         int_val = 42,

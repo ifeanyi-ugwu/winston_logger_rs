@@ -2,7 +2,6 @@ mod common;
 
 use common::{wait_for_logs, MockTransport};
 use logform::LogInfo;
-use std::sync::Arc;
 use winston::{log, BackpressureStrategy, Logger, LoggerOptions};
 
 #[test]

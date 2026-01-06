@@ -27,7 +27,7 @@ fn test_concurrent_logging() {
                 for i in 0..messages_per_thread {
                     logger.log(LogInfo::new(
                         "info",
-                        &format!("Thread {} - Message {}", thread_id, i),
+                        format!("Thread {} - Message {}", thread_id, i),
                     ));
                 }
             })
@@ -64,7 +64,7 @@ fn test_concurrent_add_remove_transport() {
 
                 // Log some messages
                 for i in 0..10 {
-                    logger.log(LogInfo::new("info", &format!("Message {}", i)));
+                    logger.log(LogInfo::new("info", format!("Message {}", i)));
                 }
 
                 logger.flush().unwrap();
@@ -104,7 +104,7 @@ fn test_concurrent_configure() {
                 logger.configure(Some(winston::LoggerOptions::new().level("debug")));
 
                 // Log message
-                logger.log(LogInfo::new("debug", &format!("Thread {}", thread_id)));
+                logger.log(LogInfo::new("debug", format!("Thread {}", thread_id)));
             })
         })
         .collect();
@@ -130,7 +130,7 @@ fn test_logging_non_blocking() {
     let start = std::time::Instant::now();
 
     for i in 0..num_messages {
-        logger.log(LogInfo::new("info", &format!("Message {}", i)));
+        logger.log(LogInfo::new("info", format!("Message {}", i)));
     }
 
     let enqueue_time = start.elapsed();
@@ -152,7 +152,7 @@ fn test_flush_waits_for_processing() {
     let logger = Logger::builder().transport(transport.clone()).build();
 
     for i in 0..5 {
-        logger.log(LogInfo::new("info", &format!("Message {}", i)));
+        logger.log(LogInfo::new("info", format!("Message {}", i)));
     }
 
     // Before flush, logs might not be processed yet
@@ -198,7 +198,7 @@ fn test_concurrent_query() {
     // Log some messages
     for i in 0..20 {
         logger.log(
-            LogInfo::new("info", &format!("Message {}", i)), //.with_meta("timestamp", chrono::Utc::now().to_rfc3339()),
+            LogInfo::new("info", format!("Message {}", i)), //.with_meta("timestamp", chrono::Utc::now().to_rfc3339()),
         );
     }
     logger.flush().unwrap();
