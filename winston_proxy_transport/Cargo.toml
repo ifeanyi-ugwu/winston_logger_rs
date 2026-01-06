@@ -10,4 +10,4 @@ authors = ["ifeanyi ugwu"]
 
 [dependencies]
 logform = { version = "0.6.2", path = "../logform" }
-winston_transport = { version = "0.6.0", path = "../winston_transport" }
+winston_transport = { version = "0.7.0", path = "../winston_transport" }

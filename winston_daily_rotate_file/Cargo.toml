@@ -12,7 +12,7 @@ authors = ["ifeanyi ugwu"]
 chrono = "0.4.39"
 flate2 = "1.0.35"
 logform = { version = "0.6.2", path = "../logform" }
-winston_transport = { version = "0.6.0", path = "../winston_transport" }
+winston_transport = { version = "0.7.0", path = "../winston_transport" }
 
 [dev-dependencies]
 tempfile = "3.17.1"
