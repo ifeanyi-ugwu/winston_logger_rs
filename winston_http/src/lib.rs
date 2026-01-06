@@ -453,10 +453,10 @@ mod tests {
             assert!(!received.is_empty(), "No logs received");
             println!("Received {} log entries", received.len());
 
-            if let Some(batch) = received.get(0) {
+            if let Some(batch) = received.first() {
                 if let Some(batch_array) = batch.as_array() {
                     assert_eq!(batch_array.len(), 2);
-                    if let Some(log_entry1) = batch_array.get(0) {
+                    if let Some(log_entry1) = batch_array.first() {
                         assert_eq!(
                             log_entry1.get("level").and_then(Value::as_str),
                             Some("warn")
@@ -517,7 +517,7 @@ mod tests {
             };
 
             assert!(
-                received_after_flush.len() >= 1,
+                !received_after_flush.is_empty(),
                 "No logs received after flush"
             );
 

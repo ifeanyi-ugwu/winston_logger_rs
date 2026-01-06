@@ -5,7 +5,6 @@ use crate::{
 };
 use logform::{json, Format, LogInfo};
 use std::{collections::HashMap, sync::Arc};
-use winston_transport::Transport;
 
 #[derive(Clone)]
 pub struct LoggerOptions {
@@ -158,7 +157,6 @@ impl Default for LoggerOptions {
     /// - The JSON format for log entries.
     /// - A channel capacity of 1024.
     /// - A backpressure strategy set to `BackpressureStrategy::Block`, meaning the logger will block on overflow until space is available.
-
     fn default() -> Self {
         LoggerOptions {
             levels: Some(LoggerLevels::default()),

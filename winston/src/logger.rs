@@ -69,7 +69,7 @@ impl<'a> TransportBuilder<'a> {
 #[derive(Debug)]
 pub enum LogMessage {
     Entry(Arc<LogInfo>),
-    Configure(LoggerOptions),
+    //Configure(LoggerOptions),
     Shutdown,
     Flush,
 }
@@ -200,7 +200,7 @@ impl Logger {
                         Self::process_entry(&entry, &state);
                     }
                 }
-                LogMessage::Configure(new_options) => {
+                /*LogMessage::Configure(new_options) => {
                     let mut state = shared_state.write();
                     // Update only the provided options
                     if let Some(level) = new_options.level {
@@ -221,7 +221,7 @@ impl Logger {
 
                     // Process buffered entries with new configuration
                     Self::process_buffered_entries(&shared_state, &buffer);
-                }
+                }*/
                 LogMessage::Shutdown => {
                     Self::process_buffered_entries(&shared_state, &buffer);
                     break;
@@ -349,10 +349,10 @@ impl Logger {
             Err(TrySendError::Full(LogMessage::Entry(entry))) => {
                 self.handle_full_channel(entry);
             }
-            Err(TrySendError::Full(LogMessage::Configure(config))) => {
+            /*Err(TrySendError::Full(LogMessage::Configure(config))) => {
                 eprintln!("[winston] Channel is full, forcing config update.");
                 let _ = self.sender.send(LogMessage::Configure(config));
-            }
+            }*/
             Err(TrySendError::Full(LogMessage::Shutdown)) => {
                 eprintln!("[winston] Channel is full, forcing shutdown.");
                 let _ = self.sender.send(LogMessage::Shutdown);
@@ -529,7 +529,7 @@ impl Logger {
     pub fn transport(
         &self,
         transport: impl Transport<LogInfo> + Send + Sync + 'static,
-    ) -> TransportBuilder {
+    ) -> TransportBuilder<'_> {
         TransportBuilder {
             logger: self,
             logger_transport: LoggerTransport::new(transport),

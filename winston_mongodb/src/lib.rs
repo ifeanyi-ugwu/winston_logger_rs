@@ -35,6 +35,7 @@ struct LogDocument {
 
 pub struct MongoDBTransport {
     sender: mpsc::Sender<MongoDBThreadMessage>,
+    #[cfg(test)]
     options: MongoDBOptions,
     exit_signal: Arc<AtomicBool>,
 }
@@ -244,6 +245,7 @@ impl MongoDBTransport {
 
         let transport = Self {
             sender,
+            #[cfg(test)]
             options,
             exit_signal,
         };
@@ -260,6 +262,7 @@ impl MongoDBTransport {
         self.exit_signal.store(true, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     async fn get_collection(&self) -> Collection<LogDocument> {
         let client = Client::with_uri_str(&self.options.connection_string)
             .await
@@ -458,7 +461,6 @@ mod tests {
     use super::*;
     use mongodb::{bson::doc, options::ClientOptions};
     use std::env;
-    use tokio;
 
     #[tokio::test]
     async fn test_logging_persists_to_mongodb() {

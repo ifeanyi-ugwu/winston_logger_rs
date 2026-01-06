@@ -151,7 +151,7 @@ impl FileTransport {
     }
 
     /// Sorts log entries by timestamp according to query order.
-    fn sort_results(&self, query: &LogQuery, entries: &mut Vec<LogInfo>) {
+    fn sort_results(&self, query: &LogQuery, entries: &mut [LogInfo]) {
         match query.order {
             Order::Ascending => {
                 entries.sort_by(|a, b| Self::extract_timestamp(a).cmp(&Self::extract_timestamp(b)))
