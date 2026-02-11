@@ -35,6 +35,8 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to push version bumps and tags back to repo
     steps:
       - uses: actions/checkout@v4
         with:

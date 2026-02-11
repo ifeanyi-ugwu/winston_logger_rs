@@ -32,6 +32,9 @@ jobs:
         run: cargo test --workspace --all-features
 
   semver:
+    # Only run on PRs to warn about breaking changes
+    # Don't run on main so publish workflow can push version bumps without triggering checks
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
