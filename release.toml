@@ -1,4 +1,3 @@
-dev-version = false
 allow-branch = ["main"]
 consolidate-commits = false
 tag-name = "{{crate_name}}-v{{version}}"
