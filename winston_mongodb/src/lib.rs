@@ -466,7 +466,13 @@ mod tests {
     async fn test_logging_persists_to_mongodb() {
         dotenv::dotenv().ok();
 
-        let connection_string = env::var("MONGODB_URI").expect("MONGODB_URI must be set");
+        let connection_string = match env::var("MONGODB_URI") {
+            Ok(uri) => uri,
+            Err(_) => {
+                eprintln!("Skipping test: MONGODB_URI not set");
+                return;
+            }
+        };
 
         let options = MongoDBOptions {
             connection_string,
@@ -510,7 +516,13 @@ mod tests {
     async fn test_query_logs_from_mongodb() {
         dotenv::dotenv().ok();
 
-        let connection_string = env::var("MONGODB_URI").expect("MONGODB_URI must be set");
+        let connection_string = match env::var("MONGODB_URI") {
+            Ok(uri) => uri,
+            Err(_) => {
+                eprintln!("Skipping test: MONGODB_URI not set");
+                return;
+            }
+        };
 
         let options = MongoDBOptions {
             connection_string,
@@ -600,7 +612,13 @@ mod tests {
 
         dotenv::dotenv().ok();
 
-        let connection_string = env::var("MONGODB_URI").expect("MONGODB_URI must be set");
+        let connection_string = match env::var("MONGODB_URI") {
+            Ok(uri) => uri,
+            Err(_) => {
+                eprintln!("Skipping test: MONGODB_URI not set");
+                return;
+            }
+        };
 
         let options = MongoDBOptions {
             connection_string,
