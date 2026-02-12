@@ -22,7 +22,7 @@ fn test_log_backend_basic_integration() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough())
+                .format(logform::passthrough()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -56,7 +56,7 @@ fn test_log_backend_level_filtering() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("warn")
-                .format(logform::passthrough())
+                .format(logform::passthrough()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -83,7 +83,7 @@ fn test_log_backend_metadata_capture() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough())  // Use passthrough to preserve metadata
+            .format(logform::passthrough()) // Use passthrough to preserve metadata
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -91,7 +91,7 @@ fn test_log_backend_metadata_capture() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough())  // Use passthrough to preserve metadata
+                .format(logform::passthrough()), // Use passthrough to preserve metadata
         ));
         winston::add_transport(transport.clone());
     }
@@ -124,7 +124,7 @@ fn test_log_backend_with_format() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(winston::format::json())
+                .format(winston::format::json()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -153,7 +153,7 @@ fn test_log_backend_enabled_check() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("error")
-                .format(logform::passthrough())
+                .format(logform::passthrough()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -189,7 +189,7 @@ fn test_log_backend_concurrent_logging() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough())
+                .format(logform::passthrough()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -229,7 +229,7 @@ fn test_log_backend_mixed_with_winston() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough())
+                .format(logform::passthrough()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -252,7 +252,7 @@ fn test_log_backend_with_key_values() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough())  // Use passthrough to preserve metadata
+            .format(logform::passthrough()) // Use passthrough to preserve metadata
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -260,7 +260,7 @@ fn test_log_backend_with_key_values() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough())  // Use passthrough to preserve metadata
+                .format(logform::passthrough()), // Use passthrough to preserve metadata
         ));
         winston::add_transport(transport.clone());
     }
@@ -292,7 +292,7 @@ fn test_log_backend_flush() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough())
+                .format(logform::passthrough()),
         ));
         winston::add_transport(transport.clone());
     }
