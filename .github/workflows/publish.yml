@@ -4,10 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       crate:
-        description: "Crate to publish"
+        description: "Crate to publish (leave as 'workspace' to publish all)"
         required: true
         type: choice
         options:
+          - workspace
           - logform
           - winston_transport
           - winston_file
@@ -58,4 +59,9 @@ jobs:
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo release ${{ inputs.level }} --package ${{ inputs.crate }} --execute --no-confirm
+        run: |
+          if [ "${{ inputs.crate }}" = "workspace" ]; then
+            cargo release ${{ inputs.level }} --workspace --execute --no-confirm
+          else
+            cargo release ${{ inputs.level }} --package ${{ inputs.crate }} --execute --no-confirm
+          fi
