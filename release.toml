@@ -1,4 +1,3 @@
-[workspace]
 dev-version = false
 allow-branch = ["main"]
 consolidate-commits = false
