@@ -11,7 +11,7 @@ keywords = ["winston", "transport"]
 categories = ["development-tools::debugging"]
 
 [dependencies]
-logform = { version = "0.6.2", features = ["serde"], path = "../logform" }
+logform = { workspace = true, features = ["serde"] }
 reqwest = { version = "0.12.15", features = ["blocking", "json"] }
 winston_proxy_transport.workspace = true
 winston_transport.workspace = true
