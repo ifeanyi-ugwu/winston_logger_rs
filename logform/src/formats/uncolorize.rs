@@ -8,6 +8,12 @@ pub struct Uncolorize {
     message: bool,
 }
 
+impl Default for Uncolorize {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Uncolorize {
     pub fn new() -> Self {
         Self {

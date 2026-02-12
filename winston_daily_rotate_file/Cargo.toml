@@ -11,8 +11,8 @@ authors = ["ifeanyi ugwu"]
 [dependencies]
 chrono = "0.4.39"
 flate2 = "1.0.35"
-logform = { version = "0.6.2", path = "../logform" }
-winston_transport = { version = "0.6.0", path = "../winston_transport" }
+logform.workspace = true
+winston_transport.workspace = true
 
 [dev-dependencies]
 tempfile = "3.17.1"

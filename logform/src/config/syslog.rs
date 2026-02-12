@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 pub fn levels() -> HashMap<String, usize> {
-    let levels = HashMap::from([
+    HashMap::from([
         ("emerg".to_string(), 0),
         ("alert".to_string(), 1),
         ("crit".to_string(), 2),
@@ -10,12 +10,11 @@ pub fn levels() -> HashMap<String, usize> {
         ("notice".to_string(), 5),
         ("info".to_string(), 6),
         ("debug".to_string(), 7),
-    ]);
-    levels
+    ])
 }
 
 pub fn colors() -> HashMap<String, String> {
-    let colors = HashMap::from([
+    HashMap::from([
         ("emerg".to_string(), "red".to_string()),
         ("alert".to_string(), "yellow".to_string()),
         ("crit".to_string(), "red".to_string()),
@@ -24,6 +23,5 @@ pub fn colors() -> HashMap<String, String> {
         ("notice".to_string(), "yellow".to_string()),
         ("info".to_string(), "green".to_string()),
         ("debug".to_string(), "blue".to_string()),
-    ]);
-    colors
+    ])
 }

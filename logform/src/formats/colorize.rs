@@ -40,6 +40,12 @@ pub struct Colorizer {
     message: bool,
 }
 
+impl Default for Colorizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Colorizer {
     fn init_colors() {
         INIT.call_once(|| {
@@ -147,10 +153,7 @@ impl Format for Colorizer {
     }
 }
 
-fn apply_color<'a>(
-    message: impl Into<colored::ColoredString>,
-    color: &str,
-) -> colored::ColoredString {
+fn apply_color(message: impl Into<colored::ColoredString>, color: &str) -> colored::ColoredString {
     let message = message.into();
     match color {
         "black" => message.black(),

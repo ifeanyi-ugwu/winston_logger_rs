@@ -8,6 +8,12 @@ pub struct MsFormat {
     prev_time: Mutex<Option<Instant>>,
 }
 
+impl Default for MsFormat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MsFormat {
     pub fn new() -> Self {
         MsFormat {

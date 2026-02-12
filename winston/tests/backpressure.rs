@@ -60,7 +60,7 @@ fn test_backpressure_drop_oldest_strategy() {
 
     // Rapidly send 5 messages
     for i in 1..=5 {
-        logger.log(LogInfo::new("info", &format!("Message {}", i)));
+        logger.log(LogInfo::new("info", format!("Message {}", i)));
     }
 
     // Give time for processing
@@ -94,7 +94,7 @@ fn test_backpressure_drop_current_strategy() {
 
     // Rapidly send 5 messages
     for i in 1..=5 {
-        logger.log(LogInfo::new("info", &format!("Message {}", i)));
+        logger.log(LogInfo::new("info", format!("Message {}", i)));
     }
 
     // Give time for processing
@@ -125,7 +125,7 @@ fn test_backpressure_strategies_differ() {
 
     let start_block = Instant::now();
     for i in 1..=3 {
-        logger_block.log(LogInfo::new("info", &format!("Block {}", i)));
+        logger_block.log(LogInfo::new("info", format!("Block {}", i)));
     }
     let block_duration = start_block.elapsed();
     logger_block.flush().unwrap();
@@ -140,7 +140,7 @@ fn test_backpressure_strategies_differ() {
 
     let start_drop = Instant::now();
     for i in 1..=3 {
-        logger_drop.log(LogInfo::new("info", &format!("Drop {}", i)));
+        logger_drop.log(LogInfo::new("info", format!("Drop {}", i)));
     }
     let drop_duration = start_drop.elapsed();
     logger_drop.flush().unwrap();
@@ -171,7 +171,7 @@ fn test_no_backpressure_with_sufficient_capacity() {
     let start = Instant::now();
 
     for i in 0..100 {
-        logger.log(LogInfo::new("info", &format!("Message {}", i)));
+        logger.log(LogInfo::new("info", format!("Message {}", i)));
     }
 
     let enqueue_duration = start.elapsed();
@@ -204,16 +204,16 @@ fn test_backpressure_recovers_after_flush() {
 
     // Fill and overflow
     for i in 1..=5 {
-        logger.log(LogInfo::new("info", &format!("First batch {}", i)));
+        logger.log(LogInfo::new("info", format!("First batch {}", i)));
     }
 
     logger.flush().unwrap();
-    let first_count = transport.log_count();
+    let _first_count = transport.log_count();
     transport.clear_logs();
 
     // Should work normally after flush
     for i in 1..=3 {
-        logger.log(LogInfo::new("info", &format!("Second batch {}", i)));
+        logger.log(LogInfo::new("info", format!("Second batch {}", i)));
     }
 
     logger.flush().unwrap();

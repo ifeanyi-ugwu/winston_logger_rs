@@ -39,12 +39,12 @@ mod tests {
         let json_formatter = JsonFormat;
         let info = LogInfo::new("info", "User logged in");
         let result = json_formatter.transform(info).unwrap();
-        let expected_json = json!({
+        let expected_value = json!({
             "level": "info",
             "message": "User logged in"
-        })
-        .to_string();
-        assert_eq!(result.message, expected_json);
+        });
+        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        assert_eq!(actual_value, expected_value);
     }
 
     #[test]
@@ -53,13 +53,13 @@ mod tests {
         let info = LogInfo::new("info", "Special chars: \" \n \t ")
             .with_meta("weird\nkey", Value::String("strange\tvalue".to_string()));
         let result = json_formatter.transform(info).unwrap();
-        let expected_json = json!({
+        let expected_value = json!({
             "level": "info",
             "message": "Special chars: \" \n \t ",
             "weird\nkey": "strange\tvalue"
-        })
-        .to_string();
-        assert_eq!(result.message, expected_json);
+        });
+        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        assert_eq!(actual_value, expected_value);
     }
 
     #[test]
@@ -80,8 +80,11 @@ mod tests {
         for i in 0..1000 {
             expected.insert(format!("key_{}", i), Value::Number(i.into()));
         }
-        let expected_json = Value::Object(expected).to_string();
-        assert_eq!(result.message, expected_json);
+        let expected_value = Value::Object(expected);
+
+        // Compare as parsed values to avoid HashMap key ordering issues
+        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        assert_eq!(actual_value, expected_value);
     }
 
     #[test]
@@ -89,12 +92,12 @@ mod tests {
         let json_formatter = JsonFormat;
         let info = LogInfo::new("", "");
         let result = json_formatter.transform(info).unwrap();
-        let expected_json = json!({
+        let expected_value = json!({
             "level": "",
             "message": ""
-        })
-        .to_string();
-        assert_eq!(result.message, expected_json);
+        });
+        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        assert_eq!(actual_value, expected_value);
     }
     use serde_json::json;
 
@@ -109,14 +112,14 @@ mod tests {
             .with_meta("session_id", Value::String("abcde12345".to_string()));
 
         let result = json_formatter.transform(info).unwrap();
-        let expected_json = json!({
+        let expected_value = json!({
             "level": "info",
             "message": "User logged in",
             "user_id": 12345,
             "session_id": "abcde12345"
-        })
-        .to_string();
+        });
 
-        assert_eq!(result.message, expected_json);
+        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        assert_eq!(actual_value, expected_value);
     }
 }

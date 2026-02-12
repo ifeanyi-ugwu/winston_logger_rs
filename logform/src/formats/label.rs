@@ -7,6 +7,12 @@ pub struct LabelFormat {
     message: bool,
 }
 
+impl Default for LabelFormat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LabelFormat {
     pub fn new() -> Self {
         Self {

@@ -11,6 +11,12 @@ pub struct MetadataFormat {
     fill_with: HashSet<String>,
 }
 
+impl Default for MetadataFormat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetadataFormat {
     pub fn new() -> Self {
         MetadataFormat {
@@ -144,7 +150,7 @@ mod tests {
             Some(&Value::String("value1".to_string()))
         );
         // Should be removed from original meta
-        assert!(result.meta.get("key1").is_none());
+        assert!(!result.meta.contains_key("key1"));
     }
     use super::*;
     use serde_json::Value;
@@ -166,7 +172,7 @@ mod tests {
             Some(&Value::String("value1".to_string()))
         );
         assert!(metadata.get("key2").is_none());
-        assert!(result.meta.get("key1").is_none());
+        assert!(!result.meta.contains_key("key1"));
         assert_eq!(
             result.meta.get("key2"),
             Some(&Value::String("value2".to_string()))

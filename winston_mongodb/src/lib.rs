@@ -1,3 +1,5 @@
+mod to_mongodb_filter;
+
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use logform::LogInfo;
@@ -17,6 +19,7 @@ use std::{
     },
     thread,
 };
+use to_mongodb_filter::ToMongoDbFilter;
 use tokio::runtime::Builder as TokioBuilder;
 use winston_transport::{LogQuery, Order, Transport};
 
@@ -32,6 +35,7 @@ struct LogDocument {
 
 pub struct MongoDBTransport {
     sender: mpsc::Sender<MongoDBThreadMessage>,
+    #[cfg(test)]
     options: MongoDBOptions,
     exit_signal: Arc<AtomicBool>,
 }
@@ -241,6 +245,7 @@ impl MongoDBTransport {
 
         let transport = Self {
             sender,
+            #[cfg(test)]
             options,
             exit_signal,
         };
@@ -257,6 +262,7 @@ impl MongoDBTransport {
         self.exit_signal.store(true, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     async fn get_collection(&self) -> Collection<LogDocument> {
         let client = Client::with_uri_str(&self.options.connection_string)
             .await
@@ -269,7 +275,7 @@ impl MongoDBTransport {
         collection: &Collection<LogDocument>,
         query: &LogQuery,
     ) -> Result<Vec<LogInfo>, String> {
-        let mut filter = Document::new();
+        let mut filter_parts = Vec::new();
 
         // Add timestamp range filters
         let mut timestamp_filter = Document::new();
@@ -280,22 +286,36 @@ impl MongoDBTransport {
             timestamp_filter.insert("$lte", until);
         }
         if !timestamp_filter.is_empty() {
-            filter.insert("timestamp", timestamp_filter);
+            filter_parts.push(doc! { "timestamp": timestamp_filter });
         }
 
         // Add level filter
         if !query.levels.is_empty() {
-            filter.insert("level", doc! { "$in": &query.levels });
+            filter_parts.push(doc! { "level": { "$in": &query.levels } });
         }
 
+        // Add search term filter
         if let Some(search_regex) = &query.search_term {
-            filter.insert(
-                "message",
-                doc! {
+            filter_parts.push(doc! {
+                "message": {
                     "$regex": search_regex.as_str()
-                },
-            );
+                }
+            });
         }
+
+        // Add DSL filter if present
+        if let Some(ref dsl_filter) = query.filter {
+            filter_parts.push(dsl_filter.to_mongodb_filter());
+        }
+
+        // Combine all filters with $and if there are multiple conditions
+        let filter = if filter_parts.is_empty() {
+            Document::new()
+        } else if filter_parts.len() == 1 {
+            filter_parts.into_iter().next().unwrap()
+        } else {
+            doc! { "$and": filter_parts }
+        };
 
         // Configure options (sort, skip, limit)
         let mut options = FindOptions::default();
@@ -441,13 +461,18 @@ mod tests {
     use super::*;
     use mongodb::{bson::doc, options::ClientOptions};
     use std::env;
-    use tokio;
 
     #[tokio::test]
     async fn test_logging_persists_to_mongodb() {
         dotenv::dotenv().ok();
 
-        let connection_string = env::var("MONGODB_URI").expect("MONGODB_URI must be set");
+        let connection_string = match env::var("MONGODB_URI") {
+            Ok(uri) => uri,
+            Err(_) => {
+                eprintln!("Skipping test: MONGODB_URI not set");
+                return;
+            }
+        };
 
         let options = MongoDBOptions {
             connection_string,
@@ -491,7 +516,13 @@ mod tests {
     async fn test_query_logs_from_mongodb() {
         dotenv::dotenv().ok();
 
-        let connection_string = env::var("MONGODB_URI").expect("MONGODB_URI must be set");
+        let connection_string = match env::var("MONGODB_URI") {
+            Ok(uri) => uri,
+            Err(_) => {
+                eprintln!("Skipping test: MONGODB_URI not set");
+                return;
+            }
+        };
 
         let options = MongoDBOptions {
             connection_string,
@@ -570,6 +601,220 @@ mod tests {
         // **Cleanup: Delete all test logs added in this test**
         let collection = transport.get_collection().await;
         let cleanup_filter = doc! { "message": { "$in": ["Info log 1", "Warning log", "Error log 1", "Info log 2"] } };
+        let delete_result = collection.delete_many(cleanup_filter).await.unwrap();
+        println!("Deleted {} test logs", delete_result.deleted_count);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_dsl_query_filter_with_mongodb() {
+        use winston_transport::query_dsl::dlc::alpha::a::prelude::*;
+        use winston_transport::{and, field_logic as fl, field_query as fq};
+
+        dotenv::dotenv().ok();
+
+        let connection_string = match env::var("MONGODB_URI") {
+            Ok(uri) => uri,
+            Err(_) => {
+                eprintln!("Skipping test: MONGODB_URI not set");
+                return;
+            }
+        };
+
+        let options = MongoDBOptions {
+            connection_string,
+            database: "winston_mongodb_test_db".to_string(),
+            collection: "logs_dsl_test".to_string(),
+        };
+
+        let transport = MongoDBTransport::new(options.clone()).unwrap();
+
+        // Cleanup any existing test data first
+        let collection = transport.get_collection().await;
+        let cleanup_filter = doc! {
+            "message": {
+                "$in": [
+                    "User login successful",
+                    "User profile updated",
+                    "Failed login attempt",
+                    "Password reset",
+                    "Database connection failed"
+                ]
+            }
+        };
+        collection
+            .delete_many(cleanup_filter.clone())
+            .await
+            .unwrap();
+
+        // Insert test logs with metadata
+        let test_logs = vec![
+            LogInfo::new("info", "User login successful")
+                .with_meta("user_id", 101)
+                .with_meta("user_age", 25)
+                .with_meta("user_status", "active")
+                .with_meta("department", "engineering"),
+            LogInfo::new("info", "User profile updated")
+                .with_meta("user_id", 102)
+                .with_meta("user_age", 30)
+                .with_meta("user_status", "active")
+                .with_meta("department", "marketing"),
+            LogInfo::new("warn", "Failed login attempt")
+                .with_meta("user_id", 103)
+                .with_meta("user_age", 45)
+                .with_meta("user_status", "suspended")
+                .with_meta("department", "engineering"),
+            LogInfo::new("info", "Password reset")
+                .with_meta("user_id", 104)
+                .with_meta("user_age", 22)
+                .with_meta("user_status", "active")
+                .with_meta("department", "sales"),
+            LogInfo::new("error", "Database connection failed")
+                .with_meta("user_id", 105)
+                .with_meta("user_age", 35)
+                .with_meta("user_status", "active")
+                .with_meta("department", "engineering"),
+        ];
+
+        // Log all entries
+        for log in test_logs {
+            transport.log(log);
+        }
+
+        // Wait for logs to be inserted
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        // Test 1: Simple equality filter - users in engineering department
+        // Meta fields are flattened in MongoDB documents, so field paths do not include "meta." prefix
+        let query1 = LogQuery::new()
+            .from("a day ago")
+            .until("now")
+            .limit(100) // Override default limit
+            .filter(fq!("department", eq("engineering")));
+
+        let results1 = transport.query(&query1).unwrap();
+        assert_eq!(
+            results1.len(),
+            3,
+            "Should find 3 logs from engineering department"
+        );
+        for log in &results1 {
+            assert_eq!(
+                log.meta.get("department").unwrap().as_str().unwrap(),
+                "engineering"
+            );
+        }
+
+        // Test 2: Age range filter - users between 18 and 40
+        let query2 = LogQuery::new()
+            .from("a day ago")
+            .until("now")
+            .filter(fq!("user_age", fl!(and, gt(18), lt(40))));
+
+        let results2 = transport.query(&query2).unwrap();
+        assert!(
+            results2.len() >= 3,
+            "Should find at least 3 users aged between 18 and 40"
+        );
+        for log in &results2 {
+            let age = log.meta.get("user_age").unwrap().as_i64().unwrap();
+            assert!(age > 18 && age < 40, "Age should be between 18 and 40");
+        }
+
+        // Test 3: Complex AND filter - active users in engineering with age > 20
+        let query3 = LogQuery::new()
+            .from("a day ago")
+            .until("now")
+            .levels(vec!["info", "warn", "error"])
+            .filter(and!(
+                fq!("user_status", eq("active")),
+                fq!("department", eq("engineering")),
+                fq!("user_age", gt(20))
+            ));
+
+        let results3 = transport.query(&query3).unwrap();
+        assert_eq!(
+            results3.len(),
+            2,
+            "Should find 2 active engineering users over 20"
+        );
+        for log in &results3 {
+            assert_eq!(
+                log.meta.get("user_status").unwrap().as_str().unwrap(),
+                "active"
+            );
+            assert_eq!(
+                log.meta.get("department").unwrap().as_str().unwrap(),
+                "engineering"
+            );
+            let age = log.meta.get("user_age").unwrap().as_i64().unwrap();
+            assert!(age > 20);
+        }
+
+        // Test 4: OR filter - users from engineering OR marketing
+        let query4 = LogQuery::new()
+            .from("a day ago")
+            .until("now")
+            .filter(winston_transport::or!(
+                fq!("department", eq("engineering")),
+                fq!("department", eq("marketing"))
+            ));
+
+        let results4 = transport.query(&query4).unwrap();
+        assert_eq!(
+            results4.len(),
+            4,
+            "Should find 4 logs from engineering or marketing"
+        );
+        for log in &results4 {
+            let dept = log.meta.get("department").unwrap().as_str().unwrap();
+            assert!(dept == "engineering" || dept == "marketing");
+        }
+
+        // Test 5: Combined filter with levels and DSL
+        let query5 = LogQuery::new()
+            .from("a day ago")
+            .until("now")
+            .levels(vec!["info"]) // Only info level
+            .filter(and!(
+                fq!("user_status", eq("active")),
+                fq!("user_age", fl!(and, gt(20), lt(35)))
+            ));
+
+        let results5 = transport.query(&query5).unwrap();
+        assert_eq!(
+            results5.len(),
+            3,
+            "Should find 3 active info logs with age 20-35"
+        );
+        for log in &results5 {
+            assert_eq!(log.level, "info");
+            assert_eq!(
+                log.meta.get("user_status").unwrap().as_str().unwrap(),
+                "active"
+            );
+            let age = log.meta.get("user_age").unwrap().as_i64().unwrap();
+            assert!(
+                age > 20 && age < 35,
+                "Age {} should be between 20 and 35",
+                age
+            );
+        }
+
+        println!("All DSL query filter tests passed!");
+
+        // Cleanup: Delete all test logs
+        let collection = transport.get_collection().await;
+        let cleanup_filter = doc! {
+            "message": {
+                "$in": [
+                    "User login successful",
+                    "User profile updated",
+                    "Failed login attempt",
+                    "Password reset",
+                    "Database connection failed"
+                ]
+            }
+        };
         let delete_result = collection.delete_many(cleanup_filter).await.unwrap();
         println!("Deleted {} test logs", delete_result.deleted_count);
     }

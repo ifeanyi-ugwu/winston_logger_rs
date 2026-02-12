@@ -32,7 +32,7 @@ impl Default for BatchConfig {
 enum BatchMessage<L> {
     Log(L),
     Flush(Sender<Result<(), String>>),
-    Query(LogQuery, Sender<Result<Vec<L>, String>>),
+    Query(Box<LogQuery>, Sender<Result<Vec<L>, String>>),
     Shutdown,
 }
 
@@ -106,7 +106,7 @@ where
 
         let flush_batch = |batch: &mut Vec<L>| -> Result<(), String> {
             if !batch.is_empty() {
-                transport.log_batch(batch.drain(..).collect());
+                transport.log_batch(std::mem::take(batch));
                 transport.flush() // propagate flush error
             } else {
                 Ok(())
@@ -211,7 +211,10 @@ where
         let (response_sender, response_receiver) = mpsc::channel();
 
         self.sender
-            .send(BatchMessage::Query(options.clone(), response_sender))
+            .send(BatchMessage::Query(
+                Box::new(options.clone()),
+                response_sender,
+            ))
             .map_err(|_| "Failed to send query message to batch thread")?;
 
         response_receiver

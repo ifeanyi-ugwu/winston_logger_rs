@@ -29,23 +29,21 @@ pub fn colors() -> HashMap<String, String> {
 }
 */
 pub fn levels() -> HashMap<String, usize> {
-    let levels = HashMap::from([
+    HashMap::from([
         ("error".to_string(), 0),
         ("warn".to_string(), 1),
         ("info".to_string(), 2),
         ("debug".to_string(), 3),
         ("trace".to_string(), 4),
-    ]);
-    levels
+    ])
 }
 
 pub fn colors() -> HashMap<String, String> {
-    let colors = HashMap::from([
+    HashMap::from([
         ("error".to_string(), "red".to_string()),
         ("warn".to_string(), "yellow".to_string()),
         ("info".to_string(), "green".to_string()),
         ("debug".to_string(), "blue".to_string()),
         ("trace".to_string(), "magenta".to_string()),
-    ]);
-    colors
+    ])
 }

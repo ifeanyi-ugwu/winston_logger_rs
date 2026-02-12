@@ -124,7 +124,7 @@ fn test_global_flush() {
     winston::add_transport(transport.clone());
 
     for i in 0..5 {
-        winston::log(LogInfo::new("info", &format!("Message {}", i)));
+        winston::log(LogInfo::new("info", format!("Message {}", i)));
     }
 
     assert!(winston::flush().is_ok());

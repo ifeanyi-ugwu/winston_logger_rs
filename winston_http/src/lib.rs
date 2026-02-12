@@ -67,10 +67,16 @@ impl HttpTransport {
         }
 
         // Send single log or batch of logs
+        // Convert to flat representation for consistent serialization
         let response = if formatted_logs.len() == 1 {
-            request.json(&formatted_logs[0])
+            let flat_log = formatted_logs[0].to_flat_value();
+            request.json(&flat_log)
         } else {
-            request.json(&formatted_logs)
+            let flat_logs: Vec<_> = formatted_logs
+                .iter()
+                .map(|log| log.to_flat_value())
+                .collect();
+            request.json(&flat_logs)
         }
         .send()
         .map_err(|e| format!("Failed to send log(s): {}", e))?;
@@ -140,10 +146,16 @@ impl Proxy<LogInfo> for HttpTransport {
                 .filter_map(|log| fmt.transform(log.clone()))
                 .collect()
         } else {
-            logs.iter().cloned().collect()
+            logs.to_vec()
         };
 
-        let mut req = self.client.post(&self.options.url).json(&formatted_logs);
+        // Convert to flat representation for consistent serialization
+        let flat_logs: Vec<_> = formatted_logs
+            .iter()
+            .map(|log| log.to_flat_value())
+            .collect();
+
+        let mut req = self.client.post(&self.options.url).json(&flat_logs);
 
         if let Some(headers) = &self.options.headers {
             for (k, v) in headers {
@@ -163,6 +175,12 @@ impl Proxy<LogInfo> for HttpTransport {
 
 pub struct HttpTransportBuilder {
     options: HttpTransportOptions,
+}
+
+impl Default for HttpTransportBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpTransportBuilder {
@@ -435,10 +453,10 @@ mod tests {
             assert!(!received.is_empty(), "No logs received");
             println!("Received {} log entries", received.len());
 
-            if let Some(batch) = received.get(0) {
+            if let Some(batch) = received.first() {
                 if let Some(batch_array) = batch.as_array() {
                     assert_eq!(batch_array.len(), 2);
-                    if let Some(log_entry1) = batch_array.get(0) {
+                    if let Some(log_entry1) = batch_array.first() {
                         assert_eq!(
                             log_entry1.get("level").and_then(Value::as_str),
                             Some("warn")
@@ -447,11 +465,10 @@ mod tests {
                             log_entry1.get("message").and_then(Value::as_str),
                             Some("Test log 1 in batch")
                         );
-                        assert!(log_entry1
-                            .get("meta")
-                            .and_then(Value::as_object)
-                            .and_then(|meta| meta.get("timestamp"))
-                            .is_some());
+                        assert!(
+                            log_entry1.get("timestamp").is_some(),
+                            "Timestamp should be at root level"
+                        );
                     }
                     if let Some(log_entry2) = batch_array.get(1) {
                         assert_eq!(
@@ -462,11 +479,10 @@ mod tests {
                             log_entry2.get("message").and_then(Value::as_str),
                             Some("Test log 2 in batch")
                         );
-                        assert!(log_entry2
-                            .get("meta")
-                            .and_then(Value::as_object)
-                            .and_then(|meta| meta.get("timestamp"))
-                            .is_some());
+                        assert!(
+                            log_entry2.get("timestamp").is_some(),
+                            "Timestamp should be at root level"
+                        );
                     }
                 } else {
                     panic!("Received data is not an array as expected for batching");
@@ -501,7 +517,7 @@ mod tests {
             };
 
             assert!(
-                received_after_flush.len() >= 1,
+                !received_after_flush.is_empty(),
                 "No logs received after flush"
             );
 
@@ -512,11 +528,10 @@ mod tests {
                 if let Some(msg) = entry.get("message").and_then(Value::as_str) {
                     if msg == "Test log for flush" {
                         assert_eq!(entry.get("level").and_then(Value::as_str), Some("info"));
-                        assert!(entry
-                            .get("meta")
-                            .and_then(Value::as_object)
-                            .and_then(|meta| meta.get("timestamp"))
-                            .is_some());
+                        assert!(
+                            entry.get("timestamp").is_some(),
+                            "Timestamp should be at root level"
+                        );
                         found_log = true;
                         break;
                     }
@@ -607,11 +622,10 @@ mod tests {
                 body.get("message").and_then(Value::as_str),
                 Some("Test with custom headers")
             );
-            assert!(body
-                .get("meta")
-                .and_then(Value::as_object)
-                .and_then(|meta| meta.get("timestamp"))
-                .is_some());
+            assert!(
+                body.get("timestamp").is_some(),
+                "Timestamp should be at root level"
+            );
         }
 
         drop(transport);

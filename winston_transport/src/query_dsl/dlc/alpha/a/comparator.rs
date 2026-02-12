@@ -42,36 +42,32 @@ impl Comparator {
         self.evaluate(vec![field_value], expected_value)
     }
 
-    pub fn evaluate<'a>(
-        &self,
-        field_value: Vec<&'a Value>,
-        expected_value: &Option<QueryValue>,
-    ) -> bool {
+    pub fn evaluate(&self, field_value: Vec<&Value>, expected_value: &Option<QueryValue>) -> bool {
         for val in field_value {
             match (self, expected_value) {
                 (Comparator::Equals, Some(expected)) => {
-                    if self.compare_values(&val, expected) {
+                    if self.compare_values(val, expected) {
                         return true;
                     } else {
                         println!("failed at `equals` check");
                     }
                 }
                 (Comparator::NotEquals, Some(expected)) => {
-                    if !self.compare_values(&val, expected) {
+                    if !self.compare_values(val, expected) {
                         return true;
                     } else {
                         println!("failed at `not_equals` check");
                     }
                 }
                 (Comparator::GreaterThan, Some(expected)) => {
-                    if self.compare_numbers(&val, expected, |a, b| a > b) {
+                    if self.compare_numbers(val, expected, |a, b| a > b) {
                         return true;
                     } else {
                         println!("failed at `greater_than` check");
                     }
                 }
                 (Comparator::LessThan, Some(expected)) => {
-                    if self.compare_numbers(&val, expected, |a, b| a < b) {
+                    if self.compare_numbers(val, expected, |a, b| a < b) {
                         return true;
                     } else {
                         println!(
@@ -81,14 +77,14 @@ impl Comparator {
                     }
                 }
                 (Comparator::GreaterThanOrEqual, Some(expected)) => {
-                    if self.compare_numbers(&val, expected, |a, b| a >= b) {
+                    if self.compare_numbers(val, expected, |a, b| a >= b) {
                         return true;
                     } else {
                         println!("failed at `greater_than_or_equal` check");
                     }
                 }
                 (Comparator::LessThanOrEqual, Some(expected)) => {
-                    if self.compare_numbers(&val, expected, |a, b| a <= b) {
+                    if self.compare_numbers(val, expected, |a, b| a <= b) {
                         return true;
                     } else {
                         println!("failed at `less_than_or_equal` check");
@@ -104,7 +100,7 @@ impl Comparator {
                 }
                 (Comparator::Matches, Some(QueryValue::Regex(expected_regex))) => {
                     if let Value::String(actual_str) = val {
-                        if expected_regex.is_match(&actual_str) {
+                        if expected_regex.is_match(actual_str) {
                             return true;
                         } else {
                             println!("failed at `matches` check");
@@ -115,7 +111,7 @@ impl Comparator {
                 }
                 (Comparator::NotMatches, Some(QueryValue::Regex(expected_regex))) => {
                     if let Value::String(actual_str) = val {
-                        if !expected_regex.is_match(&actual_str) {
+                        if !expected_regex.is_match(actual_str) {
                             return true;
                         } else {
                             println!("failed at `not_matches` check");
@@ -190,7 +186,7 @@ impl Comparator {
                 }
                 (Comparator::In, Some(QueryValue::Array(expected_array))) => {
                     for expected_val in expected_array {
-                        if self.compare_values(&val, expected_val) {
+                        if self.compare_values(val, expected_val) {
                             return true;
                         } else {
                             println!("failed at `in` check");
@@ -200,7 +196,7 @@ impl Comparator {
                 (Comparator::NotIn, Some(QueryValue::Array(expected_array))) => {
                     let mut found = false;
                     for expected_val in expected_array {
-                        if self.compare_values(&val, expected_val) {
+                        if self.compare_values(val, expected_val) {
                             found = true;
                             break;
                         }
@@ -314,10 +310,10 @@ impl Comparator {
                 (Comparator::Between, Some(QueryValue::Array(expected_range))) => {
                     if expected_range.len() == 2 {
                         if let (Some(start), Some(end)) =
-                            (expected_range.get(0), expected_range.get(1))
+                            (expected_range.first(), expected_range.get(1))
                         {
-                            if self.compare_numbers(&val, start, |a, b| a >= b)
-                                && self.compare_numbers(&val, end, |a, b| a <= b)
+                            if self.compare_numbers(val, start, |a, b| a >= b)
+                                && self.compare_numbers(val, end, |a, b| a <= b)
                             {
                                 return true;
                             } else {
@@ -333,10 +329,10 @@ impl Comparator {
                 (Comparator::NotBetween, Some(QueryValue::Array(expected_range))) => {
                     if expected_range.len() == 2 {
                         if let (Some(start), Some(end)) =
-                            (expected_range.get(0), expected_range.get(1))
+                            (expected_range.first(), expected_range.get(1))
                         {
-                            if !(self.compare_numbers(&val, start, |a, b| a >= b)
-                                && self.compare_numbers(&val, end, |a, b| a <= b))
+                            if !(self.compare_numbers(val, start, |a, b| a >= b)
+                                && self.compare_numbers(val, end, |a, b| a <= b))
                             {
                                 return true;
                             } else {
@@ -379,7 +375,7 @@ impl Comparator {
                 }
                 (Comparator::Before, Some(QueryValue::DateTime(expected))) => {
                     if let Value::String(actual_str) = val {
-                        if let Ok(actual) = DateTime::parse_from_rfc3339(&actual_str) {
+                        if let Ok(actual) = DateTime::parse_from_rfc3339(actual_str) {
                             return actual.with_timezone(&Utc) < *expected;
                         } else {
                             println!("failed at `before` check");
@@ -390,7 +386,7 @@ impl Comparator {
                 }
                 (Comparator::After, Some(QueryValue::DateTime(expected))) => {
                     if let Value::String(actual_str) = val {
-                        if let Ok(actual) = DateTime::parse_from_rfc3339(&actual_str) {
+                        if let Ok(actual) = DateTime::parse_from_rfc3339(actual_str) {
                             return actual.with_timezone(&Utc) > *expected;
                         } else {
                             println!("failed at `after` check");
@@ -401,7 +397,7 @@ impl Comparator {
                 }
                 (Comparator::SameDay, Some(QueryValue::DateTime(expected))) => {
                     if let Value::String(actual_str) = val {
-                        if let Ok(actual) = DateTime::parse_from_rfc3339(&actual_str) {
+                        if let Ok(actual) = DateTime::parse_from_rfc3339(actual_str) {
                             let actual_utc = actual.with_timezone(&Utc);
                             return actual_utc.year() == expected.year()
                                 && actual_utc.month() == expected.month()
@@ -473,7 +469,7 @@ impl Comparator {
                     };
                 }*/
                 (Comparator::Function, Some(QueryValue::Function(func))) => {
-                    if func(&val) {
+                    if func(val) {
                         return true;
                     }
                 }
@@ -483,27 +479,27 @@ impl Comparator {
         false
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn compare_values(&self, actual: &Value, expected: &QueryValue) -> bool {
         match (actual, expected) {
             (Value::String(actual_str), QueryValue::String(expected_str)) => {
                 actual_str == expected_str
             }
             (Value::Number(actual_num), QueryValue::Number(expected_num)) => {
+                // TODO: Refactor number comparison to be lossless.
+                // Current f64 conversion may lose precision for large u64/i64 values.
+                // Consider using serde_json::Number's internal comparison or a decimal crate. i.e probably by storing a string or a serde_json::Number in QueryValue::Number
                 actual_num.as_f64().unwrap_or_default() == *expected_num
             }
             (Value::Bool(actual_bool), QueryValue::Boolean(expected_bool)) => {
                 actual_bool == expected_bool
             }
             (Value::Array(actual_array), QueryValue::Array(expected_array)) => {
-                if actual_array.len() != expected_array.len() {
-                    return false;
-                }
-                for (a, b) in actual_array.iter().zip(expected_array.iter()) {
-                    if !self.compare_values(a, b) {
-                        return false;
-                    }
-                }
-                true
+                actual_array.len() == expected_array.len()
+                    && actual_array
+                        .iter()
+                        .zip(expected_array.iter())
+                        .all(|(a, b)| self.compare_values(a, b))
             }
             (Value::String(actual_str), QueryValue::Regex(expected_regex)) => {
                 expected_regex.is_match(actual_str)

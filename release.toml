@@ -1,0 +1,6 @@
+[workspace]
+dev-version = false
+allow-branch = ["main"]
+consolidate-commits = false
+tag-name = "{{crate_name}}-v{{version}}"
+pre-release-commit-message = "chore: release {{crate_name}} v{{version}}"

@@ -52,7 +52,7 @@ fn benchmark_logging(c: &mut Criterion) {
                         .map(|_| {
                             let l = Arc::clone(&logger);
                             std::thread::spawn(move || {
-                                for i in 0..(iters / num_threads as u64) {
+                                for i in 0..(iters / num_threads) {
                                     l.log(black_box(LogInfo::new(
                                         "info",
                                         format!("message {}", i),

@@ -309,13 +309,13 @@ impl DailyRotateFile {
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
-                .unwrap_or_else(|| std::time::SystemTime::UNIX_EPOCH);
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
             let b_time = b
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
-                .unwrap_or_else(|| std::time::SystemTime::UNIX_EPOCH);
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
             b_time.cmp(&a_time)
         });
@@ -377,7 +377,6 @@ impl Transport<LogInfo> for DailyRotateFile {
 
         if let Err(e) = writeln!(file, "{}", info.message) {
             eprintln!("Failed to write log: {}", e);
-            return;
         }
 
         //drop(file);
@@ -431,6 +430,12 @@ pub struct DailyRotateFileBuilder {
     dirname: Option<PathBuf>,
     zipped_archive: bool,
     utc: bool,
+}
+
+impl Default for DailyRotateFileBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DailyRotateFileBuilder {

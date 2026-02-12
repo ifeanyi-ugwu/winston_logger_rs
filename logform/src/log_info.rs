@@ -93,6 +93,22 @@ impl LogInfo {
             "meta": self.meta,
         })
     }
+
+    /// Returns a flattened JSON representation where metadata fields are at the root level.
+    /// This is used by transports for consistent serialization and querying.
+    /// Users query fields directly without "meta." prefix.
+    pub fn to_flat_value(&self) -> Value {
+        let mut flat = serde_json::Map::new();
+        flat.insert("level".to_string(), Value::String(self.level.clone()));
+        flat.insert("message".to_string(), Value::String(self.message.clone()));
+
+        // Merge all metadata fields at root level
+        for (key, value) in &self.meta {
+            flat.insert(key.clone(), value.clone());
+        }
+
+        Value::Object(flat)
+    }
 }
 
 #[macro_export]
@@ -114,22 +130,10 @@ macro_rules! log_info {
 
 impl fmt::Display for LogInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.level, self.message)?;
-
-        if !self.meta.is_empty() {
-            write!(f, " {{")?;
-            let mut first = true;
-            for (key, value) in &self.meta {
-                if !first {
-                    write!(f, ", ")?;
-                }
-                write!(f, "{}: {}", key, value)?;
-                first = false;
-            }
-            write!(f, "}}")?;
-        }
-
-        Ok(())
+        // Only write the message field, which has already been formatted by formatters.
+        // Formatters are responsible for including level, timestamp, and other fields
+        // in the message as needed.
+        write!(f, "{}", self.message)
     }
 }
 
@@ -247,7 +251,8 @@ mod display_tests {
     #[test]
     fn test_display_without_meta() {
         let log = LogInfo::new("INFO", "Test message");
-        assert_eq!(format!("{}", log), "[INFO] Test message");
+        // Display only outputs the message field (formatters handle full formatting)
+        assert_eq!(format!("{}", log), "Test message");
     }
 
     #[test]
@@ -256,10 +261,9 @@ mod display_tests {
             .with_meta("retry", 3)
             .with_meta("host", "example.com");
 
+        // Display only outputs the message field (formatters handle full formatting)
         let display = format!("{}", log);
-        assert!(display.starts_with("[ERROR] Connection failed {"));
-        assert!(display.contains("retry: 3"));
-        assert!(display.contains("host: \"example.com\""));
+        assert_eq!(display, "Connection failed");
     }
 
     #[test]

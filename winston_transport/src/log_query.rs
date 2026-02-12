@@ -1,14 +1,9 @@
 use chrono::{DateTime, Duration, Utc};
-use dateparser::parse;
-use logform::LogInfo;
 use parse_datetime::parse_datetime;
 use regex::Regex;
-use serde_json::Value;
 use std::str::FromStr;
 
-// todo: the matches, extract_timestamp, and sort methods and functions was
-// created as a result of the FileTransport, there is a high chance it wont be used else where
-// this is as observed when creating the `MongoDDTransport`
+use crate::query_dsl::dlc::alpha::a::QueryNode;
 #[derive(Debug, Clone)]
 pub struct LogQuery {
     pub from: Option<DateTime<Utc>>,
@@ -19,6 +14,7 @@ pub struct LogQuery {
     pub levels: Vec<String>,
     pub fields: Vec<String>,
     pub search_term: Option<Regex>,
+    pub filter: Option<QueryNode>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +140,7 @@ impl LogQuery {
             fields: Vec::new(),
             levels: Vec::new(),
             search_term: None,
+            filter: None,
         }
     }
 
@@ -203,102 +200,9 @@ impl LogQuery {
         self
     }
 
-    fn extract_timestamp(entry: &LogInfo) -> Option<DateTime<Utc>> {
-        entry.meta.get("timestamp").and_then(|value| match value {
-            Value::String(ts_str) => parse(&ts_str).ok().map(|dt| dt.with_timezone(&Utc)),
-            _ => None,
-        })
-    }
-
-    pub fn matches(&self, entry: &LogInfo) -> bool {
-        //println!("checking entry: {:?}", entry);
-        // Check level
-        if !self.levels.is_empty() && !self.levels.contains(&entry.level) {
-            //println!("failed at levels check");
-            return false;
-        }
-
-        // Check timestamp
-        if let Some(from) = self.from {
-            if let Some(timestamp) = Self::extract_timestamp(entry) {
-                if timestamp < from {
-                    //println!("failed at from check");
-                    return false;
-                }
-            } else {
-                //println!("failed at from check");
-                return false;
-            }
-        }
-
-        if let Some(until) = self.until {
-            if let Some(timestamp) = Self::extract_timestamp(entry) {
-                if timestamp > until {
-                    //println!("failed at until check");
-                    return false;
-                }
-            } else {
-                //println!("failed at until check");
-                return false;
-            }
-        }
-
-        // Check search term in message
-        if let Some(ref regex) = self.search_term {
-            if !regex.is_match(&entry.message) {
-                return false;
-            }
-        }
-
-        // Check fields in meta data
-        /*for field in &self.fields {
-            // Check if the field exists in either meta or as a top-level attribute
-            let field_exists = match field.as_str() {
-                "message" => true, // message always exists
-                "level" => true,   // level always exists
-                _ => entry.meta.contains_key(field),
-            };
-
-            if !field_exists {
-                //println!("failed at field check");
-                return false;
-            }
-        }*/
-
-        true
-    }
-
-    pub fn sort(&self, entries: &mut Vec<LogInfo>) {
-        match self.order {
-            Order::Ascending => {
-                entries.sort_by(|a, b| Self::extract_timestamp(a).cmp(&Self::extract_timestamp(b)))
-            }
-            Order::Descending => {
-                entries.sort_by(|a, b| Self::extract_timestamp(b).cmp(&Self::extract_timestamp(a)))
-            }
-        }
-    }
-
-    pub fn project<'a>(&self, entry: &'a LogInfo) -> serde_json::Map<String, Value> {
-        let mut projected = serde_json::Map::new();
-
-        for field in &self.fields {
-            match field.as_str() {
-                "message" => {
-                    projected.insert("message".to_string(), Value::String(entry.message.clone()));
-                }
-                "level" => {
-                    projected.insert("level".to_string(), Value::String(entry.level.clone()));
-                }
-                other => {
-                    if let Some(val) = entry.meta.get(other) {
-                        projected.insert(other.to_string(), val.clone());
-                    }
-                }
-            }
-        }
-
-        projected
+    pub fn filter<T: Into<QueryNode>>(mut self, filter: T) -> Self {
+        self.filter = Some(filter.into());
+        self
     }
 }
 
@@ -313,39 +217,6 @@ mod test {
     use chrono::{NaiveDate, TimeZone};
 
     use super::*;
-
-    #[test]
-    fn test_log_query_projection() {
-        use serde_json::json;
-
-        /*let result: Vec<_> = entries
-        .iter()
-        .filter(|e| query.matches(e))
-        .map(|e| query.project(e))
-        .collect();*/
-
-        // Create a sample log entry
-        let log = LogInfo::new("INFO", "User login")
-            .with_meta("user", "alice")
-            .with_meta("ip", "127.0.0.1")
-            .with_meta("timestamp", "2024-04-10T12:34:56Z");
-
-        // Create a LogQuery that selects specific fields
-        let query = LogQuery::new().fields(vec!["message", "user", "ip"]);
-
-        // Apply projection
-        let projected = query.project(&log);
-
-        println!("{:?}", projected);
-
-        // Expected result
-        let mut expected = serde_json::Map::new();
-        expected.insert("message".to_string(), json!("User login"));
-        expected.insert("user".to_string(), json!("alice"));
-        expected.insert("ip".to_string(), json!("127.0.0.1"));
-
-        assert_eq!(projected, expected);
-    }
 
     #[test]
     fn test_log_query_from_and_until_with_string() {
@@ -392,11 +263,11 @@ mod test {
             second: u32,
         }
 
-        impl Into<DateTime<Utc>> for MyCustomTimeInput {
-            fn into(self) -> DateTime<Utc> {
-                let naive = NaiveDate::from_ymd_opt(self.year, self.month, self.day)
+        impl From<MyCustomTimeInput> for DateTime<Utc> {
+            fn from(val: MyCustomTimeInput) -> Self {
+                let naive = NaiveDate::from_ymd_opt(val.year, val.month, val.day)
                     .unwrap()
-                    .and_hms_opt(self.hour, self.minute, self.second)
+                    .and_hms_opt(val.hour, val.minute, val.second)
                     .unwrap();
                 Utc.from_utc_datetime(&naive)
             }

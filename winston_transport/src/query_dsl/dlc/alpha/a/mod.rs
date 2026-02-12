@@ -8,7 +8,7 @@ mod query_value;
 
 use field_comparisons::FieldComparison;
 use field_path::FieldPath;
-use query_value::QueryValue;
+pub use query_value::QueryValue;
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -58,6 +58,14 @@ impl QueryLogicNode {
             LogicalOperator::Or => self.children.iter().any(|child| child.evaluate(value)),
         }
     }
+
+    pub fn operator(&self) -> &LogicalOperator {
+        &self.operator
+    }
+
+    pub fn children(&self) -> &Vec<QueryNode> {
+        &self.children
+    }
 }
 
 impl From<QueryLogicNode> for QueryNode {
@@ -83,8 +91,8 @@ impl FieldNode {
         match self {
             FieldNode::Comparison(comp) => comp.evaluate(field_value),
             FieldNode::Logic(logic) => match logic.operator {
-                LogicalOperator::And => logic.conditions.iter().all(|c| c.evaluate(&field_value)),
-                LogicalOperator::Or => logic.conditions.iter().any(|c| c.evaluate(&field_value)),
+                LogicalOperator::And => logic.conditions.iter().all(|c| c.evaluate(field_value)),
+                LogicalOperator::Or => logic.conditions.iter().any(|c| c.evaluate(field_value)),
             },
         }
     }
@@ -141,6 +149,14 @@ impl FieldQueryNode {
             return false;
         };
         self.node.evaluate(&field_value)
+    }
+
+    pub fn path(&self) -> &FieldPath {
+        &self.path
+    }
+
+    pub fn node(&self) -> &FieldNode {
+        &self.node
     }
 }
 

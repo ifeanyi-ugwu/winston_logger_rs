@@ -64,7 +64,7 @@ impl From<HashMap<String, Value>> for FieldNode {
                         .into_iter()
                         .map(|sub_cond| {
                             if let Value::Object(map) = sub_cond {
-                                HashMap::from_iter(map.into_iter().map(|(k, v)| (k, v))).into()
+                                HashMap::from_iter(map).into()
                             } else {
                                 panic!("Expected object in logical sub-condition array");
                             }

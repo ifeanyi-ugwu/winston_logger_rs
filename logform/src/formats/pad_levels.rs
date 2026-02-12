@@ -10,6 +10,12 @@ pub struct Padder {
     paddings: HashMap<String, String>,
 }
 
+impl Default for Padder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Padder {
     pub fn new() -> Self {
         let levels: HashSet<String> = crate::config::rust::levels().into_keys().collect();
@@ -83,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_padder_with_padding() {
-        let levels = vec!["info".to_string(), "error".to_string()];
+        let levels = ["info".to_string(), "error".to_string()];
         let padder = Padder::new().with_levels(levels.iter());
 
         let log_info = LogInfo::new("error", "Test message");
@@ -94,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_padder_with_custom_filler() {
-        let levels = vec![
+        let levels = [
             "info".to_string(),
             "debug".to_string(),
             "critical".to_string(),

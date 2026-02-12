@@ -72,9 +72,16 @@ mod tests {
         assert!(result.meta.contains_key("timestamp"));
         let timestamp = result.meta.get("timestamp").unwrap().as_str().unwrap();
 
+        // RFC3339 allows variable precision for fractional seconds (0-9 digits)
+        // The regex should accept any valid RFC3339 format
         let rfc3339_regex =
-            Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}([+-]\d{2}:\d{2}|Z)$").unwrap();
-        assert!(rfc3339_regex.is_match(timestamp));
+            Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)$")
+                .unwrap();
+        assert!(
+            rfc3339_regex.is_match(timestamp),
+            "Timestamp '{}' does not match RFC3339 format",
+            timestamp
+        );
     }
 
     #[test]
