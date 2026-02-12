@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "logform"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "colored",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "winston"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "winston_file"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dateparser",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "winston_http"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "logform",
  "reqwest",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "winston_mongodb"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bson",
  "chrono",
