@@ -61,7 +61,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ "${{ inputs.crate }}" = "workspace" ]; then
-            cargo release ${{ inputs.level }} --workspace --execute --no-confirm
+            cargo release --workspace --unpublished --execute --no-confirm
           else
             cargo release ${{ inputs.level }} --package ${{ inputs.crate }} --execute --no-confirm
           fi
