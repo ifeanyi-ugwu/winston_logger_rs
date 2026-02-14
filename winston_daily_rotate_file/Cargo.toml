@@ -1,6 +1,6 @@
 [package]
 name = "winston_daily_rotate_file"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "winston-daily-rotate-file for rust"
 license = "MIT"
