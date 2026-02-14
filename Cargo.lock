@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "winston_daily_rotate_file"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "flate2",
@@ -3192,7 +3192,7 @@ dependencies = [
 
 [[package]]
 name = "winston_proxy_transport"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "logform",
  "winston_transport",
