@@ -1,6 +1,8 @@
 use chrono::{DateTime, Local, Utc};
 use flate2::{write::GzEncoder, Compression};
 use logform::{Format, LogInfo};
+use std::cell::RefCell;
+use std::fmt::Write as FmtWrite;
 use std::fs::{create_dir_all, read_dir, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -389,29 +391,33 @@ impl Transport<LogInfo> for DailyRotateFile {
             return;
         }
 
-        // Calculate the total size of the batch to determine if rotation is needed before writing
-        let total_batch_size: usize = infos
-            .iter()
-            .map(|info| format!("{}\n", info.message).len())
-            .sum();
-
-        if self.should_rotate(total_batch_size) {
-            self.rotate();
+        thread_local! {
+            static BUF: RefCell<String> = RefCell::new(String::new());
         }
 
-        let mut file = match self.file.lock() {
-            Ok(f) => f,
-            Err(_) => {
-                eprintln!("Failed to acquire file lock for batch logging");
-                return;
+        BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            for info in &infos {
+                let _ = writeln!(buf, "{}", info.message);
             }
-        };
 
-        for info in infos {
-            if let Err(e) = writeln!(file, "{}", info.message) {
-                eprintln!("Failed to write log entry in batch: {}", e);
+            if self.should_rotate(buf.len()) {
+                self.rotate();
             }
-        }
+
+            let mut file = match self.file.lock() {
+                Ok(f) => f,
+                Err(_) => {
+                    eprintln!("Failed to acquire file lock for batch logging");
+                    return;
+                }
+            };
+
+            if let Err(e) = file.write_all(buf.as_bytes()) {
+                eprintln!("Failed to write log batch: {}", e);
+            }
+        });
     }
 
     fn flush(&self) -> Result<(), String> {
