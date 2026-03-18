@@ -3,7 +3,9 @@ use chrono::{DateTime, Utc};
 use dateparser::parse;
 use logform::{Format, LogInfo};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -178,12 +180,23 @@ impl Transport<LogInfo> for FileTransport {
     }
 
     fn log_batch(&self, logs: Vec<LogInfo>) {
-        let mut file = self.file.lock().unwrap();
-        for info in logs {
-            if let Err(e) = writeln!(file, "{}", info.message) {
+        if logs.is_empty() {
+            return;
+        }
+        thread_local! {
+            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
+        }
+        BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            for info in logs {
+                let _ = writeln!(buf, "{}", info.message);
+            }
+            let mut file = self.file.lock().unwrap();
+            if let Err(e) = file.write_all(buf.as_bytes()) {
                 eprintln!("Failed to write to log file in batch: {}", e);
             }
-        }
+        });
     }
 
     fn flush(&self) -> Result<(), String> {
