@@ -392,7 +392,7 @@ impl Transport<LogInfo> for DailyRotateFile {
         }
 
         thread_local! {
-            static BUF: RefCell<String> = RefCell::new(String::new());
+            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
 
         BUF.with(|buf| {

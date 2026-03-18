@@ -210,7 +210,7 @@ where
 {
     fn log(&self, info: L) {
         thread_local! {
-            static BUF: RefCell<String> = RefCell::new(String::new());
+            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
         BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
@@ -227,7 +227,7 @@ where
             return;
         }
         thread_local! {
-            static BUF: RefCell<String> = RefCell::new(String::new());
+            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
         BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
@@ -296,7 +296,7 @@ where
 {
     fn log(&self, info: L) {
         thread_local! {
-            static BUF: RefCell<String> = RefCell::new(String::new());
+            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
         BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
@@ -313,7 +313,7 @@ where
             return;
         }
         thread_local! {
-            static BUF: RefCell<String> = RefCell::new(String::new());
+            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
         BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
