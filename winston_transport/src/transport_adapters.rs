@@ -14,7 +14,7 @@
 use crate::Transport;
 use std::{
     cell::RefCell,
-    fmt::Display,
+    fmt::{Display, Write as FmtWrite},
     io::{self, Write},
     sync::Mutex,
 };
@@ -209,27 +209,36 @@ where
     L: Display,
 {
     fn log(&self, info: L) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writeln!(writer, "{}", info);
+        thread_local! {
+            static BUF: RefCell<String> = RefCell::new(String::new());
         }
+        BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            let _ = writeln!(buf, "{}", info);
+            if let Ok(mut writer) = self.writer.lock() {
+                let _ = writer.write_all(buf.as_bytes());
+            }
+        });
     }
 
     fn log_batch(&self, infos: Vec<L>) {
         if infos.is_empty() {
             return;
         }
-        if let Ok(mut writer) = self.writer.lock() {
-            for info in infos {
-                if let Err(e) = writeln!(writer, "{}", info) {
-                    eprintln!(
-                        "Failed to write log entry in batch to WriterTransport: {}",
-                        e
-                    );
-                }
-            }
-        } else {
-            eprintln!("Failed to acquire writer lock for WriterTransport batch logging");
+        thread_local! {
+            static BUF: RefCell<String> = RefCell::new(String::new());
         }
+        BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            for info in infos {
+                let _ = writeln!(buf, "{}", info);
+            }
+            if let Ok(mut writer) = self.writer.lock() {
+                let _ = writer.write_all(buf.as_bytes());
+            }
+        });
     }
 
     fn flush(&self) -> Result<(), String> {
@@ -286,28 +295,36 @@ where
     L: Display,
 {
     fn log(&self, info: L) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writeln!(writer, "{}", info);
+        thread_local! {
+            static BUF: RefCell<String> = RefCell::new(String::new());
         }
+        BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            let _ = writeln!(buf, "{}", info);
+            if let Ok(mut writer) = self.writer.lock() {
+                let _ = writer.write_all(buf.as_bytes());
+            }
+        });
     }
 
     fn log_batch(&self, infos: Vec<L>) {
         if infos.is_empty() {
             return;
         }
-
-        if let Ok(mut writer) = self.writer.lock() {
-            for info in infos {
-                if let Err(e) = writeln!(writer, "{}", info) {
-                    eprintln!(
-                        "Failed to write log entry in batch to WriterTransportRef: {}",
-                        e
-                    );
-                }
-            }
-        } else {
-            eprintln!("Failed to acquire writer lock for WriterTransportRef batch logging");
+        thread_local! {
+            static BUF: RefCell<String> = RefCell::new(String::new());
         }
+        BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            for info in infos {
+                let _ = writeln!(buf, "{}", info);
+            }
+            if let Ok(mut writer) = self.writer.lock() {
+                let _ = writer.write_all(buf.as_bytes());
+            }
+        });
     }
 
     fn flush(&self) -> Result<(), String> {
