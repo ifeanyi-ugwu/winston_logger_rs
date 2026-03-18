@@ -180,10 +180,7 @@ impl Logger {
     fn refresh_effective_levels(state: &mut SharedState, severity_cache: &AtomicU8) {
         let min_required_severity = Self::compute_min_severity(&state.options);
         state.min_required_severity = min_required_severity;
-        severity_cache.store(
-            min_required_severity.unwrap_or(u8::MAX),
-            Ordering::Relaxed,
-        );
+        severity_cache.store(min_required_severity.unwrap_or(u8::MAX), Ordering::Relaxed);
     }
 
     fn worker_loop(
