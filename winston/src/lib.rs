@@ -10,8 +10,8 @@ pub mod transports;
 #[cfg(feature = "log-backend")]
 pub use global::register_with_log;
 pub use global::{
-    add_transport, close, configure, flush, init, is_initialized, log, query, remove_transport,
-    try_log,
+    add_transport, close, configure, flush, init, is_initialized, is_level_enabled_fast, log,
+    query, remove_transport, try_log,
 };
 pub use logform as format;
 pub use logger::Logger;

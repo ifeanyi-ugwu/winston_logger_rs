@@ -53,6 +53,16 @@ pub fn log(entry: logform::LogInfo) {
     global_logger().log(entry);
 }
 
+/// Lock-free level check against the global logger.
+/// Returns `true` if the global logger is not yet initialized (let the later
+/// `log()` call handle the panic) or if the level passes the cached filter.
+pub fn is_level_enabled_fast(level: &str) -> bool {
+    match try_global_logger() {
+        Some(logger) => logger.is_level_enabled_fast(level),
+        None => true,
+    }
+}
+
 /// Try to log without panicking if not initialized.
 /// Returns false if logger not initialized.
 pub fn try_log(entry: logform::LogInfo) -> bool {

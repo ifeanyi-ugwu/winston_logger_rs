@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -61,6 +61,7 @@ impl<'a> TransportBuilder<'a> {
         } else {
             state.options.transports = Some(vec![(handle, self.logger_transport)]);
         }
+        Logger::refresh_effective_levels(&mut state, &self.logger.min_required_severity_cache);
 
         handle
     }
@@ -90,6 +91,11 @@ pub struct Logger {
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
     flush_complete: Arc<(Mutex<bool>, Condvar)>,
     is_closed: AtomicBool,
+    // Cached min required severity for lock-free pre-filtering on the caller side.
+    // u8::MAX means "no filter configured — accept everything".
+    min_required_severity_cache: AtomicU8,
+    // Cached backpressure strategy: 0 = Block, 1 = DropOldest, 2 = DropCurrent.
+    backpressure_cache: AtomicU8,
 }
 
 impl Logger {
@@ -100,8 +106,9 @@ impl Logger {
         let flush_complete = Arc::new((Mutex::new(false), Condvar::new()));
 
         let shared_receiver = Arc::new(receiver);
-        // Pre-compute effective levels
+        // Pre-compute effective levels and cache values before options is moved.
         let min_required_severity = Self::compute_min_severity(&options);
+        let bp_cache = Self::encode_backpressure(options.backpressure_strategy.as_ref());
         let shared_state = Arc::new(RwLock::new(SharedState {
             options,
             min_required_severity,
@@ -124,6 +131,8 @@ impl Logger {
             );
         });
 
+        let severity_cache = min_required_severity.unwrap_or(u8::MAX);
+
         Logger {
             worker_thread: Mutex::new(Some(worker_thread)),
             sender,
@@ -132,6 +141,8 @@ impl Logger {
             receiver: shared_receiver,
             flush_complete,
             is_closed: AtomicBool::new(false),
+            min_required_severity_cache: AtomicU8::new(severity_cache),
+            backpressure_cache: AtomicU8::new(bp_cache),
         }
     }
 
@@ -158,10 +169,21 @@ impl Logger {
         min_severity
     }
 
-    /// Update the cached levels when configuration changes
-    fn refresh_effective_levels(state: &mut SharedState) {
+    fn encode_backpressure(strategy: Option<&BackpressureStrategy>) -> u8 {
+        match strategy.unwrap_or(&BackpressureStrategy::Block) {
+            BackpressureStrategy::Block => 0,
+            BackpressureStrategy::DropOldest => 1,
+            BackpressureStrategy::DropCurrent => 2,
+        }
+    }
+
+    fn refresh_effective_levels(state: &mut SharedState, severity_cache: &AtomicU8) {
         let min_required_severity = Self::compute_min_severity(&state.options);
         state.min_required_severity = min_required_severity;
+        severity_cache.store(
+            min_required_severity.unwrap_or(u8::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     fn worker_loop(
@@ -325,6 +347,22 @@ impl Logger {
         false
     }
 
+    /// Lock-free level check for use in the caller's hot path.
+    ///
+    /// Reads the cached min severity with a single atomic load. When no filter is
+    /// configured the sentinel value `u8::MAX` is stored and this returns `true`
+    /// immediately. Otherwise falls back to a read-locked check so that custom
+    /// level maps are respected. Either way, this returns before any `LogInfo`
+    /// allocation.
+    pub fn is_level_enabled_fast(&self, level: &str) -> bool {
+        let min = self.min_required_severity_cache.load(Ordering::Relaxed);
+        if min == u8::MAX {
+            return true;
+        }
+        let state = self.shared_state.read();
+        Self::is_level_enabled(level, &state)
+    }
+
     pub fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
         let state = self.shared_state.read();
         let mut results = Vec::new();
@@ -374,28 +412,15 @@ impl Logger {
 
     /// Handles backpressure strategies when the channel is full.
     fn handle_full_channel(&self, entry: Arc<LogInfo>) {
-        let strategy = {
-            let state = self.shared_state.read();
-            state
-                .options
-                .backpressure_strategy
-                .clone()
-                .unwrap_or(BackpressureStrategy::Block)
-        };
-
-        match strategy {
-            BackpressureStrategy::DropOldest => {
-                self.drop_oldest_and_retry(entry);
-            }
-            BackpressureStrategy::Block => {
-                // Block until the channel has space
+        match self.backpressure_cache.load(Ordering::Relaxed) {
+            1 => self.drop_oldest_and_retry(entry),
+            2 => eprintln!(
+                "[winston] Dropping current log entry due to full channel: {}",
+                entry.message
+            ),
+            _ => {
+                // Block until the channel has space (default)
                 let _ = self.sender.send(LogMessage::Entry(entry));
-            }
-            BackpressureStrategy::DropCurrent => {
-                eprintln!(
-                    "[winston] Dropping current log entry due to full channel: {}",
-                    entry.message
-                );
             }
         }
     }
@@ -509,7 +534,7 @@ impl Logger {
             }
         }
 
-        Self::refresh_effective_levels(&mut state);
+        Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
         drop(state); // Release write lock
 
         // Process buffered entries with new configuration
@@ -564,6 +589,7 @@ impl Logger {
         } else {
             state.options.transports = Some(vec![(handle, logger_transport)]);
         }
+        Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
 
         handle
     }
@@ -576,6 +602,7 @@ impl Logger {
         if let Some(transports) = &mut state.options.transports {
             if let Some(index) = transports.iter().position(|(h, _)| *h == handle) {
                 transports.remove(index);
+                Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
                 return true;
             }
         }
