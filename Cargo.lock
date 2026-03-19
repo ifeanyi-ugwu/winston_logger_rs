@@ -1640,6 +1640,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin-project"
+version = "1.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1749c7ed4bcaf4c3d0a3efc28538844fb29bcdd7d2b67b2be7e20ba861ff517"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9b20ed30f105399776b9c883e68e536ef602a16ae6f596d2c473591d6ad64c6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2798,6 +2818,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "whatwg_streams"
+version = "0.1.0-alpha.7"
+dependencies = [
+ "futures",
+ "parking_lot",
+ "pin-project",
+]
+
+[[package]]
 name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3130,12 +3159,15 @@ dependencies = [
  "chrono",
  "criterion",
  "crossbeam-channel",
+ "futures",
  "log",
  "logform",
  "parking_lot",
  "serde",
  "serde_json",
  "serial_test",
+ "tokio",
+ "whatwg_streams",
  "winston_file",
  "winston_transport",
 ]

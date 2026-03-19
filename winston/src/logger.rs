@@ -2,8 +2,10 @@ use crate::{
     logger_builder::LoggerBuilder,
     logger_options::{BackpressureStrategy, LoggerOptions},
     logger_transport::{IntoLoggerTransport, LoggerTransport},
+    pipeline::{self, PipelineMessage},
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use futures::channel::mpsc as fmpsc;
 use logform::LogInfo;
 use parking_lot::RwLock;
 use std::{
@@ -14,12 +16,11 @@ use std::{
     },
     thread,
 };
+use tokio::runtime::Runtime;
 use winston_transport::{LogQuery, Transport};
 
-// Static counter for generating unique transport IDs
 static NEXT_TRANSPORT_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// A handle for referencing and removing transports
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TransportHandle(usize);
 
@@ -29,20 +30,17 @@ impl TransportHandle {
     }
 }
 
-/// Builder for configuring a transport before adding it to the logger
 pub struct TransportBuilder<'a> {
     logger: &'a Logger,
     logger_transport: LoggerTransport<LogInfo>,
 }
 
 impl<'a> TransportBuilder<'a> {
-    /// Set a custom log level for this transport
     pub fn with_level(mut self, level: impl Into<String>) -> Self {
         self.logger_transport = self.logger_transport.with_level(level);
         self
     }
 
-    /// Set a custom format for this transport
     pub fn with_format<F>(mut self, format: F) -> Self
     where
         F: logform::Format<Input = LogInfo> + Send + Sync + 'static,
@@ -51,100 +49,171 @@ impl<'a> TransportBuilder<'a> {
         self
     }
 
-    /// Consume the builder and add the transport to the logger, returning a handle
     pub fn add(self) -> TransportHandle {
-        let handle = TransportHandle::new();
-
-        let mut state = self.logger.shared_state.write();
-        if let Some(transports) = &mut state.options.transports {
-            transports.push((handle, self.logger_transport));
-        } else {
-            state.options.transports = Some(vec![(handle, self.logger_transport)]);
-        }
-        Logger::refresh_effective_levels(&mut state, &self.logger.min_required_severity_cache);
-
-        handle
+        self.logger.add_transport(self.logger_transport)
     }
 }
+
+// ── Crossbeam bridge messages ────────────────────────────────────────────────
+// These flow from the sync caller → bridge thread → pipeline channel.
 
 #[derive(Debug)]
 pub enum LogMessage {
     Entry(Arc<LogInfo>),
-    //Configure(LoggerOptions),
     Shutdown,
     Flush,
 }
 
+// ── Shared state (level metadata only — transports live in FanoutSink) ───────
+
 #[derive(Debug)]
 pub(crate) struct SharedState {
     pub(crate) options: LoggerOptions,
-    // Cache the minimum severity needed for any transport to accept a log
     min_required_severity: Option<u8>,
+    /// Level metadata for each active transport, used only for pre-filter
+    /// cache recomputation when transports are added/removed.
+    transport_levels: Vec<(TransportHandle, Option<String>)>,
 }
 
-#[derive(Debug)]
+// ── Logger ───────────────────────────────────────────────────────────────────
+
 pub struct Logger {
-    worker_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Sync caller interface — same as before.
     sender: Sender<LogMessage>,
     receiver: Arc<Receiver<LogMessage>>,
+
     pub(crate) shared_state: Arc<RwLock<SharedState>>,
+
+    /// Entries buffered when no transports are present.  Shared with FanoutSink.
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+
     flush_complete: Arc<(Mutex<bool>, Condvar)>,
     is_closed: AtomicBool,
-    // Cached min required severity for lock-free pre-filtering on the caller side.
-    // u8::MAX means "no filter configured — accept everything".
+
+    /// Lock-free pre-filter cache; u8::MAX means "accept everything".
     min_required_severity_cache: AtomicU8,
-    // Cached backpressure strategy: 0 = Block, 1 = DropOldest, 2 = DropCurrent.
     backpressure_cache: AtomicU8,
+
+    /// Sender into the async pipeline (via bridge thread).
+    pipeline_tx: fmpsc::UnboundedSender<PipelineMessage>,
+
+    /// Dedicated tokio runtime that owns all pipeline tasks.
+    _runtime: Arc<Runtime>,
+
+    bridge_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Logger {
     pub fn new(options: Option<LoggerOptions>) -> Self {
         let options = options.unwrap_or_default();
         let capacity = options.channel_capacity.unwrap_or(1024);
-        let (sender, receiver) = bounded(capacity);
+        let (sender, receiver) = bounded::<LogMessage>(capacity);
         let flush_complete = Arc::new((Mutex::new(false), Condvar::new()));
 
         let shared_receiver = Arc::new(receiver);
-        // Pre-compute effective levels and cache values before options is moved.
+
         let min_required_severity = Self::compute_min_severity(&options);
         let bp_cache = Self::encode_backpressure(options.backpressure_strategy.as_ref());
+
+        let transport_levels: Vec<(TransportHandle, Option<String>)> = options
+            .transports
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|(h, t)| (*h, t.get_level().cloned()))
+            .collect();
+
         let shared_state = Arc::new(RwLock::new(SharedState {
-            options,
+            options: options.clone(),
             min_required_severity,
+            transport_levels,
         }));
 
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
 
-        let worker_receiver = Arc::clone(&shared_receiver);
-        let worker_shared_state = Arc::clone(&shared_state);
-        let worker_buffer = Arc::clone(&buffer);
-        let worker_flush_complete = Arc::clone(&flush_complete);
+        // Build a single-threaded tokio runtime for the pipeline.
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("winston-pipeline")
+                .build()
+                .expect("failed to build tokio runtime for winston pipeline"),
+        );
 
-        // Spawn a worker thread to handle logging
-        let worker_thread = thread::spawn(move || {
-            Self::worker_loop(
-                worker_receiver,
-                worker_shared_state,
-                worker_buffer,
-                worker_flush_complete,
-            );
-        });
+        // Build the pipeline inside the runtime so all spawns go there.
+        let pipeline_tx =
+            runtime.block_on(async { pipeline::build_pipeline(&options, Arc::clone(&buffer)) });
+
+        // Bridge thread: crossbeam → pipeline channel.
+        let bridge_pipeline_tx = pipeline_tx.clone();
+        let bridge_flush_complete = Arc::clone(&flush_complete);
+        let bridge_receiver = Arc::clone(&shared_receiver);
+
+        let bridge_thread = thread::Builder::new()
+            .name("winston-bridge".into())
+            .spawn(move || {
+                Self::bridge_loop(bridge_receiver, bridge_pipeline_tx, bridge_flush_complete);
+            })
+            .expect("failed to spawn winston bridge thread");
 
         let severity_cache = min_required_severity.unwrap_or(u8::MAX);
 
         Logger {
-            worker_thread: Mutex::new(Some(worker_thread)),
             sender,
+            receiver: shared_receiver,
             shared_state,
             buffer,
-            receiver: shared_receiver,
             flush_complete,
             is_closed: AtomicBool::new(false),
             min_required_severity_cache: AtomicU8::new(severity_cache),
             backpressure_cache: AtomicU8::new(bp_cache),
+            pipeline_tx,
+            _runtime: runtime,
+            bridge_thread: Mutex::new(Some(bridge_thread)),
         }
     }
+
+    // ── Bridge ────────────────────────────────────────────────────────────────
+
+    fn bridge_loop(
+        receiver: Arc<Receiver<LogMessage>>,
+        pipeline_tx: fmpsc::UnboundedSender<PipelineMessage>,
+        flush_complete: Arc<(Mutex<bool>, Condvar)>,
+    ) {
+        for msg in receiver.iter() {
+            match msg {
+                LogMessage::Entry(entry) => {
+                    if pipeline_tx
+                        .unbounded_send(PipelineMessage::Entry(entry))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                LogMessage::Flush => {
+                    // Send flush into the pipeline and let FanoutSink signal
+                    // the condvar when all transports have flushed.
+                    let fc = Arc::clone(&flush_complete);
+                    if pipeline_tx
+                        .unbounded_send(PipelineMessage::Flush(fc))
+                        .is_err()
+                    {
+                        // Pipeline gone — signal immediately so caller doesn't hang.
+                        let (lock, cvar) = &*flush_complete;
+                        let mut done = lock.lock().unwrap();
+                        *done = true;
+                        cvar.notify_one();
+                    }
+                }
+                LogMessage::Shutdown => {
+                    let _ = pipeline_tx.unbounded_send(PipelineMessage::Shutdown);
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── Level helpers ─────────────────────────────────────────────────────────
 
     fn compute_min_severity(options: &LoggerOptions) -> Option<u8> {
         let levels = options.levels.as_ref()?;
@@ -178,159 +247,33 @@ impl Logger {
     }
 
     fn refresh_effective_levels(state: &mut SharedState, severity_cache: &AtomicU8) {
-        let min_required_severity = Self::compute_min_severity(&state.options);
-        state.min_required_severity = min_required_severity;
-        severity_cache.store(min_required_severity.unwrap_or(u8::MAX), Ordering::Relaxed);
-    }
-
-    fn worker_loop(
-        receiver: Arc<Receiver<LogMessage>>,
-        shared_state: Arc<RwLock<SharedState>>,
-        buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-        flush_complete: Arc<(Mutex<bool>, Condvar)>,
-    ) {
-        for message in receiver.iter() {
-            match message {
-                LogMessage::Entry(entry) => {
-                    // Use read lock to check if we have transports (allows parallelism)
-                    let has_transports = {
-                        let state = shared_state.read();
-                        state
-                            .options
-                            .transports
-                            .as_ref()
-                            .is_some_and(|t| !t.is_empty())
-                    };
-
-                    if !has_transports {
-                        // Only buffer lock needed here
-                        let mut buf = buffer.lock().unwrap();
-                        buf.push_back(Arc::clone(&entry));
-                        eprintln!(
-                            "[winston] Attempt to write logs with no transports, which can increase memory usage: {}",
-                            entry.message
-                        );
-                    } else {
-                        // Process any buffered entries first
-                        Self::process_buffered_entries(&shared_state, &buffer);
-
-                        // Process current entry with read lock (allows parallel processing)
-                        let state = shared_state.read();
-                        Self::process_entry(&entry, &state);
-                    }
-                }
-                /*LogMessage::Configure(new_options) => {
-                    let mut state = shared_state.write();
-                    // Update only the provided options
-                    if let Some(level) = new_options.level {
-                        state.options.level = Some(level);
-                    }
-                    if let Some(levels) = new_options.levels {
-                        state.options.levels = Some(levels);
-                    }
-                    if let Some(transports) = new_options.transports {
-                        state.options.transports = Some(transports);
-                    }
-                    if let Some(format) = new_options.format {
-                        state.options.format = Some(format);
-                    }
-
-                    Self::refresh_effective_levels(&mut state);
-                    drop(state); // Release write lock before processing buffer
-
-                    // Process buffered entries with new configuration
-                    Self::process_buffered_entries(&shared_state, &buffer);
-                }*/
-                LogMessage::Shutdown => {
-                    Self::process_buffered_entries(&shared_state, &buffer);
-                    break;
-                }
-                LogMessage::Flush => {
-                    let state = shared_state.read();
-
-                    if state
-                        .options
-                        .transports
-                        .as_ref()
-                        .is_some_and(|t| !t.is_empty())
-                    {
-                        drop(state); // Release read lock
-                        Self::process_buffered_entries(&shared_state, &buffer);
-
-                        let state = shared_state.read();
-                        if let Some(transports) = &state.options.transports {
-                            for (_handle, transport) in transports {
-                                let _ = transport.get_transport().flush();
-                            }
-                        }
-                    }
-
-                    let (lock, cvar) = &*flush_complete;
-                    let mut completed = lock.lock().unwrap();
-                    *completed = true;
-                    cvar.notify_one();
-                }
+        // Recompute using transport_levels list (not from options.transports, which
+        // may be stale — the real transports live in FanoutSink).
+        let levels = match &state.options.levels {
+            Some(l) => l,
+            None => {
+                state.min_required_severity = None;
+                severity_cache.store(u8::MAX, Ordering::Relaxed);
+                return;
             }
-        }
-    }
-
-    fn process_buffered_entries(
-        shared_state: &Arc<RwLock<SharedState>>,
-        buffer: &Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-    ) {
-        // Drain all buffered entries at once
-        let entries = {
-            let mut buf = buffer.lock().unwrap();
-            buf.drain(..).collect::<Vec<_>>()
         };
 
-        if entries.is_empty() {
-            return;
-        }
+        let mut min_sev = state
+            .options
+            .level
+            .as_deref()
+            .and_then(|l| levels.get_severity(l));
 
-        // Process with read lock (allows parallelism)
-        let state = shared_state.read();
-        for entry in entries {
-            Self::process_entry(&entry, &state);
-        }
-    }
-
-    fn process_entry(entry: &Arc<LogInfo>, state: &SharedState) {
-        if entry.message.is_empty() && entry.meta.is_empty() {
-            return;
-        }
-
-        let options = &state.options;
-        if let Some(transports) = &options.transports {
-            for (_handle, transport) in transports {
-                // Check if this transport cares about the level
-                let effective_level = transport.get_level().or(options.level.as_ref());
-
-                if let (Some(levels), Some(effective_level)) = (&options.levels, effective_level) {
-                    if let (Some(entry_sev), Some(required_sev)) = (
-                        levels.get_severity(&entry.level),
-                        levels.get_severity(effective_level),
-                    ) {
-                        if entry_sev > required_sev {
-                            continue; // skip: not enabled
-                        }
-                    } else {
-                        // If we can't get severity for either level, skip this transport
-                        continue;
-                    }
-                }
-
-                let formatted_message = match (transport.get_format(), &options.format) {
-                    (Some(tf), Some(_lf)) => tf.transform((**entry).clone()),
-                    (Some(tf), None) => tf.transform((**entry).clone()),
-                    (None, Some(lf)) => lf.transform((**entry).clone()),
-                    (None, None) => Some((**entry).clone()),
-                };
-                if let Some(msg) = formatted_message {
-                    transport.get_transport().log(msg);
+        for (_h, transport_level) in &state.transport_levels {
+            if let Some(tl) = transport_level {
+                if let Some(sev) = levels.get_severity(tl) {
+                    min_sev = Some(min_sev.map_or(sev, |cur: u8| cur.max(sev)));
                 }
             }
         }
+
+        state.min_required_severity = min_sev;
+        severity_cache.store(min_sev.unwrap_or(u8::MAX), Ordering::Relaxed);
     }
 
     fn is_level_enabled(entry_level: &str, state: &SharedState) -> bool {
@@ -344,13 +287,13 @@ impl Logger {
         false
     }
 
+    // ── Public API ────────────────────────────────────────────────────────────
+
     /// Lock-free level check for use in the caller's hot path.
     ///
-    /// Reads the cached min severity with a single atomic load. When no filter is
-    /// configured the sentinel value `u8::MAX` is stored and this returns `true`
-    /// immediately. Otherwise falls back to a read-locked check so that custom
-    /// level maps are respected. Either way, this returns before any `LogInfo`
-    /// allocation.
+    /// Reads the cached min severity with a single atomic load. When no filter
+    /// is configured the sentinel `u8::MAX` means "accept everything" and this
+    /// returns true immediately.
     pub fn is_level_enabled_fast(&self, level: &str) -> bool {
         let min = self.min_required_severity_cache.load(Ordering::Relaxed);
         if min == u8::MAX {
@@ -360,23 +303,6 @@ impl Logger {
         Self::is_level_enabled(level, &state)
     }
 
-    pub fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
-        let state = self.shared_state.read();
-        let mut results = Vec::new();
-
-        // Query each transport
-        if let Some(transports) = &state.options.transports {
-            for (_handle, transport) in transports {
-                match transport.get_transport().query(options) {
-                    Ok(mut logs) => results.append(&mut logs),
-                    Err(e) => return Err(format!("Query failed: {}", e)),
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
     pub fn log(&self, entry: LogInfo) {
         let entry = Arc::new(entry);
         match self.sender.try_send(LogMessage::Entry(entry)) {
@@ -384,10 +310,6 @@ impl Logger {
             Err(TrySendError::Full(LogMessage::Entry(entry))) => {
                 self.handle_full_channel(entry);
             }
-            /*Err(TrySendError::Full(LogMessage::Configure(config))) => {
-                eprintln!("[winston] Channel is full, forcing config update.");
-                let _ = self.sender.send(LogMessage::Configure(config));
-            }*/
             Err(TrySendError::Full(LogMessage::Shutdown)) => {
                 eprintln!("[winston] Channel is full, forcing shutdown.");
                 let _ = self.sender.send(LogMessage::Shutdown);
@@ -407,7 +329,6 @@ impl Logger {
         let _ = self.sender.send(LogMessage::Entry(entry));
     }
 
-    /// Handles backpressure strategies when the channel is full.
     fn handle_full_channel(&self, entry: Arc<LogInfo>) {
         match self.backpressure_cache.load(Ordering::Relaxed) {
             1 => self.drop_oldest_and_retry(entry),
@@ -416,58 +337,23 @@ impl Logger {
                 entry.message
             ),
             _ => {
-                // Block until the channel has space (default)
                 let _ = self.sender.send(LogMessage::Entry(entry));
             }
         }
     }
 
-    /// Drops the oldest log message from the channel and attempts to send the new one.
     fn drop_oldest_and_retry(&self, entry: Arc<LogInfo>) {
-        // Try to remove the oldest message from the channel using the shared receiver
         if let Ok(oldest) = self.receiver.try_recv() {
             eprintln!(
                 "[winston] Dropped oldest log entry due to full channel: {:?}",
                 oldest
             );
         }
-
-        // Now try to send the new entry again
         if let Err(e) = self.sender.try_send(LogMessage::Entry(entry)) {
             eprintln!(
                 "[winston] Failed to log after dropping oldest. Dropping current message: {:?}",
                 e.into_inner()
             );
-        }
-    }
-
-    pub fn close(&self) {
-        if self.is_closed.swap(true, Ordering::SeqCst) {
-            return;
-        }
-
-        if let Err(e) = self.flush() {
-            eprintln!("Error flushing logs: {}", e);
-        }
-
-        let _ = self.sender.send(LogMessage::Shutdown);
-
-        // Wake all threads waiting on flush BEFORE joining worker
-        {
-            let (lock, cvar) = &*self.flush_complete;
-            let mut completed = lock.lock().unwrap();
-            *completed = true; // Set to true so they don't wait again
-            cvar.notify_all(); // Wake ALL waiting threads
-        }
-
-        if let Ok(mut thread_handle) = self.worker_thread.lock() {
-            if let Some(handle) = thread_handle.take() {
-                if let Err(e) = handle.join() {
-                    eprintln!("Error joining worker thread: {:?}", e);
-                }
-            }
-        } else {
-            eprintln!("Error acquiring lock on worker thread handle during close.");
         }
     }
 
@@ -480,7 +366,6 @@ impl Logger {
         let mut completed = lock.lock().unwrap();
         *completed = false;
 
-        // If send fails, worker is gone
         if self.sender.send(LogMessage::Flush).is_err() {
             return Ok(());
         }
@@ -492,62 +377,66 @@ impl Logger {
         Ok(())
     }
 
-    pub fn builder() -> LoggerBuilder {
-        LoggerBuilder::new()
-    }
-
-    /// Updates the logger configuration with new options, following this fallback chain:
-    /// new options -> existing options -> defaults. Always clears existing transports
-    /// and processes buffered entries after updating.
-    ///
-    /// Note: The backpressure strategy and channel capacity are not reconfigured, as they are only used during logger creation.
-    ///
-    /// # Arguments
-    /// * `new_options` - Optional new configuration. If `None`, the existing configuration is retained.
-    pub fn configure(&self, new_options: Option<LoggerOptions>) {
-        let mut state = self.shared_state.write();
-        let default_options = LoggerOptions::default();
-
-        if let Some(t) = state.options.transports.as_mut() {
-            t.clear();
+    pub fn close(&self) {
+        if self.is_closed.swap(true, Ordering::SeqCst) {
+            return;
         }
 
-        if let Some(options) = new_options {
-            state.options.format = options
-                .format
-                .or_else(|| state.options.format.take().or(default_options.format));
-
-            state.options.levels = options
-                .levels
-                .or_else(|| state.options.levels.take().or(default_options.levels));
-
-            state.options.level = options
-                .level
-                .or_else(|| state.options.level.take().or(default_options.level));
-
-            // Add all transports we have been provided
-            if let Some(transports) = options.transports {
-                state.options.transports = Some(transports);
+        // Flush inline: flush() guards against is_closed so we can't call it here.
+        // The Flush message travels through the pipeline and, once FanoutSink has
+        // forwarded it to every transport task and they all respond, it signals the
+        // condvar — guaranteeing every queued entry is written before we proceed.
+        {
+            let (lock, cvar) = &*self.flush_complete;
+            let mut completed = lock.lock().unwrap();
+            *completed = false;
+            if self.sender.send(LogMessage::Flush).is_ok() {
+                while !*completed {
+                    completed = cvar.wait(completed).unwrap();
+                }
             }
         }
 
-        Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
-        drop(state); // Release write lock
+        let _ = self.sender.send(LogMessage::Shutdown);
 
-        // Process buffered entries with new configuration
-        Self::process_buffered_entries(&self.shared_state, &self.buffer);
+        // Unblock any other threads that may be waiting on flush_complete.
+        {
+            let (lock, cvar) = &*self.flush_complete;
+            let mut completed = lock.lock().unwrap();
+            *completed = true;
+            cvar.notify_all();
+        }
+
+        if let Ok(mut handle) = self.bridge_thread.lock() {
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
+        }
     }
 
-    /// Start building a transport configuration. Use the builder to configure
-    /// level and format, then call `.add()` to add it to the logger.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let handle = logger.transport(stdout())
-    ///     .with_level("error")
-    ///     .with_format(json())
-    ///     .add();
-    /// ```
+    pub fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
+        // Query is still forwarded via shared_state transport list — transports
+        // that support query need to be accessible here too. For now we keep a
+        // separate Arc<dyn Transport> list just for query support.
+        //
+        // TODO: in a follow-up, route query requests through the pipeline.
+        let state = self.shared_state.read();
+        let mut results = Vec::new();
+
+        if let Some(transports) = &state.options.transports {
+            for (_handle, transport) in transports {
+                match transport.get_transport().query(options) {
+                    Ok(mut logs) => results.append(&mut logs),
+                    Err(e) => return Err(format!("Query failed: {}", e)),
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    // ── Dynamic transport management ─────────────────────────────────────────
+
     pub fn transport(
         &self,
         transport: impl Transport<LogInfo> + Send + Sync + 'static,
@@ -558,52 +447,130 @@ impl Logger {
         }
     }
 
-    /// Convenience method: add a transport directly without configuration.
-    ///
-    /// Accepts either a raw transport or a pre-configured `LoggerTransport`.
-    /// Returns a handle that can be used to remove the transport later.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Raw transport
-    /// let handle = logger.add_transport(stdout());
-    ///
-    /// // Pre-configured transport
-    /// let configured = LoggerTransport::new(Arc::new(stdout()))
-    ///     .with_level("error");
-    /// let handle = logger.add_transport(configured);
-    ///
-    /// // Later...
-    /// logger.remove_transport(handle);
-    /// ```
     pub fn add_transport(&self, transport: impl IntoLoggerTransport) -> TransportHandle {
         let handle = TransportHandle::new();
         let logger_transport = transport.into_logger_transport();
+        let level = logger_transport.get_level().cloned();
 
-        let mut state = self.shared_state.write();
-        if let Some(transports) = &mut state.options.transports {
-            transports.push((handle, logger_transport));
-        } else {
-            state.options.transports = Some(vec![(handle, logger_transport)]);
+        // Update sync-side metadata for pre-filter recomputation.
+        {
+            let mut state = self.shared_state.write();
+            state.transport_levels.push((handle, level));
+            Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
+
+            // Keep options.transports in sync for query() support.
+            state
+                .options
+                .transports
+                .get_or_insert_with(Vec::new)
+                .push((handle, logger_transport.clone()));
         }
-        Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
+
+        // Inform the pipeline asynchronously — no round-trip needed.
+        let _ = self
+            .pipeline_tx
+            .unbounded_send(PipelineMessage::AddTransport {
+                handle,
+                transport: logger_transport,
+            });
 
         handle
     }
 
-    /// Remove a transport by its handle.
-    /// Returns `true` if the transport was found and removed, `false` otherwise.
     pub fn remove_transport(&self, handle: TransportHandle) -> bool {
-        let mut state = self.shared_state.write();
+        let removed = {
+            let mut state = self.shared_state.write();
 
-        if let Some(transports) = &mut state.options.transports {
-            if let Some(index) = transports.iter().position(|(h, _)| *h == handle) {
-                transports.remove(index);
+            let before = state.transport_levels.len();
+            state.transport_levels.retain(|(h, _)| *h != handle);
+            let removed = state.transport_levels.len() < before;
+
+            if removed {
+                if let Some(transports) = &mut state.options.transports {
+                    transports.retain(|(h, _)| *h != handle);
+                }
                 Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
-                return true;
             }
+            removed
+        };
+
+        if removed {
+            let _ = self
+                .pipeline_tx
+                .unbounded_send(PipelineMessage::RemoveTransport(handle));
         }
-        false
+
+        removed
+    }
+
+    pub fn configure(&self, new_options: Option<LoggerOptions>) {
+        let default_options = LoggerOptions::default();
+
+        let (format, level, levels, transports) = {
+            let mut state = self.shared_state.write();
+
+            // Merge options (same logic as before).
+            if let Some(options) = new_options {
+                state.options.format = options
+                    .format
+                    .or_else(|| state.options.format.take().or(default_options.format));
+
+                state.options.levels = options
+                    .levels
+                    .or_else(|| state.options.levels.take().or(default_options.levels));
+
+                state.options.level = options
+                    .level
+                    .or_else(|| state.options.level.take().or(default_options.level));
+
+                if let Some(new_transports) = options.transports {
+                    state.options.transports = Some(new_transports);
+                } else {
+                    state.options.transports = Some(Vec::new());
+                }
+            } else {
+                state.options.transports = Some(Vec::new());
+            }
+
+            // Rebuild transport_levels from the new options.transports.
+            state.transport_levels = state
+                .options
+                .transports
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|(h, t)| (*h, t.get_level().cloned()))
+                .collect();
+
+            Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
+
+            let transports = state.options.transports.clone().unwrap_or_default();
+            (
+                state.options.format.clone(),
+                state.options.level.clone(),
+                state.options.levels.clone(),
+                transports,
+            )
+        };
+
+        let _ = self.pipeline_tx.unbounded_send(PipelineMessage::Configure {
+            format,
+            level,
+            levels,
+            transports,
+        });
+    }
+
+    pub fn builder() -> LoggerBuilder {
+        LoggerBuilder::new()
+    }
+}
+
+impl std::fmt::Debug for Logger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Logger")
+            .field("is_closed", &self.is_closed)
+            .finish_non_exhaustive()
     }
 }
 
@@ -630,33 +597,27 @@ impl Log for Logger {
     }
 
     fn log(&self, record: &Record) {
-        // Convert log::Record to LogInfo
         let mut meta = std::collections::HashMap::new();
-        // Add timestamp
         meta.insert(
             "timestamp".to_string(),
             serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
         );
-        // Add target (module path)
         meta.insert(
             "target".to_string(),
             serde_json::Value::String(record.target().to_string()),
         );
-        // Add file location if available
         if let Some(file) = record.file() {
             meta.insert(
                 "file".to_string(),
                 serde_json::Value::String(file.to_string()),
             );
         }
-        // Add line number if available
         if let Some(line) = record.line() {
             meta.insert(
                 "line".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(line)),
             );
         }
-        // Add module path if different from target
         if let Some(module_path) = record.module_path() {
             if module_path != record.target() {
                 meta.insert(
@@ -666,12 +627,10 @@ impl Log for Logger {
             }
         }
 
-        // Add key-values if kv feature is enabled
         #[cfg(feature = "log-backend-kv")]
         {
             let mut kv_visitor = KeyValueCollector::new();
             record.key_values().visit(&mut kv_visitor).ok();
-
             for (key, value) in kv_visitor.collected {
                 meta.insert(key, value);
             }
@@ -723,14 +682,14 @@ impl<'kvs> log::kv::Visitor<'kvs> for KeyValueCollector {
                 .map(serde_json::Value::Number)
                 .unwrap_or_else(|| serde_json::Value::String(f.to_string()))
         } else {
-            // Fallback to string representation
             serde_json::Value::String(format!("{}", value))
         };
-
         self.collected.push((key.as_str().to_string(), json_value));
         Ok(())
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -738,7 +697,6 @@ mod tests {
     use crate::logger_options::LoggerOptions;
     use std::sync::{Arc, Mutex};
 
-    // Simple mock for unit tests
     #[derive(Clone)]
     struct TestTransport {
         logs: Arc<Mutex<Vec<LogInfo>>>,
@@ -779,7 +737,6 @@ mod tests {
     #[test]
     fn test_logger_creation_with_custom_options() {
         let options = LoggerOptions::new().level("debug").channel_capacity(512);
-
         let logger = Logger::new(Some(options));
         let state = logger.shared_state.read();
         assert_eq!(state.options.level.as_deref(), Some("debug"));
@@ -797,7 +754,6 @@ mod tests {
             assert_eq!(state.options.transports.as_ref().unwrap().len(), 1);
         }
 
-        // Verify the handle works
         assert!(logger.remove_transport(handle));
     }
 
@@ -810,8 +766,6 @@ mod tests {
 
         let state = logger.shared_state.read();
         assert_eq!(state.options.transports.as_ref().unwrap().len(), 2);
-
-        // Verify handles are different
         assert_ne!(handle1, handle2);
     }
 
@@ -830,7 +784,6 @@ mod tests {
     fn test_remove_nonexistent_transport() {
         let logger = Logger::new(None);
         let fake_handle = TransportHandle(9999);
-
         assert!(!logger.remove_transport(fake_handle));
     }
 
@@ -906,8 +859,6 @@ mod tests {
         ));
 
         let transport = TestTransport::new();
-
-        // Add transport with custom error-only level
         let _handle = logger
             .transport(transport.clone())
             .with_level("error")
@@ -932,7 +883,6 @@ mod tests {
         logger.log(LogInfo::new("info", ""));
         logger.flush().unwrap();
 
-        // Empty messages should be filtered out
         let logs = transport.get_logs();
         assert_eq!(logs.len(), 0);
     }
@@ -947,7 +897,6 @@ mod tests {
         logger.flush().unwrap();
         assert_eq!(transport.get_logs().len(), 0);
 
-        // Reconfigure to debug
         logger.configure(Some(LoggerOptions::new().level("debug")));
         logger.add_transport(transport.clone());
 
@@ -1016,19 +965,16 @@ mod tests {
     fn test_buffer_processed_when_transport_added() {
         let logger = Logger::builder().format(logform::passthrough()).build();
 
-        // Log without transport - should buffer
         logger.log(LogInfo::new("info", "Buffered"));
-
         logger.flush().unwrap();
+
         let buffer = logger.buffer.lock().unwrap();
         assert_eq!(buffer.len(), 1);
         drop(buffer);
 
-        // Add transport
         let transport = TestTransport::new();
         logger.add_transport(transport.clone());
 
-        // Log another message - should process buffer + new message
         logger.log(LogInfo::new("info", "Direct"));
         logger.flush().unwrap();
 
@@ -1057,9 +1003,7 @@ mod tests {
     fn test_compute_min_severity() {
         let options = LoggerOptions::new().level("warn");
         let min_sev = Logger::compute_min_severity(&options);
-
         assert!(min_sev.is_some());
-        // warn should have higher severity value than info
         assert!(min_sev.unwrap() > 0);
     }
 
@@ -1079,24 +1023,20 @@ mod tests {
         assert_eq!(transport1.get_logs().len(), 1);
         assert_eq!(transport2.get_logs().len(), 1);
 
-        // Remove first transport
         assert!(logger.remove_transport(handle1));
 
         logger.log(LogInfo::new("info", "Test2"));
         logger.flush().unwrap();
 
-        // Only second transport should have the new log
         assert_eq!(transport1.get_logs().len(), 1);
         assert_eq!(transport2.get_logs().len(), 2);
 
-        // Remove second transport
         assert!(logger.remove_transport(handle2));
     }
 
     #[test]
     fn test_transport_accepts_raw_transport() {
         let logger = Logger::builder().transport(TestTransport::new()).build();
-
         let state = logger.shared_state.read();
         assert_eq!(state.options.transports.as_ref().unwrap().len(), 1);
     }
@@ -1105,14 +1045,11 @@ mod tests {
     fn test_transport_accepts_preconfigured_logger_transport() {
         let transport = TestTransport::new();
 
-        // Pre-configure a LoggerTransport with level and format
         let configured = LoggerTransport::new(transport.clone())
             .with_level("error".to_owned())
             .with_format(logform::passthrough());
 
-        let logger = Logger::builder()
-            .transport(configured) // Pre-configured LoggerTransport
-            .build();
+        let logger = Logger::builder().transport(configured).build();
 
         logger.log(LogInfo::new("info", "Should be filtered"));
         logger.log(LogInfo::new("error", "Should pass"));
@@ -1148,9 +1085,7 @@ mod tests {
         let logger = Logger::new(None);
         let transport = TestTransport::new();
 
-        // Pre-configure with custom level
         let configured = LoggerTransport::new(transport.clone()).with_level("error".to_owned());
-
         let handle = logger.add_transport(configured);
 
         logger.log(LogInfo::new("info", "Should be filtered"));

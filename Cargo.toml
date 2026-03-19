@@ -15,3 +15,6 @@ members = [
 logform = { path = "logform", version = "0.7.0" }
 winston_transport = { path = "winston_transport", version = "0.7.0" }
 winston_proxy_transport = { path = "winston_proxy_transport", version = "0.4.1" }
+whatwg_streams = { path = "../../whatwg_streams/whatwg_streams_rs", features = ["send"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+futures = "0.3"
