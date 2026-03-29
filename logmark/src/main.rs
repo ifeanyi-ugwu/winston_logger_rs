@@ -1,11 +1,9 @@
 use chrono::Local;
-use env_logger;
 use env_logger::fmt::Formatter;
 use log::info;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use slog::{o, Drain, Logger, KV};
-use slog_async;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::process::{exit, Command};
@@ -1182,7 +1180,7 @@ fn median(values: &[f64]) -> f64 {
     }
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         let mid = sorted.len() / 2;
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
