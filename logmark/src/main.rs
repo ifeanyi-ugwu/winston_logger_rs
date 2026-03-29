@@ -9,8 +9,8 @@ use slog_async;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::process::{exit, Command};
-use std::time::Instant;
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::Instant;
 use std::{env, fs, thread};
 use tabled::{builder::Builder, settings::Style};
 use tracing::{event, Level};
@@ -105,7 +105,12 @@ fn latency_percentiles(sorted: &[u64]) -> (u64, u64, u64, u64) {
     )
 }
 
-fn run_benchmark<F: Fn()>(name: &str, target: OutputTarget, startup_secs: f64, bench_fn: F) -> BenchmarkResult {
+fn run_benchmark<F: Fn()>(
+    name: &str,
+    target: OutputTarget,
+    startup_secs: f64,
+    bench_fn: F,
+) -> BenchmarkResult {
     // Latency pass: 10K timed individual calls, results discarded for throughput stats.
     let mut samples = vec![0u64; LATENCY_ITERATIONS];
     for slot in samples.iter_mut() {
@@ -259,7 +264,9 @@ struct PrebufDrain<W: Write + Send> {
 
 impl<W: Write + Send> PrebufDrain<W> {
     fn new(w: W) -> Self {
-        PrebufDrain { writer: Mutex::new(w) }
+        PrebufDrain {
+            writer: Mutex::new(w),
+        }
     }
 }
 
@@ -270,7 +277,11 @@ impl<W: Write + Send + 'static> slog::Drain for PrebufDrain<W> {
     fn log(&self, record: &slog::Record, values: &slog::OwnedKVList) -> Result<(), slog::Never> {
         struct KvSer<'a>(&'a mut Vec<u8>);
         impl slog::Serializer for KvSer<'_> {
-            fn emit_arguments(&mut self, key: slog::Key, val: &std::fmt::Arguments) -> slog::Result {
+            fn emit_arguments(
+                &mut self,
+                key: slog::Key,
+                val: &std::fmt::Arguments,
+            ) -> slog::Result {
                 write!(self.0, ",\"{}\":\"{}\"", key, val).ok();
                 Ok(())
             }
@@ -284,7 +295,8 @@ impl<W: Write + Send + 'static> slog::Drain for PrebufDrain<W> {
             record.level().as_str(),
             record.location().module,
             record.msg()
-        ).ok();
+        )
+        .ok();
         let mut ser = KvSer(&mut buf);
         record.kv().serialize(record, &mut ser).ok();
         values.serialize(record, &mut ser).ok();
@@ -427,7 +439,11 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
         }
     };
 
-    let subscriber = fmt().json().flatten_event(true).with_writer(writer).finish();
+    let subscriber = fmt()
+        .json()
+        .flatten_event(true)
+        .with_writer(writer)
+        .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
     let startup_secs = init_start.elapsed().as_secs_f64();
 
@@ -472,14 +488,19 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
     let builder = winston::Logger::builder()
         .channel_capacity(50_000)
         .backpressure_strategy(winston::BackpressureStrategy::Block)
-        .format(winston::format::timestamp().chain(winston::format::printf(|info| {
-            format!(
-                r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
-                info.meta.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
-                info.level.to_ascii_uppercase(),
-                info.message
-            )
-        })));
+        .format(
+            winston::format::timestamp().chain(winston::format::printf(|info| {
+                format!(
+                    r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
+                    info.meta
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    info.level.to_ascii_uppercase(),
+                    info.message
+                )
+            })),
+        );
 
     let init_start = Instant::now();
     let logger = match target {
@@ -487,12 +508,16 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
             .build(),
         OutputTarget::Stdout => builder
-            .transport(winston::transports::WriterTransport::new(BufWriter::new(std::io::stdout())))
+            .transport(winston::transports::WriterTransport::new(BufWriter::new(
+                std::io::stdout(),
+            )))
             .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(BufWriter::new(log_file)))
+                .transport(winston::transports::WriterTransport::new(BufWriter::new(
+                    log_file,
+                )))
                 .build()
         }
     };
@@ -559,9 +584,7 @@ fn bench_env_logger_concurrent(target: OutputTarget) -> (f64, u64) {
         }
         OutputTarget::File => {
             let f = std::fs::File::create("logs/env_logger_conc.log").unwrap();
-            builder
-                .target(env_logger::Target::Pipe(Box::new(f)))
-                .init();
+            builder.target(env_logger::Target::Pipe(Box::new(f))).init();
         }
     }
     run_concurrent(|| || log::info!("{} {}", MESSAGE, "env_logger"))
@@ -675,7 +698,11 @@ fn bench_tracing_async_concurrent(target: OutputTarget) -> (f64, u64) {
                 .finish(file)
         }
     };
-    let subscriber = fmt().json().flatten_event(true).with_writer(writer).finish();
+    let subscriber = fmt()
+        .json()
+        .flatten_event(true)
+        .with_writer(writer)
+        .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
     // _guard outlives run_concurrent — background thread stays alive until after threads join
     let result = run_concurrent(|| || event!(Level::INFO, "{} {}", MESSAGE, "tracing_async"));
@@ -687,25 +714,34 @@ fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
         .channel_capacity(200_000)
         .backpressure_strategy(winston::BackpressureStrategy::Block)
-        .format(winston::format::timestamp().chain(winston::format::printf(|info| {
-            format!(
-                r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
-                info.meta.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
-                info.level.to_ascii_uppercase(),
-                info.message
-            )
-        })));
+        .format(
+            winston::format::timestamp().chain(winston::format::printf(|info| {
+                format!(
+                    r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
+                    info.meta
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    info.level.to_ascii_uppercase(),
+                    info.message
+                )
+            })),
+        );
     let logger = match target {
         OutputTarget::Sink => builder
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
             .build(),
         OutputTarget::Stdout => builder
-            .transport(winston::transports::WriterTransport::new(BufWriter::new(std::io::stdout())))
+            .transport(winston::transports::WriterTransport::new(BufWriter::new(
+                std::io::stdout(),
+            )))
             .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston_conc.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(BufWriter::new(log_file)))
+                .transport(winston::transports::WriterTransport::new(BufWriter::new(
+                    log_file,
+                )))
                 .build()
         }
     };
@@ -762,7 +798,11 @@ fn bench_tracing_async_saturate(target: OutputTarget) -> (f64, u64) {
                 .finish(file)
         }
     };
-    let subscriber = fmt().json().flatten_event(true).with_writer(writer).finish();
+    let subscriber = fmt()
+        .json()
+        .flatten_event(true)
+        .with_writer(writer)
+        .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting tracing default failed");
     // _guard must outlive run_concurrent so the background thread stays alive until threads join
     let result = run_concurrent(|| || event!(Level::INFO, "{} {}", MESSAGE, "tracing_async"));
@@ -774,25 +814,34 @@ fn bench_winston_saturate(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
         .channel_capacity(SATURATION_CHANNEL_SIZE)
         .backpressure_strategy(winston::BackpressureStrategy::Block)
-        .format(winston::format::timestamp().chain(winston::format::printf(|info| {
-            format!(
-                r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
-                info.meta.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
-                info.level.to_ascii_uppercase(),
-                info.message
-            )
-        })));
+        .format(
+            winston::format::timestamp().chain(winston::format::printf(|info| {
+                format!(
+                    r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
+                    info.meta
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    info.level.to_ascii_uppercase(),
+                    info.message
+                )
+            })),
+        );
     let logger = match target {
         OutputTarget::Sink => builder
             .transport(winston::transports::WriterTransport::new(std::io::sink()))
             .build(),
         OutputTarget::Stdout => builder
-            .transport(winston::transports::WriterTransport::new(BufWriter::new(std::io::stdout())))
+            .transport(winston::transports::WriterTransport::new(BufWriter::new(
+                std::io::stdout(),
+            )))
             .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston_sat.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(BufWriter::new(log_file)))
+                .transport(winston::transports::WriterTransport::new(BufWriter::new(
+                    log_file,
+                )))
                 .build()
         }
     };
@@ -1017,10 +1066,7 @@ fn run_benchmarks_in_processes(
             if output.status.success() {
                 let output_str = String::from_utf8(output.stdout).unwrap();
 
-                if let Some(line) = output_str
-                    .lines()
-                    .find(|l| l.starts_with("LOGMARK_CONC: "))
-                {
+                if let Some(line) = output_str.lines().find(|l| l.starts_with("LOGMARK_CONC: ")) {
                     let parts: Vec<&str> =
                         line["LOGMARK_CONC: ".len()..].split_whitespace().collect();
                     if parts.len() >= 4 {
@@ -1070,7 +1116,12 @@ fn run_benchmarks_in_processes(
         sat_pairs.shuffle(&mut rng);
 
         for &(bench, target) in &sat_pairs {
-            println!("  {} ({}) ×{} [sat]", bench, target.as_str(), CONCURRENT_THREADS);
+            println!(
+                "  {} ({}) ×{} [sat]",
+                bench,
+                target.as_str(),
+                CONCURRENT_THREADS
+            );
 
             let output = Command::new(env::current_exe().unwrap())
                 .arg("--saturate")
@@ -1082,10 +1133,7 @@ fn run_benchmarks_in_processes(
             if output.status.success() {
                 let output_str = String::from_utf8(output.stdout).unwrap();
 
-                if let Some(line) = output_str
-                    .lines()
-                    .find(|l| l.starts_with("LOGMARK_SAT: "))
-                {
+                if let Some(line) = output_str.lines().find(|l| l.starts_with("LOGMARK_SAT: ")) {
                     let parts: Vec<&str> =
                         line["LOGMARK_SAT: ".len()..].split_whitespace().collect();
                     if parts.len() >= 4 {
@@ -1314,7 +1362,16 @@ fn print_stats_report(
             ]);
         }
 
-        let headers = ["#", "logger", "median ops/s", "median time", "vs best", "var", "init", "drain"];
+        let headers = [
+            "#",
+            "logger",
+            "median ops/s",
+            "median time",
+            "vs best",
+            "var",
+            "init",
+            "drain",
+        ];
         let table_str = make_table(&headers, &rows);
 
         println!("\n  ── {} ", target.to_uppercase());
@@ -1326,7 +1383,11 @@ fn print_stats_report(
         let path = format!("benchmark_results/{target}_summary.txt");
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "logmark  {target} target  {run_timestamp}").unwrap();
-        writeln!(f, "{logger_count} loggers × {NUM_RUNS} runs × {ITERATIONS} iterations\n").unwrap();
+        writeln!(
+            f,
+            "{logger_count} loggers × {NUM_RUNS} runs × {ITERATIONS} iterations\n"
+        )
+        .unwrap();
         writeln!(f, "{}", table_str).unwrap();
     }
 
@@ -1406,7 +1467,14 @@ fn print_stats_report(
 
         group.sort_by(|(_, _, a_ops, _), (_, _, b_ops, _)| b_ops.partial_cmp(a_ops).unwrap());
 
-        let headers = ["#", "logger", "conc ops/s", "seq ops/s", "scale", "conc P99"];
+        let headers = [
+            "#",
+            "logger",
+            "conc ops/s",
+            "seq ops/s",
+            "scale",
+            "conc P99",
+        ];
         let rows: Vec<Vec<String>> = group
             .iter()
             .enumerate()
@@ -1463,7 +1531,16 @@ fn print_stats_report(
 
         group.sort_by(|(_, _, a_sat, _, _), (_, _, b_sat, _, _)| b_sat.partial_cmp(a_sat).unwrap());
 
-        let headers = ["#", "logger", "sat ops/s", "conc ops/s", "tput Δ", "sat P99", "conc P99", "P99 spike"];
+        let headers = [
+            "#",
+            "logger",
+            "sat ops/s",
+            "conc ops/s",
+            "tput Δ",
+            "sat P99",
+            "conc P99",
+            "P99 spike",
+        ];
         let rows: Vec<Vec<String>> = group
             .iter()
             .enumerate()
@@ -1533,6 +1610,13 @@ fn main() {
         NUM_RUNS
     );
 
-    let (stats, conc_stats, sat_stats) = run_benchmarks_in_processes(&benchmarks, &targets, NUM_RUNS);
-    print_stats_report(&stats, &conc_stats, &sat_stats, &run_timestamp, benchmarks.len());
+    let (stats, conc_stats, sat_stats) =
+        run_benchmarks_in_processes(&benchmarks, &targets, NUM_RUNS);
+    print_stats_report(
+        &stats,
+        &conc_stats,
+        &sat_stats,
+        &run_timestamp,
+        benchmarks.len(),
+    );
 }
