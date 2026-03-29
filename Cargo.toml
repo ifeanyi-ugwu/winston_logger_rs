@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "logform",
+    "logmark",
     "winston",
     "winston_daily_rotate_file",
     "winston_file",
