@@ -1,5 +1,7 @@
 use std::{
     collections::VecDeque,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Condvar, Mutex},
 };
 
@@ -16,6 +18,20 @@ use crate::{
     logger_transport::LoggerTransport,
 };
 
+/// A runtime-agnostic task spawner.  Pass `tokio::runtime::Handle::spawn`,
+/// `smol::spawn`, or any other executor's spawn primitive wrapped in an `Arc`.
+pub type SpawnFn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync>;
+
+/// The built-in spawner: runs each future on its own OS thread.
+/// Used automatically when no spawner is provided.
+pub fn default_spawner() -> SpawnFn {
+    Arc::new(|fut: Pin<Box<dyn Future<Output = ()> + Send + 'static>>| {
+        std::thread::spawn(move || {
+            futures::executor::block_on(fut);
+        });
+    })
+}
+
 // ── Messages flowing through the main pipeline ──────────────────────────────
 
 pub enum PipelineMessage {
@@ -26,7 +42,7 @@ pub enum PipelineMessage {
         handle: TransportHandle,
         transport: LoggerTransport<LogInfo>,
     },
-    /// Remove a transport by handle; the FanoutSink aborts its task.
+    /// Remove a transport by handle.
     RemoveTransport(TransportHandle),
     /// Replace global format/level/levels without touching transports.
     Reconfigure {
@@ -85,8 +101,9 @@ impl ReadableSource<PipelineMessage> for PipelineSource {
 struct TransportSlot {
     handle: TransportHandle,
     level: Option<String>,
+    // Dropping tx closes the channel; run_transport_task drains remaining
+    // messages and exits naturally — no runtime-specific abort needed.
     tx: fmpsc::UnboundedSender<TransportMessage>,
-    task_handle: tokio::task::JoinHandle<()>,
 }
 
 // ── Fanout sink ──────────────────────────────────────────────────────────────
@@ -94,9 +111,9 @@ struct TransportSlot {
 /// Receives pipeline messages, fans log entries out to per-transport tasks,
 /// and handles dynamic transport add/remove without any external locking.
 ///
-/// Runs entirely inside the streams pipeline (a single tokio task spawned by
-/// the writable stream), so `&mut self` access is always exclusive.
+/// Driven by the writable-stream task; `&mut self` access is always exclusive.
 pub struct FanoutSink {
+    spawn_fn: SpawnFn,
     transport_tasks: Vec<TransportSlot>,
     global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     global_level: Option<String>,
@@ -107,6 +124,7 @@ pub struct FanoutSink {
 
 impl FanoutSink {
     pub fn new(
+        spawn_fn: SpawnFn,
         global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
         global_level: Option<String>,
         levels: Option<LoggerLevels>,
@@ -114,6 +132,7 @@ impl FanoutSink {
         initial_transports: Vec<(TransportHandle, LoggerTransport<LogInfo>)>,
     ) -> Self {
         let mut sink = Self {
+            spawn_fn,
             transport_tasks: Vec::new(),
             global_format,
             global_level,
@@ -149,19 +168,15 @@ impl FanoutSink {
         let (tx, rx) = fmpsc::unbounded::<TransportMessage>();
         let global_fmt = self.global_format.clone();
         let level = transport.get_level().cloned();
-        let task_handle = tokio::spawn(run_transport_task(rx, transport, global_fmt));
-        self.transport_tasks.push(TransportSlot {
-            handle,
-            level,
-            tx,
-            task_handle,
-        });
+        (self.spawn_fn)(Box::pin(run_transport_task(rx, transport, global_fmt)));
+        self.transport_tasks.push(TransportSlot { handle, level, tx });
     }
 
-    fn abort_transport(&mut self, handle: TransportHandle) {
+    fn stop_transport(&mut self, handle: TransportHandle) {
+        // Removing the slot drops tx, closing the channel. The task drains any
+        // remaining messages and exits on its own — no runtime abort needed.
         if let Some(pos) = self.transport_tasks.iter().position(|s| s.handle == handle) {
-            let slot = self.transport_tasks.remove(pos);
-            slot.task_handle.abort();
+            self.transport_tasks.remove(pos);
         }
     }
 
@@ -223,9 +238,8 @@ impl FanoutSink {
     }
 
     fn clear_all_transports(&mut self) {
-        for slot in self.transport_tasks.drain(..) {
-            slot.task_handle.abort();
-        }
+        // Draining drops every tx, closing all transport channels gracefully.
+        self.transport_tasks.clear();
     }
 }
 
@@ -246,7 +260,7 @@ impl WritableSink<PipelineMessage> for FanoutSink {
                 self.drain_buffer_to_slots();
             }
 
-            PipelineMessage::RemoveTransport(handle) => self.abort_transport(handle),
+            PipelineMessage::RemoveTransport(handle) => self.stop_transport(handle),
 
             PipelineMessage::Reconfigure {
                 format,
@@ -316,16 +330,15 @@ async fn run_transport_task(
 
 // ── Pipeline constructor ─────────────────────────────────────────────────────
 
-/// Builds and returns the spawned pipeline channel sender.
+/// Builds and returns the pipeline channel sender.
 ///
-/// Spawns two tasks on the current tokio runtime:
-///   1. The ReadableStream task (drives `PipelineSource`)
-///   2. The WritableStream task (drives `FanoutSink`)
-///
-/// The returned sender is the entry point: push `PipelineMessage`s into it.
+/// All tasks are submitted through `spawn_fn`.  The pipeline itself has no
+/// knowledge of the underlying executor — callers wrap whatever runtime they
+/// use into a `SpawnFn` and hand it in.
 pub fn build_pipeline(
     options: &LoggerOptions,
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+    spawn_fn: SpawnFn,
 ) -> fmpsc::UnboundedSender<PipelineMessage> {
     let (tx, rx) = fmpsc::unbounded::<PipelineMessage>();
 
@@ -335,6 +348,7 @@ pub fn build_pipeline(
     let initial_transports = options.transports.clone().unwrap_or_default();
 
     let sink = FanoutSink::new(
+        Arc::clone(&spawn_fn),
         global_format,
         global_level,
         levels,
@@ -343,22 +357,19 @@ pub fn build_pipeline(
     );
     let source = PipelineSource::new(rx);
 
+    let sp = Arc::clone(&spawn_fn);
     let readable = ReadableStream::builder(source)
         .strategy(CountQueuingStrategy::new(1))
-        .spawn(|fut| {
-            tokio::spawn(fut);
-        });
+        .spawn(move |fut| sp(Box::pin(fut)));
 
+    let sp = Arc::clone(&spawn_fn);
     let writable = WritableStream::builder(sink)
         .strategy(CountQueuingStrategy::new(1))
-        .spawn(|fut| {
-            tokio::spawn(fut);
-        });
+        .spawn(move |fut| sp(Box::pin(fut)));
 
-    // Spawn the pipe loop as its own task so it drives itself to completion.
-    tokio::spawn(async move {
+    spawn_fn(Box::pin(async move {
         let _ = readable.pipe_to(&writable, None).await;
-    });
+    }));
 
     tx
 }

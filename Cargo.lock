@@ -3630,7 +3630,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "tokio",
  "whatwg_streams",
  "winston_file",
  "winston_transport",

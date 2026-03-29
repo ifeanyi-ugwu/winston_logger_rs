@@ -16,7 +16,6 @@ use std::{
     },
     thread,
 };
-use tokio::runtime::Runtime;
 use winston_transport::{LogQuery, Transport};
 
 static NEXT_TRANSPORT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -97,14 +96,15 @@ pub struct Logger {
     /// Sender into the async pipeline (via bridge thread).
     pipeline_tx: fmpsc::UnboundedSender<PipelineMessage>,
 
-    /// Dedicated tokio runtime that owns all pipeline tasks.
-    _runtime: Arc<Runtime>,
-
     bridge_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Logger {
     pub fn new(options: Option<LoggerOptions>) -> Self {
+        Self::new_with_spawner(options, pipeline::default_spawner())
+    }
+
+    pub fn new_with_spawner(options: Option<LoggerOptions>, spawn_fn: pipeline::SpawnFn) -> Self {
         let options = options.unwrap_or_default();
         let capacity = options.channel_capacity.unwrap_or(1024);
         let (sender, receiver) = bounded::<LogMessage>(capacity);
@@ -131,18 +131,7 @@ impl Logger {
 
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
 
-        // Build a single-threaded tokio runtime for the pipeline.
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("winston-pipeline")
-                .build()
-                .expect("failed to build tokio runtime for winston pipeline"),
-        );
-
-        // Build the pipeline inside the runtime so all spawns go there.
-        let pipeline_tx =
-            runtime.block_on(async { pipeline::build_pipeline(&options, Arc::clone(&buffer)) });
+        let pipeline_tx = pipeline::build_pipeline(&options, Arc::clone(&buffer), spawn_fn);
 
         // Bridge thread: crossbeam → pipeline channel.
         let bridge_pipeline_tx = pipeline_tx.clone();
@@ -168,7 +157,6 @@ impl Logger {
             min_required_severity_cache: AtomicU8::new(severity_cache),
             backpressure_cache: AtomicU8::new(bp_cache),
             pipeline_tx,
-            _runtime: runtime,
             bridge_thread: Mutex::new(Some(bridge_thread)),
         }
     }
@@ -565,6 +553,11 @@ impl Logger {
         LoggerBuilder::new()
     }
 }
+impl Default for Logger {
+    fn default() -> Self {
+        Logger::new(None)
+    }
+}
 
 impl std::fmt::Debug for Logger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -580,11 +573,6 @@ impl Drop for Logger {
     }
 }
 
-impl Default for Logger {
-    fn default() -> Self {
-        Logger::new(None)
-    }
-}
 
 #[cfg(feature = "log-backend")]
 use log::{Log, Metadata, Record};
