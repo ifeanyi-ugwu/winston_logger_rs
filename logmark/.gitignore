@@ -1,0 +1,8 @@
+/target
+
+# System files
+.DS_Store
+Thumbs.db
+Desktop.ini
+/logs
+/benchmark_results

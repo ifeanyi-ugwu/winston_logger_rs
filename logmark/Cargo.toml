@@ -1,0 +1,31 @@
+[package]
+name = "logmark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", features = ["clock"] }
+env_logger = "0.11.5"
+fern = "0.6.2"
+log = "0.4.22"
+rand = "0.8.5"
+tabled = "0.20"
+tikv-jemalloc-ctl = { version = "0.6.0", features = ["stats"] }
+slog = "2.7.0"
+slog-async = "2.8.0"
+slog-json = "2.6.1"
+slog-term = "2.9.1"
+tracing = "0.1.40"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
+winston = { path = "../winston" }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6.0"
+
+[profile.bench]
+debug = true
+
+[profile.release]
+debug = true
