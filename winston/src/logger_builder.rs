@@ -1,6 +1,7 @@
 use crate::{
     logger_options::{BackpressureStrategy, LoggerOptions},
     logger_transport::IntoLoggerTransport,
+    pipeline::{self, SpawnFn},
     Logger,
 };
 use logform::{Format, LogInfo};
@@ -8,6 +9,7 @@ use std::collections::HashMap;
 
 pub struct LoggerBuilder {
     options: LoggerOptions,
+    spawn_fn: Option<SpawnFn>,
 }
 
 impl Default for LoggerBuilder {
@@ -20,7 +22,13 @@ impl LoggerBuilder {
     pub fn new() -> Self {
         LoggerBuilder {
             options: LoggerOptions::default(),
+            spawn_fn: None,
         }
+    }
+
+    pub fn spawner(mut self, spawn_fn: SpawnFn) -> Self {
+        self.spawn_fn = Some(spawn_fn);
+        self
     }
 
     pub fn level<T: Into<String>>(mut self, level: T) -> Self {
@@ -66,7 +74,10 @@ impl LoggerBuilder {
     }
 
     pub fn build(self) -> Logger {
-        Logger::new(Some(self.options))
+        let spawn_fn = self
+            .spawn_fn
+            .unwrap_or_else(pipeline::default_spawner);
+        Logger::new_with_spawner(Some(self.options), spawn_fn)
     }
 }
 
