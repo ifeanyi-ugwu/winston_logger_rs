@@ -62,7 +62,71 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Install cargo-release
-        run: cargo install cargo-release
+        run: cargo install cargo-release --locked
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+
+      - name: Validate target versions not already published
+        run: |
+          # Compute the version cargo-release would publish given a base version and level.
+          next_version() {
+            local base="${1%%-*}"  # strip any pre-release suffix
+            local level="$2"
+            local major minor patch
+            IFS='.' read -r major minor patch <<< "$base"
+            case "$level" in
+              release) echo "$base" ;;
+              patch)   echo "$major.$minor.$((patch + 1))" ;;
+              minor)   echo "$major.$((minor + 1)).0" ;;
+              major)   echo "$((major + 1)).0.0" ;;
+              # For pre-release levels cargo-release appends .1 to the base; close enough for a collision check.
+              alpha|beta|rc) echo "${base}-${level}.1" ;;
+            esac
+          }
+
+          collect_crates() {
+            find . -maxdepth 2 -name 'Cargo.toml' -not -path './Cargo.toml' \
+              | xargs grep -l '^\[package\]' \
+              | while read -r f; do
+                  name=$(grep '^\s*name\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+                  version=$(grep '^\s*version\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+                  case "$version" in *-*) echo "$name $version" ;; esac
+                done
+          }
+
+          if [ "${{ inputs.crate }}" = "workspace" ]; then
+            CRATES=$(collect_crates)
+          else
+            f=$(find . -maxdepth 2 -name 'Cargo.toml' -path "*/${{ inputs.crate }}/Cargo.toml" | head -1)
+            name=$(grep '^\s*name\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+            version=$(grep '^\s*version\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+            CRATES="$name $version"
+          fi
+
+          FAILED=0
+          while IFS=' ' read -r name version; do
+            [ -z "$name" ] && continue
+            target=$(next_version "$version" "${{ inputs.level }}")
+            published=$(curl -sf "https://crates.io/api/v1/crates/$name/versions" \
+              -H "User-Agent: publish-workflow (github.com/ifeanyi-ugwu/winston_logger_rs)" \
+              | jq -r '.versions[].num' 2>/dev/null || true)
+            if echo "$published" | grep -qx "$target"; then
+              echo "error: $name $target is already published on crates.io"
+              FAILED=1
+            else
+              echo "ok: $name $target is unpublished"
+            fi
+          done <<< "$CRATES"
+          [ "$FAILED" -eq 1 ] && exit 1 || true
+
+      - name: Check SemVer
+        run: |
+          if [ "${{ inputs.crate }}" = "workspace" ]; then
+            cargo semver-checks --workspace
+          else
+            cargo semver-checks --package ${{ inputs.crate }}
+          fi
 
       - name: Publish
         env:
