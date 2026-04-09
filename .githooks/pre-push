@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# For each crate with source changes vs main, its Cargo.toml version must differ
+# from main's version. The convention is to bump to x.y.z-dev when starting work
+# on a crate, signalling it is in progress. "cargo release release" strips the
+# suffix at publish time.
+
+MAIN_BRANCH="main"
+CRATES=(
+    logform
+    logmark
+    winston
+    winston_daily_rotate_file
+    winston_file
+    winston_http
+    winston_mongodb
+    winston_proxy_transport
+    winston_transport
+    winston_tracing
+)
+
+# Nothing to check if main doesn't exist locally yet.
+if ! git rev-parse --verify "$MAIN_BRANCH" >/dev/null 2>&1; then
+    exit 0
+fi
+
+# If we ARE on main, skip — the publish workflow owns version bumps there.
+CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+if [ "$CURRENT_BRANCH" = "$MAIN_BRANCH" ]; then
+    exit 0
+fi
+
+MERGE_BASE=$(git merge-base HEAD "$MAIN_BRANCH")
+FAILED=0
+
+for crate in "${CRATES[@]}"; do
+    # Check for any changed .rs files in this crate since branching from main.
+    CHANGED_SOURCES=$(git diff --name-only "$MERGE_BASE" HEAD -- "${crate}/src" 2>/dev/null)
+    [ -z "$CHANGED_SOURCES" ] && continue
+
+    # Read version from each side.
+    BRANCH_VERSION=$(git show HEAD:"${crate}/Cargo.toml" 2>/dev/null \
+        | grep '^version' | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+    MAIN_VERSION=$(git show "${MAIN_BRANCH}:${crate}/Cargo.toml" 2>/dev/null \
+        | grep '^version' | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+
+    if [ "$BRANCH_VERSION" = "$MAIN_VERSION" ]; then
+        echo "error: $crate has source changes but its version is still $BRANCH_VERSION (same as main)"
+        echo "       bump it to ${BRANCH_VERSION}-dev in ${crate}/Cargo.toml before pushing"
+        FAILED=1
+    fi
+done
+
+if [ "$FAILED" -eq 1 ]; then
+    echo ""
+    echo "Push blocked. Version bumps required for the crates listed above."
+    echo "Use --no-verify to bypass if you know what you are doing."
+    exit 1
+fi
+
+exit 0

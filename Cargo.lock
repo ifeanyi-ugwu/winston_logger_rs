@@ -3589,7 +3589,7 @@ dependencies = [
 
 [[package]]
 name = "winston"
-version = "0.8.0"
+version = "0.8.1-dev"
 dependencies = [
  "chrono",
  "criterion",
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "winston_daily_rotate_file"
-version = "0.4.1"
+version = "0.4.2-dev"
 dependencies = [
  "chrono",
  "flate2",
@@ -3617,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "winston_file"
-version = "0.3.0"
+version = "0.3.1-dev"
 dependencies = [
  "chrono",
  "dateparser",
@@ -3676,7 +3676,7 @@ dependencies = [
 
 [[package]]
 name = "winston_transport"
-version = "0.7.0"
+version = "0.7.1-dev"
 dependencies = [
  "chrono",
  "dateparser",
