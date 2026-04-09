@@ -3663,6 +3663,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "winston_tracing"
+version = "0.1.0"
+dependencies = [
+ "logform",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "winston",
+ "winston_transport",
+]
+
+[[package]]
 name = "winston_transport"
 version = "0.7.0"
 dependencies = [
