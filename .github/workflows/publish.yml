@@ -63,22 +63,21 @@ jobs:
         run: |
           if [ "${{ inputs.crate }}" = "workspace" ]; then
             # --unpublished cannot be combined with a level, so we find crates
-            # with pre-release versions ourselves and release each one explicitly.
-            DEV_CRATES=$(find . -maxdepth 2 -name 'Cargo.toml' -not -path './Cargo.toml' \
+            # with pre-release versions ourselves. All are passed to a single
+            # cargo release call so it can resolve dependency order correctly.
+            PACKAGE_ARGS=$(find . -maxdepth 2 -name 'Cargo.toml' -not -path './Cargo.toml' \
               | xargs grep -l '^\[package\]' \
               | while read f; do
                   name=$(grep '^\s*name\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
                   version=$(grep '^\s*version\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-                  case "$version" in *-*) echo "$name" ;; esac
-                done)
-            if [ -z "$DEV_CRATES" ]; then
+                  case "$version" in *-*) echo "--package $name" ;; esac
+                done | tr '\n' ' ')
+            if [ -z "$PACKAGE_ARGS" ]; then
               echo "No crates with pre-release versions found."
               exit 0
             fi
-            for crate in $DEV_CRATES; do
-              echo "Releasing $crate..."
-              cargo release ${{ inputs.level }} --package "$crate" --execute --no-confirm
-            done
+            echo "Releasing: $PACKAGE_ARGS"
+            cargo release ${{ inputs.level }} $PACKAGE_ARGS --execute --no-confirm
           else
             cargo release ${{ inputs.level }} --package ${{ inputs.crate }} --execute --no-confirm
           fi
