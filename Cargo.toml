@@ -10,6 +10,7 @@ members = [
     "winston_mongodb",
     "winston_proxy_transport",
     "winston_transport",
+    "winston_tracing",
 ]
 
 [workspace.dependencies]
