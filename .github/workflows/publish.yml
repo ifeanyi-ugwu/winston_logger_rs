@@ -16,6 +16,7 @@ on:
           - winston_http
           - winston_mongodb
           - winston_proxy_transport
+          - winston_tracing
           - winston
       level:
         description: "Version level"
