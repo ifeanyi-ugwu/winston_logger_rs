@@ -172,6 +172,16 @@ where
             serde_json::Value::String(event.metadata().target().to_string()),
         );
 
+        if let Some(file) = event.metadata().file() {
+            fields.insert(
+                "file".to_string(),
+                serde_json::Value::String(file.to_string()),
+            );
+        }
+        if let Some(line) = event.metadata().line() {
+            fields.insert("line".to_string(), serde_json::Value::Number(line.into()));
+        }
+
         self.logger.log(LogInfo {
             level,
             message,
