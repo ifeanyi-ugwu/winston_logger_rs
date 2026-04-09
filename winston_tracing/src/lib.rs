@@ -140,9 +140,9 @@ where
         // "message" is tracing's conventional field name for the primary log line.
         let message = fields
             .remove("message")
-            .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s),
-                other => Some(other.to_string()),
+            .map(|v| match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
             })
             .unwrap_or_default();
 
