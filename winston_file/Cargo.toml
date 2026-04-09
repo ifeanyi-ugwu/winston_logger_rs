@@ -1,6 +1,6 @@
 [package]
 name = "winston_file"
-version = "0.3.0"
+version = "0.3.1-dev"
 edition = "2024"
 description = "file transport for winston"
 license = "MIT"
