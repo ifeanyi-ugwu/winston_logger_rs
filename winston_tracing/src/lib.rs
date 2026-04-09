@@ -116,8 +116,29 @@ where
         }
     }
 
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        self.logger.is_level_enabled_fast(map_level(metadata.level()))
+    }
+
+    fn max_level_hint(&self) -> Option<tracing_subscriber::filter::LevelFilter> {
+        use tracing::Level;
+        use tracing_subscriber::filter::LevelFilter;
+        for (level, filter) in [
+            (Level::TRACE, LevelFilter::TRACE),
+            (Level::DEBUG, LevelFilter::DEBUG),
+            (Level::INFO, LevelFilter::INFO),
+            (Level::WARN, LevelFilter::WARN),
+            (Level::ERROR, LevelFilter::ERROR),
+        ] {
+            if self.logger.is_level_enabled_fast(map_level(&level)) {
+                return Some(filter);
+            }
+        }
+        Some(LevelFilter::OFF)
+    }
+
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        let level = map_level(event.metadata().level());
+        let level = map_level(event.metadata().level()).to_string();
 
         let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
 
@@ -159,7 +180,7 @@ where
     }
 }
 
-fn map_level(level: &Level) -> String {
+fn map_level(level: &Level) -> &'static str {
     match *level {
         Level::ERROR => "error",
         Level::WARN => "warn",
@@ -167,7 +188,6 @@ fn map_level(level: &Level) -> String {
         Level::DEBUG => "debug",
         Level::TRACE => "trace",
     }
-    .to_string()
 }
 
 struct FieldVisitor<'a>(&'a mut HashMap<String, serde_json::Value>);
