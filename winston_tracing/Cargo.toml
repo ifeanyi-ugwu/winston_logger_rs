@@ -1,6 +1,6 @@
 [package]
 name = "winston_tracing"
-version = "0.1.0"
+version = "0.1.1-dev"
 edition = "2021"
 description = "tracing-subscriber Layer for the winston logger"
 license = "MIT"
