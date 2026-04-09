@@ -62,7 +62,23 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ "${{ inputs.crate }}" = "workspace" ]; then
-            cargo release ${{ inputs.level }} --execute --no-confirm
+            # --unpublished cannot be combined with a level, so we find crates
+            # with pre-release versions ourselves and release each one explicitly.
+            DEV_CRATES=$(find . -maxdepth 2 -name 'Cargo.toml' -not -path './Cargo.toml' \
+              | xargs grep -l '^\[package\]' \
+              | while read f; do
+                  name=$(grep '^\s*name\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+                  version=$(grep '^\s*version\s*=' "$f" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+                  case "$version" in *-*) echo "$name" ;; esac
+                done)
+            if [ -z "$DEV_CRATES" ]; then
+              echo "No crates with pre-release versions found."
+              exit 0
+            fi
+            for crate in $DEV_CRATES; do
+              echo "Releasing $crate..."
+              cargo release ${{ inputs.level }} --package "$crate" --execute --no-confirm
+            done
           else
             cargo release ${{ inputs.level }} --package ${{ inputs.crate }} --execute --no-confirm
           fi
