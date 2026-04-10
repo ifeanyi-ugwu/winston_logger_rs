@@ -15,6 +15,6 @@ members = [
 
 [workspace.dependencies]
 logform = { path = "logform", version = "0.7.0" }
-winston = { path = "winston", version = "0.8.1" }
+winston = { path = "winston", version = "0.8.2-dev" }
 winston_transport = { path = "winston_transport", version = "0.7.1" }
 winston_proxy_transport = { path = "winston_proxy_transport", version = "0.4.1" }

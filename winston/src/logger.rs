@@ -378,6 +378,9 @@ impl Logger {
     }
 
     pub fn log(&self, entry: LogInfo) {
+        if !self.is_level_enabled_fast(&entry.level) {
+            return;
+        }
         let entry = Arc::new(entry);
         match self.sender.try_send(LogMessage::Entry(entry)) {
             Ok(_) => {}
@@ -399,6 +402,16 @@ impl Logger {
             Err(TrySendError::Disconnected(_)) => {
                 eprintln!("[winston] Channel is disconnected. Unable to log message.");
             }
+        }
+    }
+
+    /// Constructs and logs an entry only if the level passes the filter.
+    ///
+    /// Use this when building the `LogInfo` itself is non-trivial — the closure
+    /// is never called for levels that would be discarded.
+    pub fn log_lazy(&self, level: &str, f: impl FnOnce() -> LogInfo) {
+        if self.is_level_enabled_fast(level) {
+            self.log(f());
         }
     }
 
