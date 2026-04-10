@@ -117,7 +117,8 @@ where
     }
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-        self.logger.is_level_enabled_fast(map_level(metadata.level()))
+        self.logger
+            .is_level_enabled_fast(map_level(metadata.level()))
     }
 
     fn max_level_hint(&self) -> Option<tracing_subscriber::filter::LevelFilter> {
