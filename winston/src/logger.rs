@@ -378,6 +378,9 @@ impl Logger {
     }
 
     pub fn log(&self, entry: LogInfo) {
+        if !self.is_level_enabled_fast(&entry.level) {
+            return;
+        }
         let entry = Arc::new(entry);
         match self.sender.try_send(LogMessage::Entry(entry)) {
             Ok(_) => {}
