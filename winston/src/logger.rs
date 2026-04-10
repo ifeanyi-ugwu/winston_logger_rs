@@ -405,6 +405,16 @@ impl Logger {
         }
     }
 
+    /// Constructs and logs an entry only if the level passes the filter.
+    ///
+    /// Use this when building the `LogInfo` itself is non-trivial — the closure
+    /// is never called for levels that would be discarded.
+    pub fn log_lazy(&self, level: &str, f: impl FnOnce() -> LogInfo) {
+        if self.is_level_enabled_fast(level) {
+            self.log(f());
+        }
+    }
+
     pub fn logi(&self, entry: LogInfo) {
         let entry = Arc::new(entry);
         let _ = self.sender.send(LogMessage::Entry(entry));
