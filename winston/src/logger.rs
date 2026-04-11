@@ -694,6 +694,7 @@ impl Log for Logger {
             level: record.level().as_str().to_lowercase(),
             message: record.args().to_string(),
             meta,
+            formatted: None,
         };
 
         self.log(log_info);

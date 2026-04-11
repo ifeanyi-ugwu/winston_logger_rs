@@ -555,6 +555,7 @@ mod tests {
             level: "info".to_string(),
             message: "Test message".to_string(),
             meta: Default::default(),
+            formatted: None,
         };
 
         transport.log(log_info);
@@ -581,6 +582,7 @@ mod tests {
             level: "info".to_string(),
             message: "log entry 1".to_string(),
             meta: Default::default(),
+            formatted: None,
         });
 
         // Simulate date change
@@ -590,6 +592,7 @@ mod tests {
             level: "info".to_string(),
             message: "log entry 2".to_string(),
             meta: Default::default(),
+            formatted: None,
         });
 
         transport.flush().expect("Failed to flush");
@@ -616,6 +619,7 @@ mod tests {
             level: "info".to_string(),
             message: log_message.to_string(),
             meta: Default::default(),
+            formatted: None,
         };
 
         // Write multiple logs until rotation occurs
@@ -656,6 +660,7 @@ mod tests {
                 level: "info".to_string(),
                 message: format!("Test message {}", i),
                 meta: Default::default(),
+                formatted: None,
             };
             transport.log(log_info);
         }
@@ -668,6 +673,7 @@ mod tests {
                 level: "info".to_string(),
                 message: format!("Test message final {}", i),
                 meta: Default::default(),
+                formatted: None,
             };
             transport.log(log_info);
         }
@@ -705,6 +711,7 @@ mod tests {
                 level: "info".to_string(),
                 message: format!("Message {}", i),
                 meta: Default::default(),
+                formatted: None,
             });
 
             // simulate date change

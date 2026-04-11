@@ -392,6 +392,7 @@ fn document_to_loginfo(doc: LogDocument) -> LogInfo {
         level: doc.level,
         message: doc.message,
         meta,
+        formatted: None,
     }
 }
 
@@ -486,6 +487,7 @@ mod tests {
             level: "info".to_string(),
             message: "Test log message".to_string(),
             meta: HashMap::new(),
+            formatted: None,
         };
 
         transport.log(log_info);
@@ -538,21 +540,25 @@ mod tests {
                 level: "info".to_string(),
                 message: "Info log 1".to_string(),
                 meta: HashMap::new(),
+                formatted: None,
             },
             LogInfo {
                 level: "warn".to_string(),
                 message: "Warning log".to_string(),
                 meta: HashMap::new(),
+                formatted: None,
             },
             LogInfo {
                 level: "error".to_string(),
                 message: "Error log 1".to_string(),
                 meta: HashMap::new(),
+                formatted: None,
             },
             LogInfo {
                 level: "info".to_string(),
                 message: "Info log 2".to_string(),
                 meta: HashMap::new(),
+                formatted: None,
             },
         ];
 

@@ -94,6 +94,7 @@ impl FileTransport {
             level: level.to_string(),
             message: message.to_string(),
             meta,
+            formatted: None,
         })
     }
 
@@ -174,7 +175,7 @@ impl Transport<LogInfo> for FileTransport {
 
     fn log(&self, info: LogInfo) {
         let mut file = self.file.lock().unwrap();
-        if let Err(e) = writeln!(file, "{}", info.message) {
+        if let Err(e) = writeln!(file, "{}", info) {
             eprintln!("Failed to write to log file: {}", e);
         }
     }
@@ -190,7 +191,7 @@ impl Transport<LogInfo> for FileTransport {
             let mut buf = buf.borrow_mut();
             buf.clear();
             for info in logs {
-                let _ = writeln!(buf, "{}", info.message);
+                let _ = writeln!(buf, "{}", info);
             }
             let mut file = self.file.lock().unwrap();
             if let Err(e) = file.write_all(buf.as_bytes()) {
@@ -266,6 +267,7 @@ impl Transport<LogInfo> for FileTransport {
                             .into_iter()
                             .filter(|(k, _)| normalized_fields.contains(&k.to_lowercase()))
                             .collect(),
+                        formatted: None,
                     }
                 })
                 .collect()
@@ -382,7 +384,7 @@ impl Proxy<LogInfo> for FileTransport {
                 .unwrap_or(Some(log))
                 .ok_or_else(|| "Transform failed".to_string())?;
 
-            writeln!(file, "{}", formatted_log.message)
+            writeln!(file, "{}", formatted_log)
                 .map_err(|e| format!("Failed to write log: {}", e))?;
         }
 

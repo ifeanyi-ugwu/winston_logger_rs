@@ -28,9 +28,8 @@ impl Format for SimpleFormat {
         }
 
         Some(LogInfo {
-            level: info.level,
-            message,
-            meta: std::collections::HashMap::new(),
+            formatted: Some(message),
+            ..info
         })
     }
 }
@@ -53,10 +52,10 @@ mod tests {
 
         // Should start with 'info: User logged in '
         let expected_prefix = "info: User logged in ";
-        assert!(result.message.starts_with(expected_prefix));
+        assert!(result.formatted.as_deref().unwrap().starts_with(expected_prefix));
 
         // Extract and parse the JSON part
-        let json_part = result.message.strip_prefix(expected_prefix).unwrap();
+        let json_part = result.formatted.as_deref().unwrap().strip_prefix(expected_prefix).unwrap();
         let actual_json: Value = serde_json::from_str(json_part).unwrap();
 
         let expected_json = json!({
@@ -76,7 +75,7 @@ mod tests {
 
         // Should match exactly since no metadata remains
         let expected_message = "info: User logged in";
-        assert_eq!(result.message, expected_message);
+        assert_eq!(result.formatted.as_deref().unwrap(), expected_message);
     }
     use super::*;
     use serde_json::{json, Value};
@@ -94,10 +93,10 @@ mod tests {
 
         // Split the expected message and metadata for separate assertions
         let expected_prefix = "info:     User logged in ";
-        assert!(result.message.starts_with(expected_prefix));
+        assert!(result.formatted.as_deref().unwrap().starts_with(expected_prefix));
 
         // Extract and parse the JSON part
-        let json_part = result.message.strip_prefix(expected_prefix).unwrap();
+        let json_part = result.formatted.as_deref().unwrap().strip_prefix(expected_prefix).unwrap();
         let actual_json: Value = serde_json::from_str(json_part).unwrap();
 
         // Expected JSON object

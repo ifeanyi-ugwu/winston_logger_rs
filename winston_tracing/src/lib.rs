@@ -187,6 +187,7 @@ where
             level,
             message,
             meta: fields,
+            formatted: None,
         });
     }
 }

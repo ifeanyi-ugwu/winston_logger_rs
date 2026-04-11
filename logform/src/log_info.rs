@@ -13,6 +13,11 @@ pub struct LogInfo {
     pub level: String,
     pub message: String,
     pub meta: HashMap<String, Value>,
+    /// The terminal output string produced by a finalizer format.
+    /// Transports read this field (via Display) instead of `message`.
+    /// Set only by finalizers; transforms never touch it.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub formatted: Option<String>,
 }
 
 impl LogInfo {
@@ -21,6 +26,7 @@ impl LogInfo {
             level: level.into(),
             message: message.into(),
             meta: HashMap::new(),
+            formatted: None,
         }
     }
 
@@ -80,6 +86,7 @@ impl LogInfo {
                 level,
                 message,
                 meta,
+                formatted: None,
             })
         } else {
             Err("Input value is not a JSON object".to_string())
@@ -130,10 +137,7 @@ macro_rules! log_info {
 
 impl fmt::Display for LogInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Only write the message field, which has already been formatted by formatters.
-        // Formatters are responsible for including level, timestamp, and other fields
-        // in the message as needed.
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.formatted.as_deref().unwrap_or(&self.message))
     }
 }
 
@@ -187,6 +191,7 @@ impl FromStr for LogInfo {
                 level,
                 message,
                 meta,
+                formatted: None,
             })
         } else {
             // No metadata
@@ -194,6 +199,7 @@ impl FromStr for LogInfo {
                 level,
                 message: rest.to_string(),
                 meta: HashMap::new(),
+                formatted: None,
             })
         }
     }
