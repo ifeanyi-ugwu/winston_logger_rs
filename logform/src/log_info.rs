@@ -137,7 +137,21 @@ macro_rules! log_info {
 
 impl fmt::Display for LogInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.formatted.as_deref().unwrap_or(&self.message))
+        if let Some(s) = &self.formatted {
+            return write!(f, "{}", s);
+        }
+        // No finalizer ran — emit level + message + meta so nothing is silently dropped
+        if self.meta.is_empty() {
+            write!(f, "{}: {}", self.level, self.message)
+        } else {
+            write!(
+                f,
+                "{}: {} {}",
+                self.level,
+                self.message,
+                serde_json::to_string(&self.meta).unwrap_or_default()
+            )
+        }
     }
 }
 
@@ -257,8 +271,7 @@ mod display_tests {
     #[test]
     fn test_display_without_meta() {
         let log = LogInfo::new("INFO", "Test message");
-        // Display only outputs the message field (formatters handle full formatting)
-        assert_eq!(format!("{}", log), "Test message");
+        assert_eq!(format!("{}", log), "INFO: Test message");
     }
 
     #[test]
@@ -267,9 +280,24 @@ mod display_tests {
             .with_meta("retry", 3)
             .with_meta("host", "example.com");
 
-        // Display only outputs the message field (formatters handle full formatting)
         let display = format!("{}", log);
-        assert_eq!(display, "Connection failed");
+        // meta is a HashMap so key order isn't guaranteed — check parts separately
+        assert!(display.starts_with("ERROR: Connection failed "));
+        let json_part = &display["ERROR: Connection failed ".len()..];
+        let parsed: serde_json::Value = serde_json::from_str(json_part).unwrap();
+        assert_eq!(parsed["retry"], json!(3));
+        assert_eq!(parsed["host"], json!("example.com"));
+    }
+
+    #[test]
+    fn test_display_with_formatted() {
+        let log = LogInfo {
+            level: "info".to_string(),
+            message: "original".to_string(),
+            meta: Default::default(),
+            formatted: Some("custom output".to_string()),
+        };
+        assert_eq!(format!("{}", log), "custom output");
     }
 
     #[test]
