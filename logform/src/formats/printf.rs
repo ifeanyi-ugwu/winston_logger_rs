@@ -22,9 +22,12 @@ impl Printf {
 impl Format for Printf {
     type Input = LogInfo;
 
-    fn transform(&self, mut info: LogInfo) -> Option<Self::Input> {
-        info.message = (self.template)(&info);
-        Some(info)
+    fn transform(&self, info: LogInfo) -> Option<Self::Input> {
+        let output = (self.template)(&info);
+        Some(LogInfo {
+            formatted: Some(output),
+            ..info
+        })
     }
 }
 
@@ -55,6 +58,6 @@ mod tests {
         let result = formatter.transform(info).unwrap();
 
         let expected = "info - This is a message: {\"key\":\"value\"}".to_string();
-        assert_eq!(result.message, expected);
+        assert_eq!(result.formatted.as_deref().unwrap(), expected);
     }
 }

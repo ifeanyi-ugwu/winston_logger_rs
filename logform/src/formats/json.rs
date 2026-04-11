@@ -13,17 +13,15 @@ impl Format for JsonFormat {
         log_object.insert("level".to_string(), Value::String(info.level.clone()));
         log_object.insert("message".to_string(), Value::String(info.message.clone()));
 
-        for (key, value) in info.meta.into_iter() {
-            log_object.insert(key, value);
+        for (key, value) in &info.meta {
+            log_object.insert(key.clone(), value.clone());
         }
 
         let json_message = Value::Object(log_object).to_string();
 
-        // Clear meta to avoid duplication and extra memory use
         Some(LogInfo {
-            level: info.level,
-            message: json_message,
-            meta: std::collections::HashMap::new(),
+            formatted: Some(json_message),
+            ..info
         })
     }
 }
@@ -43,7 +41,8 @@ mod tests {
             "level": "info",
             "message": "User logged in"
         });
-        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        let actual_value: Value =
+            serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
         assert_eq!(actual_value, expected_value);
     }
 
@@ -58,7 +57,8 @@ mod tests {
             "message": "Special chars: \" \n \t ",
             "weird\nkey": "strange\tvalue"
         });
-        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        let actual_value: Value =
+            serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
         assert_eq!(actual_value, expected_value);
     }
 
@@ -83,7 +83,8 @@ mod tests {
         let expected_value = Value::Object(expected);
 
         // Compare as parsed values to avoid HashMap key ordering issues
-        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        let actual_value: Value =
+            serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
         assert_eq!(actual_value, expected_value);
     }
 
@@ -96,7 +97,8 @@ mod tests {
             "level": "",
             "message": ""
         });
-        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        let actual_value: Value =
+            serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
         assert_eq!(actual_value, expected_value);
     }
     use serde_json::json;
@@ -119,7 +121,8 @@ mod tests {
             "session_id": "abcde12345"
         });
 
-        let actual_value: Value = serde_json::from_str(&result.message).unwrap();
+        let actual_value: Value =
+            serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
         assert_eq!(actual_value, expected_value);
     }
 }

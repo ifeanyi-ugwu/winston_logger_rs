@@ -183,11 +183,7 @@ where
             fields.insert("line".to_string(), serde_json::Value::Number(line.into()));
         }
 
-        self.logger.log(LogInfo {
-            level,
-            message,
-            meta: fields,
-        });
+        self.logger.log(LogInfo::from_parts(level, message, fields));
     }
 }
 

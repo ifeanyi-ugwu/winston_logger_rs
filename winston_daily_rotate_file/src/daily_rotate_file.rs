@@ -551,11 +551,7 @@ mod tests {
         let temp_dir = setup_temp_dir();
         let transport = create_test_transport(&temp_dir);
 
-        let log_info = LogInfo {
-            level: "info".to_string(),
-            message: "Test message".to_string(),
-            meta: Default::default(),
-        };
+        let log_info = LogInfo::new("info", "Test message");
 
         transport.log(log_info);
         transport.flush().expect("Failed to flush");
@@ -577,20 +573,12 @@ mod tests {
             .build()
             .expect("Failed to create transport");
 
-        transport.log(LogInfo {
-            level: "info".to_string(),
-            message: "log entry 1".to_string(),
-            meta: Default::default(),
-        });
+        transport.log(LogInfo::new("info", "log entry 1"));
 
         // Simulate date change
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        transport.log(LogInfo {
-            level: "info".to_string(),
-            message: "log entry 2".to_string(),
-            meta: Default::default(),
-        });
+        transport.log(LogInfo::new("info", "log entry 2"));
 
         transport.flush().expect("Failed to flush");
 
@@ -612,11 +600,7 @@ mod tests {
             .expect("Failed to create transport");
 
         let log_message = "This is a test log message that should exceed the max file size.";
-        let log_info = LogInfo {
-            level: "info".to_string(),
-            message: log_message.to_string(),
-            meta: Default::default(),
-        };
+        let log_info = LogInfo::new("info", log_message);
 
         // Write multiple logs until rotation occurs
         for _ in 0..10 {
@@ -652,24 +636,14 @@ mod tests {
 
         // Create log entries to force rotation
         for i in 0..5 {
-            let log_info = LogInfo {
-                level: "info".to_string(),
-                message: format!("Test message {}", i),
-                meta: Default::default(),
-            };
-            transport.log(log_info);
+            transport.log(LogInfo::new("info", format!("Test message {}", i)));
         }
 
         // Add more entries to trigger another rotation
         // this entry will hit max size at about the 3rd message
         // which means it will cause a rotation and still keep an open file containing the last 2 messages
         for i in 0..5 {
-            let log_info = LogInfo {
-                level: "info".to_string(),
-                message: format!("Test message final {}", i),
-                meta: Default::default(),
-            };
-            transport.log(log_info);
+            transport.log(LogInfo::new("info", format!("Test message final {}", i)));
         }
 
         // Check if .gz files were created
@@ -701,11 +675,7 @@ mod tests {
             .expect("Failed to create transport");
 
         for i in 0..5 {
-            transport.log(LogInfo {
-                level: "info".to_string(),
-                message: format!("Message {}", i),
-                meta: Default::default(),
-            });
+            transport.log(LogInfo::new("info", format!("Message {}", i)));
 
             // simulate date change
             std::thread::sleep(std::time::Duration::from_secs(1));

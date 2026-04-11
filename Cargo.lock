@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "logform"
-version = "0.7.0"
+version = "0.8.0-dev"
 dependencies = [
  "chrono",
  "colored",
@@ -3589,7 +3589,7 @@ dependencies = [
 
 [[package]]
 name = "winston"
-version = "0.8.2"
+version = "0.8.3-dev"
 dependencies = [
  "chrono",
  "criterion",
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "winston_daily_rotate_file"
-version = "0.4.2"
+version = "0.4.3-dev"
 dependencies = [
  "chrono",
  "flate2",
@@ -3617,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "winston_file"
-version = "0.3.1"
+version = "0.3.2-dev"
 dependencies = [
  "chrono",
  "dateparser",
@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "winston_mongodb"
-version = "0.5.1"
+version = "0.5.2-dev"
 dependencies = [
  "bson",
  "chrono",
@@ -3664,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "winston_tracing"
-version = "0.1.1"
+version = "0.1.2-dev"
 dependencies = [
  "logform",
  "serde_json",

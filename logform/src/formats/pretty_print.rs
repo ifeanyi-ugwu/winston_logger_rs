@@ -29,17 +29,16 @@ impl PrettyPrinter {
         json_output.insert("level".to_string(), Value::String(info.level.clone()));
         json_output.insert("message".to_string(), Value::String(info.message.clone()));
 
-        for (key, value) in info.meta {
-            json_output.insert(key, value);
+        for (key, value) in &info.meta {
+            json_output.insert(key.clone(), value.clone());
         }
 
         let json_value = Value::Object(json_output);
         let pretty_message = format_json(&json_value, self.colorize);
 
         LogInfo {
-            level: info.level.clone(),
-            message: pretty_message,
-            meta: std::collections::HashMap::new(),
+            formatted: Some(pretty_message),
+            ..info
         }
     }
 }
@@ -88,7 +87,7 @@ mod tests {
         let result = formatter.transform(info).unwrap();
 
         // Check for overall structure
-        let message = &result.message;
+        let message = result.formatted.as_deref().unwrap();
 
         // Check for proper JSON-like structure
         assert!(message.starts_with("{"), "Message should start with '{{'");
@@ -165,7 +164,7 @@ mod tests {
             .with_meta("null_value", Value::Null);
 
         let result = formatter.transform(info).unwrap();
-        let message = &result.message;
+        let message = result.formatted.as_deref().unwrap();
 
         let re_info = Regex::new(r"level: '\x1b\[32minfo\x1b\[0m'").unwrap();
         let re_message = Regex::new(r"message: '\x1b\[32mTest message\x1b\[0m'").unwrap();

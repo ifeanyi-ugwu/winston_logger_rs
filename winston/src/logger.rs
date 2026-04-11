@@ -690,11 +690,11 @@ impl Log for Logger {
             }
         }
 
-        let log_info = LogInfo {
-            level: record.level().as_str().to_lowercase(),
-            message: record.args().to_string(),
+        let log_info = LogInfo::from_parts(
+            record.level().as_str().to_lowercase(),
+            record.args().to_string(),
             meta,
-        };
+        );
 
         self.log(log_info);
     }

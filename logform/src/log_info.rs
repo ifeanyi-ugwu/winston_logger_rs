@@ -7,12 +7,18 @@ use std::{collections::HashMap, fmt, str::FromStr};
 #[cfg(feature = "serde")]
 use std::io::Result as IoResult;
 
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LogInfo {
     pub level: String,
     pub message: String,
     pub meta: HashMap<String, Value>,
+    /// The terminal output string produced by a finalizer format.
+    /// Transports read this field (via Display) instead of `message`.
+    /// Set only by finalizers; transforms never touch it.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub formatted: Option<String>,
 }
 
 impl LogInfo {
@@ -21,6 +27,20 @@ impl LogInfo {
             level: level.into(),
             message: message.into(),
             meta: HashMap::new(),
+            formatted: None,
+        }
+    }
+
+    pub fn from_parts<L, M>(level: L, message: M, meta: HashMap<String, Value>) -> Self
+    where
+        L: Into<String>,
+        M: Into<String>,
+    {
+        Self {
+            level: level.into(),
+            message: message.into(),
+            meta,
+            formatted: None,
         }
     }
 
@@ -80,6 +100,7 @@ impl LogInfo {
                 level,
                 message,
                 meta,
+                formatted: None,
             })
         } else {
             Err("Input value is not a JSON object".to_string())
@@ -130,10 +151,21 @@ macro_rules! log_info {
 
 impl fmt::Display for LogInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Only write the message field, which has already been formatted by formatters.
-        // Formatters are responsible for including level, timestamp, and other fields
-        // in the message as needed.
-        write!(f, "{}", self.message)
+        if let Some(s) = &self.formatted {
+            return write!(f, "{}", s);
+        }
+        // No finalizer ran — emit level + message + meta so nothing is silently dropped
+        if self.meta.is_empty() {
+            write!(f, "{} {}", self.level, self.message)
+        } else {
+            write!(
+                f,
+                "{} {} {}",
+                self.level,
+                self.message,
+                serde_json::to_string(&self.meta).unwrap_or_default()
+            )
+        }
     }
 }
 
@@ -187,6 +219,7 @@ impl FromStr for LogInfo {
                 level,
                 message,
                 meta,
+                formatted: None,
             })
         } else {
             // No metadata
@@ -194,6 +227,7 @@ impl FromStr for LogInfo {
                 level,
                 message: rest.to_string(),
                 meta: HashMap::new(),
+                formatted: None,
             })
         }
     }
@@ -251,8 +285,7 @@ mod display_tests {
     #[test]
     fn test_display_without_meta() {
         let log = LogInfo::new("INFO", "Test message");
-        // Display only outputs the message field (formatters handle full formatting)
-        assert_eq!(format!("{}", log), "Test message");
+        assert_eq!(format!("{}", log), "INFO Test message");
     }
 
     #[test]
@@ -261,9 +294,24 @@ mod display_tests {
             .with_meta("retry", 3)
             .with_meta("host", "example.com");
 
-        // Display only outputs the message field (formatters handle full formatting)
         let display = format!("{}", log);
-        assert_eq!(display, "Connection failed");
+        // meta is a HashMap so key order isn't guaranteed — check parts separately
+        assert!(display.starts_with("ERROR Connection failed "));
+        let json_part = &display["ERROR Connection failed ".len()..];
+        let parsed: serde_json::Value = serde_json::from_str(json_part).unwrap();
+        assert_eq!(parsed["retry"], json!(3));
+        assert_eq!(parsed["host"], json!("example.com"));
+    }
+
+    #[test]
+    fn test_display_with_formatted() {
+        let log = LogInfo {
+            level: "info".to_string(),
+            message: "original".to_string(),
+            meta: Default::default(),
+            formatted: Some("custom output".to_string()),
+        };
+        assert_eq!(format!("{}", log), "custom output");
     }
 
     #[test]
