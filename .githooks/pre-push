@@ -45,19 +45,14 @@ for crate in "${CRATES[@]}"; do
         | grep '^version' | head -1 | sed 's/.*= *"\(.*\)"/\1/')
 
     if [ "$BRANCH_VERSION" = "$MAIN_VERSION" ]; then
-        # Strip any existing prerelease suffix to get the numeric base (e.g. "0.8.2-dev" → "0.8.2").
+        # Always suggest the next patch pre-release. Strip any existing prerelease
+        # suffix first so "0.8.2-dev" doesn't produce "0.8.2-dev-dev", and bump
+        # the patch so the suggestion is never the already-published version.
         BASE_VERSION=$(echo "$MAIN_VERSION" | sed 's/-.*$//')
-        if [ "$BASE_VERSION" = "$MAIN_VERSION" ]; then
-            # No prerelease on main — plain x.y.z-dev is the right target.
-            SUGGESTED="${MAIN_VERSION}-dev"
-        else
-            # Main already has a prerelease suffix; appending -dev would produce
-            # nonsense like "0.8.2-dev-dev". Bump the patch instead.
-            PATCH=$(echo "$BASE_VERSION" | cut -d. -f3)
-            NEW_PATCH=$((PATCH + 1))
-            MAJOR_MINOR=$(echo "$BASE_VERSION" | cut -d. -f1-2)
-            SUGGESTED="${MAJOR_MINOR}.${NEW_PATCH}-dev"
-        fi
+        PATCH=$(echo "$BASE_VERSION" | cut -d. -f3)
+        NEW_PATCH=$((PATCH + 1))
+        MAJOR_MINOR=$(echo "$BASE_VERSION" | cut -d. -f1-2)
+        SUGGESTED="${MAJOR_MINOR}.${NEW_PATCH}-dev"
         echo "error: $crate has source changes but its version is still $BRANCH_VERSION (same as main)"
         echo "       bump it to ${SUGGESTED} in ${crate}/Cargo.toml before pushing"
         FAILED=1
