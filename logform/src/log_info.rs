@@ -142,11 +142,11 @@ impl fmt::Display for LogInfo {
         }
         // No finalizer ran — emit level + message + meta so nothing is silently dropped
         if self.meta.is_empty() {
-            write!(f, "{}: {}", self.level, self.message)
+            write!(f, "{} {}", self.level, self.message)
         } else {
             write!(
                 f,
-                "{}: {} {}",
+                "{} {} {}",
                 self.level,
                 self.message,
                 serde_json::to_string(&self.meta).unwrap_or_default()
@@ -271,7 +271,7 @@ mod display_tests {
     #[test]
     fn test_display_without_meta() {
         let log = LogInfo::new("INFO", "Test message");
-        assert_eq!(format!("{}", log), "INFO: Test message");
+        assert_eq!(format!("{}", log), "INFO Test message");
     }
 
     #[test]
@@ -282,8 +282,8 @@ mod display_tests {
 
         let display = format!("{}", log);
         // meta is a HashMap so key order isn't guaranteed — check parts separately
-        assert!(display.starts_with("ERROR: Connection failed "));
-        let json_part = &display["ERROR: Connection failed ".len()..];
+        assert!(display.starts_with("ERROR Connection failed "));
+        let json_part = &display["ERROR Connection failed ".len()..];
         let parsed: serde_json::Value = serde_json::from_str(json_part).unwrap();
         assert_eq!(parsed["retry"], json!(3));
         assert_eq!(parsed["host"], json!("example.com"));
