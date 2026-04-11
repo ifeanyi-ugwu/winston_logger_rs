@@ -388,12 +388,7 @@ fn document_to_loginfo(doc: LogDocument) -> LogInfo {
         serde_json::Value::from(doc.timestamp.to_rfc3339()),
     );
 
-    LogInfo {
-        level: doc.level,
-        message: doc.message,
-        meta,
-        formatted: None,
-    }
+    LogInfo::from_parts(doc.level, doc.message, meta)
 }
 
 async fn create_indexes(collection: &Collection<LogDocument>) -> Result<(), mongodb::error::Error> {
@@ -483,12 +478,7 @@ mod tests {
 
         let transport = MongoDBTransport::new(options.clone()).unwrap();
 
-        let log_info = LogInfo {
-            level: "info".to_string(),
-            message: "Test log message".to_string(),
-            meta: HashMap::new(),
-            formatted: None,
-        };
+        let log_info = LogInfo::new("info", "Test log message");
 
         transport.log(log_info);
 
@@ -540,30 +530,10 @@ mod tests {
 
         // Insert multiple logs with different levels, timestamps, and messages
         let log_entries = vec![
-            LogInfo {
-                level: "info".to_string(),
-                message: "Info log 1".to_string(),
-                meta: HashMap::new(),
-                formatted: None,
-            },
-            LogInfo {
-                level: "warn".to_string(),
-                message: "Warning log".to_string(),
-                meta: HashMap::new(),
-                formatted: None,
-            },
-            LogInfo {
-                level: "error".to_string(),
-                message: "Error log 1".to_string(),
-                meta: HashMap::new(),
-                formatted: None,
-            },
-            LogInfo {
-                level: "info".to_string(),
-                message: "Info log 2".to_string(),
-                meta: HashMap::new(),
-                formatted: None,
-            },
+            LogInfo::new("info", "Info log 1"),
+            LogInfo::new("warn", "Warning log"),
+            LogInfo::new("error", "Error log 1"),
+            LogInfo::new("info", "Info log 2"),
         ];
 
         // Log the entries

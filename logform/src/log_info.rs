@@ -7,6 +7,7 @@ use std::{collections::HashMap, fmt, str::FromStr};
 #[cfg(feature = "serde")]
 use std::io::Result as IoResult;
 
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LogInfo {
@@ -26,6 +27,19 @@ impl LogInfo {
             level: level.into(),
             message: message.into(),
             meta: HashMap::new(),
+            formatted: None,
+        }
+    }
+
+    pub fn from_parts<L, M>(level: L, message: M, meta: HashMap<String, Value>) -> Self
+    where
+        L: Into<String>,
+        M: Into<String>,
+    {
+        Self {
+            level: level.into(),
+            message: message.into(),
+            meta,
             formatted: None,
         }
     }
