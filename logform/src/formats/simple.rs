@@ -30,7 +30,7 @@ impl Format for SimpleFormat {
         Some(LogInfo {
             level: info.level,
             message,
-            meta: info.meta,
+            meta: std::collections::HashMap::new(),
         })
     }
 }
