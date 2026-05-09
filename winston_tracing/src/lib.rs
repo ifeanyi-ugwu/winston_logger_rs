@@ -172,8 +172,7 @@ where
             let metadata = attrs.metadata();
             insert_location(&mut meta, metadata);
             let level = map_level(metadata.level()).to_string();
-            self.logger
-                .log(LogInfo::from_parts(level, span_name, meta));
+            self.logger.log(LogInfo::from_parts(level, span_name, meta));
         }
     }
 
@@ -362,8 +361,7 @@ impl tracing::field::Visit for FieldVisitor<'_> {
     ) {
         // Walk the source chain; a single-entry chain is stored as a plain string
         // so existing consumers that expect a string field don't break.
-        let mut chain: Vec<serde_json::Value> =
-            vec![serde_json::Value::String(value.to_string())];
+        let mut chain: Vec<serde_json::Value> = vec![serde_json::Value::String(value.to_string())];
         let mut source = value.source();
         while let Some(err) = source {
             chain.push(serde_json::Value::String(err.to_string()));
