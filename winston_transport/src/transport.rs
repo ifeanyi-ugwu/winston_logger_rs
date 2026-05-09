@@ -46,4 +46,11 @@ pub trait AsyncTransport<L>: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 's>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn query<'s>(
+        &'s self,
+        _options: &'s LogQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<L>, String>> + Send + 's>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }

@@ -416,19 +416,16 @@ impl Logger {
         }
     }
 
+    /// Synchronous query — only iterates sync transports. Async transports are
+    /// skipped (calling their futures from a sync context would require
+    /// blocking on a runtime, which deadlocks inside tokio). Use
+    /// [`Logger::query_async`] from async contexts to include both.
     pub fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
-        // Query is still forwarded via shared_state transport list — transports
-        // that support query need to be accessible here too. For now we keep a
-        // separate Arc<dyn Transport> list just for query support.
-        //
-        // TODO: in a follow-up, route query requests through the pipeline.
         let state = self.shared_state.read();
         let mut results = Vec::new();
 
         if let Some(transports) = &state.options.transports {
             for (_handle, transport) in transports {
-                // Async transports don't expose a sync query path yet;
-                // skip them until the async query refactor lands.
                 let Some(sync_t) = transport.as_sync() else {
                     continue;
                 };
@@ -436,6 +433,39 @@ impl Logger {
                     Ok(mut logs) => results.append(&mut logs),
                     Err(e) => return Err(format!("Query failed: {}", e)),
                 }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Async query — iterates every transport, awaiting async ones. Each
+    /// transport's query runs sequentially so a slow one doesn't race ahead;
+    /// switch to `futures::future::try_join_all` here if cross-transport
+    /// concurrency becomes worth the complexity.
+    pub async fn query_async(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
+        // Snapshot the transport list so we don't hold the RwLock across awaits.
+        let snapshot: Vec<LoggerTransport<LogInfo>> = {
+            let state = self.shared_state.read();
+            state
+                .options
+                .transports
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|(_, t)| t.clone())
+                .collect()
+        };
+
+        let mut results = Vec::new();
+        for transport in snapshot {
+            let chunk = match transport.kind() {
+                crate::logger_transport::TransportKind::Sync(t) => t.query(options),
+                crate::logger_transport::TransportKind::Async(t) => t.query(options).await,
+            };
+            match chunk {
+                Ok(mut logs) => results.append(&mut logs),
+                Err(e) => return Err(format!("Query failed: {}", e)),
             }
         }
 
