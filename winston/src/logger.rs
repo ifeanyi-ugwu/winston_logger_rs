@@ -1157,4 +1157,185 @@ mod tests {
         let state = logger.shared_state.read();
         assert_eq!(state.options.transports.as_ref().unwrap().len(), 2);
     }
+
+    // ── Async transport tests ────────────────────────────────────────────────
+
+    use crate::logger_transport::Async;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::task::{Context, Poll};
+
+    /// Yields exactly once: returns Pending and then Ready on the next poll.
+    /// Used to force the executor to make progress on other futures, so
+    /// concurrency tests can observe overlapping in-flight log calls.
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    fn yield_once() -> YieldOnce {
+        YieldOnce(false)
+    }
+
+    #[derive(Clone)]
+    struct AsyncTestTransport {
+        logs: Arc<Mutex<Vec<LogInfo>>>,
+        concurrency: usize,
+        in_flight: Arc<AtomicUsize>,
+        max_observed: Arc<AtomicUsize>,
+    }
+
+    impl AsyncTestTransport {
+        fn new(concurrency: usize) -> Self {
+            Self {
+                logs: Arc::new(Mutex::new(Vec::new())),
+                concurrency,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_observed: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn get_logs(&self) -> Vec<LogInfo> {
+            self.logs.lock().unwrap().clone()
+        }
+
+        fn max_in_flight(&self) -> usize {
+            self.max_observed.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl winston_transport::AsyncTransport<LogInfo> for AsyncTestTransport {
+        fn log<'s>(&'s self, info: LogInfo) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
+            let logs = Arc::clone(&self.logs);
+            let in_flight = Arc::clone(&self.in_flight);
+            let max_observed = Arc::clone(&self.max_observed);
+            Box::pin(async move {
+                let cur = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                max_observed.fetch_max(cur, AtomicOrdering::SeqCst);
+                yield_once().await;
+                logs.lock().unwrap().push(info);
+                in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            })
+        }
+
+        fn query<'s>(
+            &'s self,
+            _options: &'s winston_transport::LogQuery,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<LogInfo>, String>> + Send + 's>> {
+            let logs = Arc::clone(&self.logs);
+            Box::pin(async move { Ok(logs.lock().unwrap().clone()) })
+        }
+
+        fn concurrency(&self) -> usize {
+            self.concurrency
+        }
+    }
+
+    #[test]
+    fn test_async_transport_receives_logs() {
+        let logger = Logger::new(None);
+        let transport = AsyncTestTransport::new(1);
+        logger.add_transport(Async(transport.clone()));
+
+        logger.log(LogInfo::new("info", "one"));
+        logger.log(LogInfo::new("info", "two"));
+        logger.flush().unwrap();
+
+        let logs = transport.get_logs();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].message, "one");
+        assert_eq!(logs[1].message, "two");
+    }
+
+    #[test]
+    fn test_async_transport_sequential_keeps_in_flight_at_one() {
+        let logger = Logger::new(None);
+        let transport = AsyncTestTransport::new(1);
+        logger.add_transport(Async(transport.clone()));
+
+        for i in 0..8 {
+            logger.log(LogInfo::new("info", format!("msg {}", i)));
+        }
+        logger.flush().unwrap();
+
+        assert_eq!(transport.get_logs().len(), 8);
+        assert_eq!(
+            transport.max_in_flight(),
+            1,
+            "concurrency=1 must serialize log calls"
+        );
+    }
+
+    #[test]
+    fn test_async_transport_concurrent_overlaps_log_calls() {
+        let logger = Logger::new(None);
+        let transport = AsyncTestTransport::new(4);
+        logger.add_transport(Async(transport.clone()));
+
+        for i in 0..8 {
+            logger.log(LogInfo::new("info", format!("msg {}", i)));
+        }
+        logger.flush().unwrap();
+
+        assert_eq!(transport.get_logs().len(), 8);
+        assert!(
+            transport.max_in_flight() > 1,
+            "concurrency=4 should let multiple log futures be in flight (saw {})",
+            transport.max_in_flight()
+        );
+    }
+
+    #[test]
+    fn test_async_transport_flush_drains_in_flight() {
+        let logger = Logger::new(None);
+        let transport = AsyncTestTransport::new(4);
+        logger.add_transport(Async(transport.clone()));
+
+        for i in 0..16 {
+            logger.log(LogInfo::new("info", format!("msg {}", i)));
+        }
+        // Flush must wait for every in-flight log future before returning.
+        logger.flush().unwrap();
+
+        assert_eq!(transport.get_logs().len(), 16);
+        assert_eq!(
+            transport.in_flight.load(AtomicOrdering::SeqCst),
+            0,
+            "flush must drain all in-flight log futures"
+        );
+    }
+
+    #[test]
+    fn test_query_async_includes_async_transport() {
+        use futures::executor::block_on;
+
+        let logger = Logger::new(None);
+        let async_t = AsyncTestTransport::new(1);
+        let sync_t = TestTransport::new();
+        logger.add_transport(Async(async_t.clone()));
+        logger.add_transport(sync_t.clone());
+
+        logger.log(LogInfo::new("info", "from sync"));
+        logger.log(LogInfo::new("info", "from async"));
+        logger.flush().unwrap();
+
+        let results = block_on(logger.query_async(&LogQuery::new())).unwrap();
+        // Each transport sees both entries; query_async aggregates them.
+        assert_eq!(results.len(), 4);
+
+        // Sync query path skips async transports — only the sync transport contributes.
+        let sync_only = logger.query(&LogQuery::new()).unwrap();
+        assert_eq!(sync_only.len(), 2);
+    }
 }
