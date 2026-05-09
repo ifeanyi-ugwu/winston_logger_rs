@@ -3676,7 +3676,7 @@ dependencies = [
 
 [[package]]
 name = "winston_transport"
-version = "0.7.1"
+version = "0.7.2-dev"
 dependencies = [
  "chrono",
  "dateparser",

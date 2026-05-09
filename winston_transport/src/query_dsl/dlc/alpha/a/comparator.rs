@@ -468,10 +468,8 @@ impl Comparator {
                         }
                     };
                 }*/
-                (Comparator::Function, Some(QueryValue::Function(func))) => {
-                    if func(val) {
-                        return true;
-                    }
+                (Comparator::Function, Some(QueryValue::Function(func))) if func(val) => {
+                    return true;
                 }
                 _ => {}
             }
