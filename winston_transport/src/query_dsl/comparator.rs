@@ -71,35 +71,31 @@ impl Comparator {
     pub fn evaluate(&self, field_value: Vec<&Value>, expected_value: &Option<QueryValue>) -> bool {
         for val in field_value {
             match (self, expected_value) {
-                (Comparator::Equals, Some(expected)) => {
-                    if self.compare_values(val, expected) {
-                        return true;
-                    }
+                (Comparator::Equals, Some(expected)) if self.compare_values(val, expected) => {
+                    return true;
                 }
-                (Comparator::NotEquals, Some(expected)) => {
-                    if !self.compare_values(val, expected) {
-                        return true;
-                    }
+                (Comparator::NotEquals, Some(expected)) if !self.compare_values(val, expected) => {
+                    return true;
                 }
-                (Comparator::GreaterThan, Some(expected)) => {
-                    if self.compare_numbers(val, expected, Ordering::is_gt) {
-                        return true;
-                    }
+                (Comparator::GreaterThan, Some(expected))
+                    if self.compare_numbers(val, expected, Ordering::is_gt) =>
+                {
+                    return true;
                 }
-                (Comparator::LessThan, Some(expected)) => {
-                    if self.compare_numbers(val, expected, Ordering::is_lt) {
-                        return true;
-                    }
+                (Comparator::LessThan, Some(expected))
+                    if self.compare_numbers(val, expected, Ordering::is_lt) =>
+                {
+                    return true;
                 }
-                (Comparator::GreaterThanOrEqual, Some(expected)) => {
-                    if self.compare_numbers(val, expected, Ordering::is_ge) {
-                        return true;
-                    }
+                (Comparator::GreaterThanOrEqual, Some(expected))
+                    if self.compare_numbers(val, expected, Ordering::is_ge) =>
+                {
+                    return true;
                 }
-                (Comparator::LessThanOrEqual, Some(expected)) => {
-                    if self.compare_numbers(val, expected, Ordering::is_le) {
-                        return true;
-                    }
+                (Comparator::LessThanOrEqual, Some(expected))
+                    if self.compare_numbers(val, expected, Ordering::is_le) =>
+                {
+                    return true;
                 }
                 (Comparator::Exists, None) => return true,
                 (Comparator::NotExists, None) => return false,
@@ -141,10 +137,8 @@ impl Comparator {
                             }
                         }
                     }
-                    Value::String(actual_str) => {
-                        if actual_str.contains(expected_substring) {
-                            return true;
-                        }
+                    Value::String(actual_str) if actual_str.contains(expected_substring) => {
+                        return true;
                     }
                     _ => {}
                 },
@@ -247,29 +241,29 @@ impl Comparator {
                         }
                     }
                 }
-                (Comparator::Between, Some(QueryValue::Array(expected_range))) => {
-                    if expected_range.len() == 2 {
-                        if let (Some(start), Some(end)) =
-                            (expected_range.first(), expected_range.get(1))
+                (Comparator::Between, Some(QueryValue::Array(expected_range)))
+                    if expected_range.len() == 2 =>
+                {
+                    if let (Some(start), Some(end)) =
+                        (expected_range.first(), expected_range.get(1))
+                    {
+                        if self.compare_numbers(val, start, Ordering::is_ge)
+                            && self.compare_numbers(val, end, Ordering::is_le)
                         {
-                            if self.compare_numbers(val, start, Ordering::is_ge)
-                                && self.compare_numbers(val, end, Ordering::is_le)
-                            {
-                                return true;
-                            }
+                            return true;
                         }
                     }
                 }
-                (Comparator::NotBetween, Some(QueryValue::Array(expected_range))) => {
-                    if expected_range.len() == 2 {
-                        if let (Some(start), Some(end)) =
-                            (expected_range.first(), expected_range.get(1))
+                (Comparator::NotBetween, Some(QueryValue::Array(expected_range)))
+                    if expected_range.len() == 2 =>
+                {
+                    if let (Some(start), Some(end)) =
+                        (expected_range.first(), expected_range.get(1))
+                    {
+                        if !(self.compare_numbers(val, start, Ordering::is_ge)
+                            && self.compare_numbers(val, end, Ordering::is_le))
                         {
-                            if !(self.compare_numbers(val, start, Ordering::is_ge)
-                                && self.compare_numbers(val, end, Ordering::is_le))
-                            {
-                                return true;
-                            }
+                            return true;
                         }
                     }
                 }
