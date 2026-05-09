@@ -9,12 +9,12 @@ members = [
     "logmark",
     "winston",
     "winston_file",
+    "winston_mongodb",
     "winston_transport",
 ]
 exclude = [
     "winston_daily_rotate_file",
     "winston_http",
-    "winston_mongodb",
     "winston_tracing",
 ]
 
