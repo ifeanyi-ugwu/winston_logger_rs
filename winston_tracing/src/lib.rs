@@ -2,8 +2,14 @@ use logform::{Format, LogInfo};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
-use winston::Logger;
+use whatwg_streams::{CountQueuingStrategy, WritableStream};
+use winston::{Logger, SpawnFn};
 use winston_transport::Transport;
+
+/// Type-erased per-transport enqueue closure used by [`DirectLayer`]. Captures
+/// a typed `WritableStreamDefaultWriter` so each `Transport` impl can have its
+/// own concrete sink type while still living together in a `Vec`.
+type EnqueueFn = Box<dyn Fn(LogInfo) + Send + Sync>;
 
 struct SpanFields(HashMap<String, serde_json::Value>);
 
@@ -154,24 +160,24 @@ impl tracing::field::Visit for FieldVisitor<'_> {
 }
 
 /// A lightweight [`tracing_subscriber::Layer`] that routes tracing events
-/// directly through a logform format pipeline into one or more transports —
-/// no [`Logger`] required.
+/// directly into one or more transports — no [`Logger`] required.
 ///
-/// Because there is no background thread or channel, each event is formatted
-/// and dispatched synchronously inside the tracing callback. If a transport
-/// is slow, wrap it in a [`winston_transport::threaded_transport::ThreadedTransport`]
-/// before passing it here.
+/// Each transport runs its own per-transport `WritableStream` task, spawned
+/// via the `SpawnFn` you pass to the builder. Events fan out via the writers'
+/// fire-and-forget `enqueue`, so the tracing callback returns immediately.
+/// A slow transport applies backpressure on its own writer's queue without
+/// blocking other transports.
 ///
 /// # Example
 ///
 /// ```rust,no_run
 /// use tracing_subscriber::prelude::*;
 /// use winston_tracing::DirectLayer;
-/// use winston::transports;
+/// use winston::{default_spawner, transports};
 ///
 /// tracing_subscriber::registry()
 ///     .with(
-///         DirectLayer::builder()
+///         DirectLayer::builder(default_spawner())
 ///             .format(logform::json())
 ///             .transport(transports::stdout())
 ///             .build(),
@@ -182,13 +188,14 @@ impl tracing::field::Visit for FieldVisitor<'_> {
 /// ```
 pub struct DirectLayer {
     format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    transports: Vec<Arc<dyn Transport<LogInfo> + Send + Sync>>,
+    transports: Vec<EnqueueFn>,
     min_level: Option<LevelFilter>,
 }
 
 impl DirectLayer {
-    pub fn builder() -> DirectLayerBuilder {
+    pub fn builder(spawn_fn: SpawnFn) -> DirectLayerBuilder {
         DirectLayerBuilder {
+            spawn_fn,
             format: None,
             transports: Vec::new(),
             min_level: None,
@@ -197,8 +204,9 @@ impl DirectLayer {
 }
 
 pub struct DirectLayerBuilder {
+    spawn_fn: SpawnFn,
     format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    transports: Vec<Arc<dyn Transport<LogInfo> + Send + Sync>>,
+    transports: Vec<EnqueueFn>,
     min_level: Option<LevelFilter>,
 }
 
@@ -213,12 +221,30 @@ impl DirectLayerBuilder {
         self
     }
 
-    /// Add a transport. Multiple transports receive every (post-format) entry.
+    /// Add a transport. Each call spawns a per-transport `WritableStream`
+    /// task using the builder's `SpawnFn`. Multiple transports each receive
+    /// every (post-format) entry.
     pub fn transport<T>(mut self, transport: T) -> Self
     where
-        T: Transport<LogInfo> + Send + Sync + 'static,
+        T: Transport,
     {
-        self.transports.push(Arc::new(transport));
+        let spawn_for_stream = Arc::clone(&self.spawn_fn);
+        let stream = WritableStream::builder(transport)
+            .strategy(CountQueuingStrategy::new(1024))
+            .spawn(move |fut| spawn_for_stream(fut));
+        let (locked, writer) = stream
+            .get_writer()
+            .expect("DirectLayer: failed to acquire writer for transport");
+
+        // Move `locked` and `writer` into the closure together — `_locked`
+        // keeps the writer's exclusivity for as long as the closure (and
+        // therefore the DirectLayer) is alive.
+        let enqueue: EnqueueFn = Box::new(move |info: LogInfo| {
+            // Held only to keep the lock alive.
+            let _ = &locked;
+            let _ = writer.enqueue(info);
+        });
+        self.transports.push(enqueue);
         self
     }
 
@@ -311,8 +337,10 @@ where
             None => info,
         };
 
-        for transport in &self.transports {
-            transport.log(info.clone());
+        // Fire-and-forget enqueue per transport. Backpressure is per-stream;
+        // a slow transport doesn't block the others.
+        for enqueue in &self.transports {
+            enqueue(info.clone());
         }
     }
 }
@@ -568,29 +596,53 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::prelude::*;
+    use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
+    use winston::default_spawner;
 
+    /// Test transport: pushes each entry into a shared `Vec`. Cloning shares
+    /// the underlying `Arc<Mutex<Vec<LogInfo>>>` so the test thread retains a
+    /// handle to inspect what was written even after the consumer takes the
+    /// transport.
     #[derive(Clone)]
     struct CaptureTransport(Arc<Mutex<Vec<LogInfo>>>);
 
-    impl Transport<LogInfo> for CaptureTransport {
-        fn log(&self, info: LogInfo) {
+    impl WritableSink<LogInfo> for CaptureTransport {
+        async fn write(
+            &mut self,
+            info: LogInfo,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
             self.0.lock().unwrap().push(info);
+            Ok(())
         }
     }
+
+    impl Transport for CaptureTransport {}
 
     fn capture() -> (CaptureTransport, Arc<Mutex<Vec<LogInfo>>>) {
         let store = Arc::new(Mutex::new(Vec::new()));
         (CaptureTransport(store.clone()), store)
     }
 
+    /// Per-test-event grace period: enqueue is fire-and-forget into the
+    /// per-transport WritableStream task, so test assertions need a moment
+    /// for the task to drain. 100ms is generous for the in-memory writes
+    /// these tests do; the alternative would be to also flush, which means
+    /// taking a `Logger` route — that defeats the point of `DirectLayer`'s
+    /// no-Logger story.
+    fn drain() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     #[test]
     fn direct_event_fields_become_meta() {
         let (transport, captured) = capture();
         let _guard = tracing_subscriber::registry()
-            .with(DirectLayer::builder().transport(transport).build())
+            .with(DirectLayer::builder(default_spawner()).transport(transport).build())
             .set_default();
 
         tracing::info!(user_id = 42u64, "login");
+        drain();
 
         let logs = captured.lock().unwrap();
         assert_eq!(logs.len(), 1);
@@ -603,12 +655,13 @@ mod tests {
     fn direct_span_fields_propagate() {
         let (transport, captured) = capture();
         let _guard = tracing_subscriber::registry()
-            .with(DirectLayer::builder().transport(transport).build())
+            .with(DirectLayer::builder(default_spawner()).transport(transport).build())
             .set_default();
 
         let span = tracing::info_span!("request", request_id = "abc");
         let _enter = span.enter();
         tracing::warn!("slow");
+        drain();
 
         let logs = captured.lock().unwrap();
         assert_eq!(logs[0].meta["request_id"], serde_json::json!("abc"));
@@ -628,7 +681,7 @@ mod tests {
         let (transport, captured) = capture();
         let _guard = tracing_subscriber::registry()
             .with(
-                DirectLayer::builder()
+                DirectLayer::builder(default_spawner())
                     .format(DropAll)
                     .transport(transport)
                     .build(),
@@ -636,6 +689,7 @@ mod tests {
             .set_default();
 
         tracing::info!("should be dropped");
+        drain();
 
         assert!(captured.lock().unwrap().is_empty());
     }
@@ -655,7 +709,7 @@ mod tests {
         let (transport, captured) = capture();
         let _guard = tracing_subscriber::registry()
             .with(
-                DirectLayer::builder()
+                DirectLayer::builder(default_spawner())
                     .format(AddField)
                     .transport(transport)
                     .build(),
@@ -663,6 +717,7 @@ mod tests {
             .set_default();
 
         tracing::info!("hello");
+        drain();
 
         let logs = captured.lock().unwrap();
         assert_eq!(logs[0].meta["injected"], serde_json::json!(true));
@@ -673,10 +728,11 @@ mod tests {
         let (t1, c1) = capture();
         let (t2, c2) = capture();
         let _guard = tracing_subscriber::registry()
-            .with(DirectLayer::builder().transport(t1).transport(t2).build())
+            .with(DirectLayer::builder(default_spawner()).transport(t1).transport(t2).build())
             .set_default();
 
         tracing::info!("broadcast");
+        drain();
 
         assert_eq!(c1.lock().unwrap().len(), 1);
         assert_eq!(c2.lock().unwrap().len(), 1);
@@ -687,7 +743,7 @@ mod tests {
         let (transport, captured) = capture();
         let _guard = tracing_subscriber::registry()
             .with(
-                DirectLayer::builder()
+                DirectLayer::builder(default_spawner())
                     .level("warn")
                     .transport(transport)
                     .build(),
@@ -698,6 +754,7 @@ mod tests {
         tracing::debug!("also filtered");
         tracing::warn!("passes");
         tracing::error!("also passes");
+        drain();
 
         let logs = captured.lock().unwrap();
         assert_eq!(logs.len(), 2);
@@ -708,7 +765,7 @@ mod tests {
     #[test]
     fn direct_no_transports_does_not_panic() {
         let _guard = tracing_subscriber::registry()
-            .with(DirectLayer::builder().build())
+            .with(DirectLayer::builder(default_spawner()).build())
             .set_default();
 
         tracing::info!("no transports configured");

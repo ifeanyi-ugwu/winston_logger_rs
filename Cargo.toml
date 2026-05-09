@@ -12,10 +12,8 @@ members = [
     "winston_file",
     "winston_http",
     "winston_mongodb",
-    "winston_transport",
-]
-exclude = [
     "winston_tracing",
+    "winston_transport",
 ]
 
 [workspace.dependencies]
