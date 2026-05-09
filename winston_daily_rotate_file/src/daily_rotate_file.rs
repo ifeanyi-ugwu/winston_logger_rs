@@ -1,50 +1,59 @@
 use chrono::{DateTime, Local, Utc};
 use flate2::{write::GzEncoder, Compression};
-use logform::{Format, LogInfo};
-use std::cell::RefCell;
-use std::fmt::Write as FmtWrite;
+use logform::LogInfo;
 use std::fs::{create_dir_all, read_dir, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
 use winston_transport::Transport;
 
 pub struct DailyRotateFileOptions {
-    pub level: Option<String>,
-    pub format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     pub filename: PathBuf,
     pub date_pattern: String,
     pub max_files: Option<u32>,
-    pub max_size: Option<u64>, // in bytes
+    pub max_size: Option<u64>,
     pub dirname: Option<PathBuf>,
     pub zipped_archive: bool,
     pub utc: bool,
 }
 
+/// Daily-rotating file transport.
+///
+/// Writes one entry per `write` call. Before each write we check whether
+/// rotation is due (date boundary or `max_size` exceeded) and roll over if so.
+/// Optional gzip compression of the previous file and `max_files` retention
+/// happen during rotation.
+///
+/// State is accessed via `&mut self` from the WritableStream's task — no
+/// `Mutex` required, in contrast to the legacy `Transport<L>` impl which had
+/// to lock-around-`&self` for every write.
 pub struct DailyRotateFile {
-    file: Mutex<BufWriter<File>>,
+    writer: BufWriter<File>,
     options: DailyRotateFileOptions,
-    last_rotation: Mutex<DateTime<Utc>>,
-    file_path: Mutex<PathBuf>,
+    last_rotation: DateTime<Utc>,
+    file_path: PathBuf,
 }
 
 impl DailyRotateFile {
-    pub fn new(options: DailyRotateFileOptions) -> Self {
+    pub fn new(options: DailyRotateFileOptions) -> std::io::Result<Self> {
         let current_date = if options.utc {
             Utc::now()
         } else {
             Local::now().with_timezone(&Utc)
         };
 
-        let (file, path) =
-            Self::create_file(&options, &current_date).expect("Failed to create initial log file");
+        let (file, path) = Self::create_file(&options, &current_date)?;
 
-        DailyRotateFile {
-            file: Mutex::new(BufWriter::new(file)),
+        Ok(DailyRotateFile {
+            writer: BufWriter::new(file),
             options,
-            last_rotation: Mutex::new(current_date),
-            file_path: Mutex::new(path),
-        }
+            last_rotation: current_date,
+            file_path: path,
+        })
+    }
+
+    pub fn builder() -> DailyRotateFileBuilder {
+        DailyRotateFileBuilder::new()
     }
 
     fn create_file(
@@ -117,18 +126,16 @@ impl DailyRotateFile {
         filename
     }
 
-    fn get_file_size(&self) -> u64 {
-        self.file
-            .lock()
-            .ok()
-            .and_then(|mut file_guard| {
-                file_guard.flush().ok()?;
-                file_guard.get_ref().metadata().ok().map(|m| m.len())
-            })
+    fn current_file_size(&mut self) -> u64 {
+        let _ = self.writer.flush();
+        self.writer
+            .get_ref()
+            .metadata()
+            .map(|m| m.len())
             .unwrap_or(0)
     }
 
-    fn should_rotate(&self, new_entry_size: usize) -> bool {
+    fn should_rotate(&mut self, new_entry_size: usize) -> bool {
         let now = Utc::now();
 
         let now_str = if self.options.utc {
@@ -139,11 +146,12 @@ impl DailyRotateFile {
                 .to_string()
         };
 
-        let last_rotation = self.last_rotation.lock().unwrap();
         let last_rotation_str = if self.options.utc {
-            last_rotation.format(&self.options.date_pattern).to_string()
+            self.last_rotation
+                .format(&self.options.date_pattern)
+                .to_string()
         } else {
-            last_rotation
+            self.last_rotation
                 .with_timezone(&Local)
                 .format(&self.options.date_pattern)
                 .to_string()
@@ -153,36 +161,22 @@ impl DailyRotateFile {
             return true;
         }
 
-        self.options
-            .max_size
-            .map(|max_size| self.get_file_size() + new_entry_size as u64 >= max_size)
-            .unwrap_or(false)
+        if let Some(max_size) = self.options.max_size {
+            return self.current_file_size() + new_entry_size as u64 >= max_size;
+        }
+        false
     }
 
-    fn rotate(&self) {
+    fn rotate(&mut self) -> std::io::Result<()> {
         let now = Utc::now();
+        let _ = self.writer.flush();
 
-        if let Ok(mut file_guard) = self.file.lock() {
-            let _ = file_guard.flush();
-        }
+        let previous_file_path = self.file_path.clone();
 
-        let previous_file_path = self.file_path.lock().unwrap().clone();
-
-        let (new_file, new_path) =
-            Self::create_file(&self.options, &now).expect("Failed to rotate log file");
-
-        // Replace the existing file with the new one
-        if let Ok(mut file_lock) = self.file.lock() {
-            *file_lock = BufWriter::new(new_file);
-        }
-
-        if let Ok(mut path_lock) = self.file_path.lock() {
-            *path_lock = new_path;
-        }
-
-        if let Ok(mut last_rotation) = self.last_rotation.lock() {
-            *last_rotation = now;
-        }
+        let (new_file, new_path) = Self::create_file(&self.options, &now)?;
+        self.writer = BufWriter::new(new_file);
+        self.file_path = new_path;
+        self.last_rotation = now;
 
         if self.options.zipped_archive {
             if let Err(e) = Self::compress_file(&previous_file_path) {
@@ -195,6 +189,8 @@ impl DailyRotateFile {
                 eprintln!("Failed to clean up old log files: {}", e);
             }
         }
+
+        Ok(())
     }
 
     fn compress_file(file_path: &Path) -> std::io::Result<()> {
@@ -261,8 +257,6 @@ impl DailyRotateFile {
     }
 
     fn cleanup_old_files(&self, max_files: u32) -> std::io::Result<()> {
-        //println!("cleaning up");
-
         let log_dir = self
             .options
             .dirname
@@ -279,18 +273,12 @@ impl DailyRotateFile {
 
         let mut log_files: Vec<PathBuf> = Vec::new();
 
-        // add all log files, zipped ones inclusive
         for entry in read_dir(log_dir)? {
             let entry = entry?;
             let path = entry.path();
 
             if path.is_file() {
                 let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-
-                //println!("Checking file: {}", filename);
-                //println!("Base name: {}", base_name);
-
-                // Check if it's one of our log files ("basename.date" and "basename_N.date" formats)
                 if filename.starts_with(&format!("{}.", base_name))
                     || filename.starts_with(&format!("{}_", base_name))
                 {
@@ -299,13 +287,11 @@ impl DailyRotateFile {
             }
         }
 
-        //println!("log files found: {:?}", log_files);
-
         if log_files.len() <= max_files as usize {
             return Ok(());
         }
 
-        // Sort by modification time (newest first)
+        // Newest first.
         log_files.sort_by(|a, b| {
             let a_time = a
                 .metadata()
@@ -322,113 +308,54 @@ impl DailyRotateFile {
             b_time.cmp(&a_time)
         });
 
-        for file in &log_files {
-            println!("Detected log file: {}", file.display());
-        }
-
-        // Keep only max_files
         for old_file in log_files.iter().skip(max_files as usize) {
-            //println!("Deleting file: {}", old_file.display());
-
-            // don't delete active log file
-            let current_path = self.file_path.lock().map(|p| p.clone()).unwrap_or_default();
-            if old_file == &current_path {
+            if old_file == &self.file_path {
                 continue;
             }
 
             if self.options.zipped_archive
                 && old_file.extension().and_then(|e| e.to_str()) != Some("gz")
             {
-                // compress_file also deletes the original file
-                //let _ = Self::compress_file(old_file);
                 if let Err(e) = Self::compress_file(old_file) {
                     eprintln!("Failed to compress old file {}: {}", old_file.display(), e);
                 }
-            } else {
-                //let _ = std::fs::remove_file(old_file);
-                if let Err(e) = std::fs::remove_file(old_file) {
-                    eprintln!("Failed to remove old file {}: {}", old_file.display(), e);
-                }
+            } else if let Err(e) = std::fs::remove_file(old_file) {
+                eprintln!("Failed to remove old file {}: {}", old_file.display(), e);
             }
         }
 
         Ok(())
     }
+}
 
-    pub fn builder() -> DailyRotateFileBuilder {
-        DailyRotateFileBuilder::new()
+impl WritableSink<LogInfo> for DailyRotateFile {
+    async fn write(
+        &mut self,
+        info: LogInfo,
+        _controller: &mut WritableStreamDefaultController,
+    ) -> StreamResult<()> {
+        let entry_size = format!("{}\n", info.message).len();
+        if self.should_rotate(entry_size) {
+            self.rotate()?;
+        }
+        writeln!(&mut self.writer, "{}", info.message)?;
+        Ok(())
+    }
+
+    async fn close(mut self) -> StreamResult<()> {
+        self.writer.flush()?;
+        Ok(())
     }
 }
 
-impl Transport<LogInfo> for DailyRotateFile {
-    fn log(&self, info: LogInfo) {
-        let entry_size = format!("{}\n", info.message).len();
-
-        if self.should_rotate(entry_size) {
-            self.rotate();
-        }
-        //println!("File size before: {}", self.get_file_size());
-
-        let mut file = match self.file.lock() {
-            Ok(f) => f,
-            Err(_) => {
-                eprintln!("Failed to acquire file lock");
-                return;
-            }
-        };
-
-        if let Err(e) = writeln!(file, "{}", info.message) {
-            eprintln!("Failed to write log: {}", e);
-        }
-
-        //drop(file);
-
-        //println!("File size after: {}", self.get_file_size()); //deadlocks
-    }
-
-    fn log_batch(&self, infos: Vec<LogInfo>) {
-        if infos.is_empty() {
-            return;
-        }
-
-        thread_local! {
-            static BUF: RefCell<String> = const { RefCell::new(String::new()) };
-        }
-
-        BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            buf.clear();
-            for info in &infos {
-                let _ = writeln!(buf, "{}", info.message);
-            }
-
-            if self.should_rotate(buf.len()) {
-                self.rotate();
-            }
-
-            let mut file = match self.file.lock() {
-                Ok(f) => f,
-                Err(_) => {
-                    eprintln!("Failed to acquire file lock for batch logging");
-                    return;
-                }
-            };
-
-            if let Err(e) = file.write_all(buf.as_bytes()) {
-                eprintln!("Failed to write log batch: {}", e);
-            }
-        });
-    }
-
-    fn flush(&self) -> Result<(), String> {
-        let mut file = self.file.lock().unwrap();
-        file.flush().map_err(|e| format!("Failed to flush: {}", e))
-    }
+impl Transport for DailyRotateFile {
+    // Query is intentionally unsupported — the rotation/archive lifecycle
+    // means past entries live in N files (and possibly .gz archives) that the
+    // transport doesn't track centrally. If you need query, log to a regular
+    // `winston_file::FileTransport` (which keeps a single file) alongside.
 }
 
 pub struct DailyRotateFileBuilder {
-    level: Option<String>,
-    format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     filename: Option<PathBuf>,
     date_pattern: String,
     max_files: Option<u32>,
@@ -447,8 +374,6 @@ impl Default for DailyRotateFileBuilder {
 impl DailyRotateFileBuilder {
     pub fn new() -> Self {
         Self {
-            level: None,
-            format: None,
             filename: None,
             date_pattern: String::from("%Y-%m-%d"),
             max_files: None,
@@ -457,16 +382,6 @@ impl DailyRotateFileBuilder {
             zipped_archive: false,
             utc: false,
         }
-    }
-
-    pub fn level<T: Into<String>>(mut self, level: T) -> Self {
-        self.level = Some(level.into());
-        self
-    }
-
-    pub fn format(mut self, format: Arc<dyn Format<Input = LogInfo> + Send + Sync>) -> Self {
-        self.format = Some(format);
-        self
     }
 
     pub fn filename<T: Into<PathBuf>>(mut self, filename: T) -> Self {
@@ -508,8 +423,6 @@ impl DailyRotateFileBuilder {
         let filename = self.filename.ok_or("Filename is required")?;
 
         let options = DailyRotateFileOptions {
-            level: self.level,
-            format: self.format,
             filename,
             date_pattern: self.date_pattern,
             max_files: self.max_files,
@@ -519,7 +432,7 @@ impl DailyRotateFileBuilder {
             utc: self.utc,
         };
 
-        Ok(DailyRotateFile::new(options))
+        DailyRotateFile::new(options).map_err(|e| format!("Failed to open log file: {}", e))
     }
 }
 
@@ -529,34 +442,59 @@ mod tests {
     use chrono::Local;
     use std::fs;
     use tempfile::TempDir;
+    use whatwg_streams::{CountQueuingStrategy, WritableStream};
 
     fn setup_temp_dir() -> TempDir {
         let project_root = std::env::current_dir().expect("Failed to get current directory");
         TempDir::new_in(&project_root).expect("Failed to create temp directory in project folder")
     }
 
-    fn create_test_transport(temp_dir: &TempDir) -> DailyRotateFile {
-        let log_path = temp_dir.path().join("test.log");
-        DailyRotateFile::builder()
-            .filename(&log_path)
-            .date_pattern("%Y-%m-%d")
-            .max_files(3)
-            .max_size(1024) // 1KB
-            .build()
-            .expect("Failed to create transport")
+    fn thread_spawner<F>(fut: F) -> std::thread::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        std::thread::spawn(move || futures::executor::block_on(fut))
+    }
+
+    /// Wraps the transport in a real WritableStream, runs the given closure
+    /// against its writer, then closes the stream so rotation/flush completes
+    /// before assertions.
+    fn drive<F, Fut>(transport: DailyRotateFile, body: F)
+    where
+        F: FnOnce(
+            whatwg_streams::WritableStreamDefaultWriter<LogInfo, DailyRotateFile>,
+        ) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let stream = WritableStream::builder(transport)
+            .strategy(CountQueuingStrategy::new(64))
+            .spawn(thread_spawner);
+        futures::executor::block_on(async {
+            let (_locked, writer) = stream.get_writer().expect("get_writer");
+            body(writer).await;
+        });
     }
 
     #[test]
     fn test_basic_logging() {
         let temp_dir = setup_temp_dir();
-        let transport = create_test_transport(&temp_dir);
+        let log_path = temp_dir.path().join("test.log");
+        let transport = DailyRotateFile::builder()
+            .filename(&log_path)
+            .date_pattern("%Y-%m-%d")
+            .max_files(3)
+            .max_size(1024)
+            .build()
+            .expect("Failed to create transport");
 
-        let log_info = LogInfo::new("info", "Test message");
+        drive(transport, |writer| async move {
+            writer
+                .write(LogInfo::new("info", "Test message"))
+                .await
+                .expect("write");
+            writer.close().await.expect("close");
+        });
 
-        transport.log(log_info);
-        transport.flush().expect("Failed to flush");
-
-        // Check if log file exists and contains the message
         let date_str = Local::now().format("%Y-%m-%d").to_string();
         let log_file = temp_dir.path().join(format!("test.log.{}", date_str));
         let contents = fs::read_to_string(log_file).expect("Failed to read log file");
@@ -573,14 +511,21 @@ mod tests {
             .build()
             .expect("Failed to create transport");
 
-        transport.log(LogInfo::new("info", "log entry 1"));
-
-        // Simulate date change
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        transport.log(LogInfo::new("info", "log entry 2"));
-
-        transport.flush().expect("Failed to flush");
+        drive(transport, |writer| async move {
+            writer
+                .write(LogInfo::new("info", "log entry 1"))
+                .await
+                .expect("write");
+            // Simulate date change — `should_rotate` looks at the formatted
+            // current time vs. last rotation, so a 1s sleep with a per-second
+            // pattern is enough to trigger.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            writer
+                .write(LogInfo::new("info", "log entry 2"))
+                .await
+                .expect("write");
+            writer.close().await.expect("close");
+        });
 
         let files: Vec<_> = fs::read_dir(temp_dir.path())
             .unwrap()
@@ -594,28 +539,26 @@ mod tests {
         let temp_dir = setup_temp_dir();
         let transport = DailyRotateFile::builder()
             .filename(temp_dir.path().join("test.log"))
-            //.filename("logs/test.log")
             .max_size(100)
             .build()
             .expect("Failed to create transport");
 
-        let log_message = "This is a test log message that should exceed the max file size.";
-        let log_info = LogInfo::new("info", log_message);
+        drive(transport, |writer| async move {
+            let log_message = "This is a test log message that should exceed the max file size.";
+            for _ in 0..10 {
+                writer
+                    .write(LogInfo::new("info", log_message))
+                    .await
+                    .expect("write");
+            }
+            writer.close().await.expect("close");
+        });
 
-        // Write multiple logs until rotation occurs
-        for _ in 0..10 {
-            transport.log(log_info.clone());
-        }
-
-        transport.flush().expect("Failed to flush");
-
-        // Check if multiple log files were created
         let files: Vec<_> = fs::read_dir(temp_dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
             .collect();
 
-        //println!("{}", files.len());
         assert_eq!(
             files.len(),
             10,
@@ -628,25 +571,27 @@ mod tests {
         let temp_dir = setup_temp_dir();
         let transport = DailyRotateFile::builder()
             .filename(temp_dir.path().join("test.log"))
-            //.filename("logs/test.log")
-            .max_size(80) // Small size to force rotation `Test message x` plus new line is 15 bytes each * 5 = 75 + 5 buffer
+            .max_size(80)
             .zipped_archive(true)
             .build()
             .expect("Failed to create transport");
 
-        // Create log entries to force rotation
-        for i in 0..5 {
-            transport.log(LogInfo::new("info", format!("Test message {}", i)));
-        }
+        drive(transport, |writer| async move {
+            for i in 0..5 {
+                writer
+                    .write(LogInfo::new("info", format!("Test message {}", i)))
+                    .await
+                    .expect("write");
+            }
+            for i in 0..5 {
+                writer
+                    .write(LogInfo::new("info", format!("Test message final {}", i)))
+                    .await
+                    .expect("write");
+            }
+            writer.close().await.expect("close");
+        });
 
-        // Add more entries to trigger another rotation
-        // this entry will hit max size at about the 3rd message
-        // which means it will cause a rotation and still keep an open file containing the last 2 messages
-        for i in 0..5 {
-            transport.log(LogInfo::new("info", format!("Test message final {}", i)));
-        }
-
-        // Check if .gz files were created
         let gz_files: Vec<_> = fs::read_dir(temp_dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -668,20 +613,21 @@ mod tests {
         let temp_dir = setup_temp_dir();
         let transport = DailyRotateFile::builder()
             .filename(temp_dir.path().join("test.log"))
-            //.filename("logs/test.log")
             .date_pattern("%Y-%m-%d_%H-%M-%S")
             .max_files(2)
             .build()
             .expect("Failed to create transport");
 
-        for i in 0..5 {
-            transport.log(LogInfo::new("info", format!("Message {}", i)));
-
-            // simulate date change
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-
-        transport.flush().expect("Failed to flush");
+        drive(transport, |writer| async move {
+            for i in 0..5 {
+                writer
+                    .write(LogInfo::new("info", format!("Message {}", i)))
+                    .await
+                    .expect("write");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            writer.close().await.expect("close");
+        });
 
         let files: Vec<_> = fs::read_dir(temp_dir.path())
             .unwrap()

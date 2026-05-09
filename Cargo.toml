@@ -8,12 +8,12 @@ members = [
     "logform",
     "logmark",
     "winston",
+    "winston_daily_rotate_file",
     "winston_file",
     "winston_mongodb",
     "winston_transport",
 ]
 exclude = [
-    "winston_daily_rotate_file",
     "winston_http",
     "winston_tracing",
 ]
