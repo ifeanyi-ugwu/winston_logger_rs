@@ -1,44 +1,71 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
+use futures::channel::mpsc as fmpsc;
 use logform::{Format, LogInfo};
-use winston_transport::{AsyncTransport, Transport};
+use parking_lot::Mutex;
+use winston_transport::{DynQueryHandle, Transport};
 
-/// Whether a `LoggerTransport` wraps a synchronous or async transport.
+use crate::pipeline::{run_transport_task, SpawnFn, TransportMessage};
+
+/// One-shot builder that captures a typed transport and, when invoked by the
+/// pipeline, produces the future for that transport's per-transport task.
 ///
-/// The pipeline matches on this in `run_transport_task` so each leaf method is
-/// called the right way: sync transports are fire-and-forget, async transports
-/// are `await`ed inside the per-transport task.
-#[derive(Clone)]
-pub enum TransportKind<L> {
-    Sync(Arc<dyn Transport<L> + Send + Sync>),
-    Async(Arc<dyn AsyncTransport<L> + Send + Sync>),
-}
+/// The transport is type-erased into the closure so a heterogeneous list of
+/// `LoggerTransport`s can live in the FanoutSink. Mutex<Option<_>> gives
+/// "callable exactly once" — the slot empties when the pipeline takes it.
+type TaskBuilder = Box<
+    dyn FnOnce(
+            fmpsc::UnboundedReceiver<TransportMessage>,
+            Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>, // transport-level
+            Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>, // global
+            SpawnFn,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>
+        + Send,
+>;
 
+/// Configuration the Logger holds about a registered transport.
+///
+/// The write side of a `Transport: WritableSink<LogInfo>` is consumed when
+/// the pipeline spawns the per-transport task — at that point the typed
+/// transport is moved into a `WritableStream`. The read side (`query_handle`)
+/// is extracted before consumption and stored separately so `Logger::query`
+/// keeps working independently of the writer's lifetime.
 #[derive(Clone)]
-pub struct LoggerTransport<L> {
-    kind: TransportKind<L>,
+pub struct LoggerTransport {
+    /// One-shot. The pipeline takes this when spawning; subsequent reads see `None`.
+    builder: Arc<Mutex<Option<TaskBuilder>>>,
+    /// Long-lived. Open as many query streams as you like, even after the
+    /// writer side has been consumed.
+    query_handle: Option<Arc<dyn DynQueryHandle>>,
     level: Option<String>,
-    format: Option<Arc<dyn Format<Input = L> + Send + Sync>>,
+    format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
 }
 
-impl<L> LoggerTransport<L> {
+impl LoggerTransport {
     pub fn new<T>(transport: T) -> Self
     where
-        T: Transport<L> + Send + Sync + 'static,
+        T: Transport,
     {
-        Self {
-            kind: TransportKind::Sync(Arc::new(transport)),
-            level: None,
-            format: None,
-        }
-    }
+        // Extract the read-side handle *before* the transport gets sealed
+        // into the task builder closure (which moves it).
+        let query_handle: Option<Arc<dyn DynQueryHandle>> =
+            transport.query_handle().map(Arc::from);
 
-    pub fn new_async<T>(transport: T) -> Self
-    where
-        T: AsyncTransport<L> + 'static,
-    {
+        let builder: TaskBuilder = Box::new(
+            move |rx, transport_format, global_format, spawn_fn| {
+                Box::pin(run_transport_task(
+                    rx,
+                    transport,
+                    transport_format,
+                    global_format,
+                    spawn_fn,
+                ))
+            },
+        );
+
         Self {
-            kind: TransportKind::Async(Arc::new(transport)),
+            builder: Arc::new(Mutex::new(Some(builder))),
+            query_handle,
             level: None,
             format: None,
         }
@@ -51,7 +78,7 @@ impl<L> LoggerTransport<L> {
 
     pub fn with_format<F>(mut self, format: F) -> Self
     where
-        F: Format<Input = L> + Send + Sync + 'static,
+        F: Format<Input = LogInfo> + Send + Sync + 'static,
     {
         self.format = Some(Arc::new(format));
         self
@@ -61,78 +88,46 @@ impl<L> LoggerTransport<L> {
         self.level.as_ref()
     }
 
-    pub fn get_format(&self) -> Option<Arc<dyn Format<Input = L> + Send + Sync>> {
+    pub fn get_format(&self) -> Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>> {
         self.format.clone()
     }
 
-    pub fn kind(&self) -> &TransportKind<L> {
-        &self.kind
+    pub fn query_handle(&self) -> Option<&Arc<dyn DynQueryHandle>> {
+        self.query_handle.as_ref()
     }
 
-    /// Returns the underlying sync transport, if this `LoggerTransport` wraps one.
-    /// Async transports return `None` — caller must dispatch separately.
-    pub fn as_sync(&self) -> Option<&Arc<dyn Transport<L> + Send + Sync>> {
-        match &self.kind {
-            TransportKind::Sync(t) => Some(t),
-            TransportKind::Async(_) => None,
-        }
+    /// Take the one-shot task builder. Returns `None` if already consumed.
+    /// Only the pipeline calls this.
+    pub(crate) fn take_builder(&self) -> Option<TaskBuilder> {
+        self.builder.lock().take()
     }
 }
 
-impl<L> fmt::Debug for LoggerTransport<L> {
+impl fmt::Debug for LoggerTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match &self.kind {
-            TransportKind::Sync(_) => "Sync",
-            TransportKind::Async(_) => "Async",
-        };
         f.debug_struct("LoggerTransport")
-            .field(
-                "transport",
-                &format!("Transport<{}>({})", std::any::type_name::<L>(), kind),
-            )
             .field("level", &self.level)
             .field("format", &self.format.as_ref().map(|_| "Format<...>"))
+            .field("queryable", &self.query_handle.is_some())
             .finish()
     }
 }
 
 pub trait IntoLoggerTransport {
-    fn into_logger_transport(self) -> LoggerTransport<LogInfo>;
+    fn into_logger_transport(self) -> LoggerTransport;
 }
 
-// Raw sync transport
 impl<T> IntoLoggerTransport for T
 where
-    T: Transport<LogInfo> + Send + Sync + 'static,
+    T: Transport,
 {
-    fn into_logger_transport(self) -> LoggerTransport<LogInfo> {
+    fn into_logger_transport(self) -> LoggerTransport {
         LoggerTransport::new(self)
     }
 }
 
-// Pre-configured LoggerTransport
-impl IntoLoggerTransport for LoggerTransport<LogInfo> {
-    fn into_logger_transport(self) -> LoggerTransport<LogInfo> {
+impl IntoLoggerTransport for LoggerTransport {
+    fn into_logger_transport(self) -> LoggerTransport {
         self
-    }
-}
-
-/// Wrapper to feed an async transport through `IntoLoggerTransport` ergonomically:
-///
-/// ```ignore
-/// logger.add_transport(Async(MyHttpTransport::new()));
-/// ```
-///
-/// A blanket `impl<T: AsyncTransport> IntoLoggerTransport for T` would conflict
-/// with the sync blanket impl for any type implementing both traits, so callers
-/// opt in via `Async(..)` (or `LoggerTransport::new_async(..)`).
-pub struct Async<T>(pub T);
-
-impl<T> IntoLoggerTransport for Async<T>
-where
-    T: AsyncTransport<LogInfo> + 'static,
-{
-    fn into_logger_transport(self) -> LoggerTransport<LogInfo> {
-        LoggerTransport::new_async(self.0)
     }
 }

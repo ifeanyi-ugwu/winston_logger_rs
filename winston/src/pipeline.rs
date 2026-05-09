@@ -6,20 +6,19 @@ use std::{
 };
 
 use futures::channel::mpsc as fmpsc;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use logform::{Format, LogInfo};
 use whatwg_streams::{
     CountQueuingStrategy, ReadableSource, ReadableStream, ReadableStreamDefaultController,
     StreamResult, WritableSink, WritableStream, WritableStreamDefaultController,
 };
-use winston_transport::AsyncTransport;
+use winston_transport::Transport;
 
 use crate::{
     logger::TransportHandle,
     logger_levels::LoggerLevels,
     logger_options::LoggerOptions,
-    logger_transport::{LoggerTransport, TransportKind},
+    logger_transport::LoggerTransport,
 };
 
 /// A runtime-agnostic task spawner.  Pass `tokio::runtime::Handle::spawn`,
@@ -77,7 +76,7 @@ pub enum PipelineMessage {
     /// Add a transport at runtime; the FanoutSink spawns its task.
     AddTransport {
         handle: TransportHandle,
-        transport: LoggerTransport<LogInfo>,
+        transport: LoggerTransport,
     },
     /// Remove a transport by handle.
     RemoveTransport(TransportHandle),
@@ -92,7 +91,7 @@ pub enum PipelineMessage {
         format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
         level: Option<String>,
         levels: Option<LoggerLevels>,
-        transports: Vec<(TransportHandle, LoggerTransport<LogInfo>)>,
+        transports: Vec<(TransportHandle, LoggerTransport)>,
     },
     Shutdown,
 }
@@ -103,7 +102,7 @@ unsafe impl Sync for PipelineMessage {}
 
 // ── Per-transport messages ───────────────────────────────────────────────────
 
-enum TransportMessage {
+pub enum TransportMessage {
     Entry(Arc<LogInfo>),
     Flush(futures::channel::oneshot::Sender<()>),
 }
@@ -166,7 +165,7 @@ impl FanoutSink {
         global_level: Option<String>,
         levels: Option<LoggerLevels>,
         buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-        initial_transports: Vec<(TransportHandle, LoggerTransport<LogInfo>)>,
+        initial_transports: Vec<(TransportHandle, LoggerTransport)>,
     ) -> Self {
         let mut sink = Self {
             spawn_fn,
@@ -201,11 +200,20 @@ impl FanoutSink {
         }
     }
 
-    fn spawn_transport(&mut self, handle: TransportHandle, transport: LoggerTransport<LogInfo>) {
-        let (tx, rx) = fmpsc::unbounded::<TransportMessage>();
-        let global_fmt = self.global_format.clone();
+    fn spawn_transport(&mut self, handle: TransportHandle, transport: LoggerTransport) {
         let level = transport.get_level().cloned();
-        (self.spawn_fn)(Box::pin(run_transport_task(rx, transport, global_fmt)));
+        let transport_fmt = transport.get_format();
+        let global_fmt = self.global_format.clone();
+
+        // Take the one-shot builder out of the LoggerTransport. Skip silently
+        // if the transport has already been consumed (e.g. duplicate add).
+        let Some(builder) = transport.take_builder() else {
+            return;
+        };
+
+        let (tx, rx) = fmpsc::unbounded::<TransportMessage>();
+        let spawn_fn = Arc::clone(&self.spawn_fn);
+        (self.spawn_fn)(builder(rx, transport_fmt, global_fmt, spawn_fn));
         self.transport_tasks.push(TransportSlot { handle, level, tx });
     }
 
@@ -293,7 +301,6 @@ impl WritableSink<PipelineMessage> for FanoutSink {
 
             PipelineMessage::AddTransport { handle, transport } => {
                 self.spawn_transport(handle, transport);
-                // Drain any buffer now that we have at least one transport.
                 self.drain_buffer_to_slots();
             }
 
@@ -338,129 +345,63 @@ impl WritableSink<PipelineMessage> for FanoutSink {
     }
 }
 
-// ── Per-transport async task ─────────────────────────────────────────────────
+// ── Per-transport task ───────────────────────────────────────────────────────
 
-async fn run_transport_task(
-    rx: fmpsc::UnboundedReceiver<TransportMessage>,
-    transport: LoggerTransport<LogInfo>,
-    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-) {
-    // Async transports may opt into concurrent dispatch (`concurrency() > 1`).
-    // The concurrent path uses a FuturesUnordered, so keep the simple
-    // sequential loop as the default to avoid select! overhead in the hot path.
-    if let TransportKind::Async(async_t) = transport.kind() {
-        let concurrency = async_t.concurrency().max(1);
-        if concurrency > 1 {
-            let async_t = Arc::clone(async_t);
-            run_async_concurrent_loop(
-                rx,
-                async_t,
-                transport.get_format(),
-                global_format,
-                concurrency,
-            )
-            .await;
-            return;
-        }
-    }
-
-    run_sequential_loop(rx, transport, global_format).await;
-}
-
-async fn run_sequential_loop(
+/// Drives one transport.
+///
+/// Wraps the transport in a `WritableStream<LogInfo, T>` so writes are
+/// serialized into the sink and backpressure is applied by the queuing
+/// strategy. Per-transport mpsc messages flow in from the FanoutSink; we
+/// translate them to writes against the stream's writer.
+///
+/// # Flush semantics
+///
+/// WHATWG streams have no mid-life flush primitive — only `close`. Each prior
+/// `writer.write(...).await` is fully resolved by the time `Logger::flush`
+/// reaches us, so the sink has *received* every queued entry. Whether the
+/// sink's *internal* buffer (e.g. `BufWriter`) has hit disk is up to the
+/// sink. We ack the flush eagerly; durable flush happens at task shutdown
+/// when the channel closes and `writer.close()` runs (which calls
+/// `WritableSink::close`).
+pub async fn run_transport_task<T>(
     mut rx: fmpsc::UnboundedReceiver<TransportMessage>,
-    transport: LoggerTransport<LogInfo>,
+    transport: T,
+    transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-) {
+    spawn_fn: SpawnFn,
+) where
+    T: Transport,
+{
+    let spawn_for_stream = Arc::clone(&spawn_fn);
+    let stream = WritableStream::builder(transport)
+        .strategy(CountQueuingStrategy::new(1024))
+        .spawn(move |fut| spawn_for_stream(fut));
+
+    let Ok((_locked, writer)) = stream.get_writer() else {
+        return;
+    };
+
     while let Some(msg) = rx.next().await {
         match msg {
             TransportMessage::Entry(entry) => {
-                let formatted = match (transport.get_format(), &global_format) {
-                    (Some(tf), _) => tf.transform((*entry).clone()),
-                    (None, Some(lf)) => lf.transform((*entry).clone()),
-                    (None, None) => Some((*entry).clone()),
-                };
-                if let Some(info) = formatted {
-                    match transport.kind() {
-                        TransportKind::Sync(t) => t.log(info),
-                        // Order-preserving per transport; cross-transport
-                        // concurrency comes from each running on its own task.
-                        TransportKind::Async(t) => t.log(info).await,
-                    }
-                }
-            }
-            TransportMessage::Flush(tx) => {
-                match transport.kind() {
-                    TransportKind::Sync(t) => {
-                        let _ = t.flush();
-                    }
-                    TransportKind::Async(t) => {
-                        let _ = t.flush().await;
-                    }
-                }
-                let _ = tx.send(());
-            }
-        }
-    }
-}
-
-/// Async-transport loop with bounded in-flight log futures.
-///
-/// `log` futures are pushed into a FuturesUnordered up to `concurrency`. While
-/// at capacity we only drain; below it we race the next message against pending
-/// completions so the set keeps draining even when the channel is idle. Flush
-/// drains all in-flight futures before invoking the transport's flush — so
-/// callers of `Logger::flush` still see "all queued entries written" semantics.
-async fn run_async_concurrent_loop(
-    mut rx: fmpsc::UnboundedReceiver<TransportMessage>,
-    async_t: Arc<dyn AsyncTransport<LogInfo> + Send + Sync>,
-    transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    concurrency: usize,
-) {
-    let mut in_flight: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> =
-        FuturesUnordered::new();
-
-    loop {
-        if in_flight.len() >= concurrency {
-            let _ = in_flight.next().await;
-            continue;
-        }
-
-        let msg = if in_flight.is_empty() {
-            rx.next().await
-        } else {
-            futures::select! {
-                m = rx.next() => m,
-                _ = in_flight.select_next_some() => continue,
-            }
-        };
-
-        match msg {
-            Some(TransportMessage::Entry(entry)) => {
                 let formatted = match (&transport_format, &global_format) {
                     (Some(tf), _) => tf.transform((*entry).clone()),
                     (None, Some(lf)) => lf.transform((*entry).clone()),
                     (None, None) => Some((*entry).clone()),
                 };
                 if let Some(info) = formatted {
-                    let t = Arc::clone(&async_t);
-                    in_flight.push(Box::pin(async move {
-                        t.log(info).await;
-                    }));
+                    let _ = writer.write(info).await;
                 }
             }
-            Some(TransportMessage::Flush(tx)) => {
-                while in_flight.next().await.is_some() {}
-                let _ = async_t.flush().await;
+            TransportMessage::Flush(tx) => {
+                // Best-effort — see method docs.
                 let _ = tx.send(());
-            }
-            None => {
-                while in_flight.next().await.is_some() {}
-                return;
             }
         }
     }
+
+    // Channel closed: drain the writer's queue and let the sink's `close` run.
+    let _ = writer.close().await;
 }
 
 // ── Pipeline constructor ─────────────────────────────────────────────────────

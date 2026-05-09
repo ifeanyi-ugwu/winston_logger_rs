@@ -210,7 +210,7 @@ fn test_concurrent_query() {
             let logger = Arc::clone(&logger);
             thread::spawn(move || {
                 let query = winston::LogQuery::new();
-                logger.query(&query).unwrap()
+                common::query_blocking(&logger, &query).unwrap()
             })
         })
         .collect();

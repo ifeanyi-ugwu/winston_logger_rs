@@ -4,9 +4,9 @@ use crate::{
     logger_transport::{IntoLoggerTransport, LoggerTransport},
     pipeline::{self, PipelineMessage},
 };
-use winston_transport::AsyncTransport;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use futures::channel::mpsc as fmpsc;
+use futures::StreamExt;
 use logform::LogInfo;
 use parking_lot::RwLock;
 use std::{
@@ -17,7 +17,8 @@ use std::{
     },
     thread,
 };
-use winston_transport::{LogQuery, Transport};
+use whatwg_streams::{CountQueuingStrategy, ReadableStream};
+use winston_transport::{BoxedReadableSource, LogQuery, Transport};
 
 static NEXT_TRANSPORT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -32,7 +33,7 @@ impl TransportHandle {
 
 pub struct TransportBuilder<'a> {
     logger: &'a Logger,
-    logger_transport: LoggerTransport<LogInfo>,
+    logger_transport: LoggerTransport,
 }
 
 impl<'a> TransportBuilder<'a> {
@@ -98,6 +99,10 @@ pub struct Logger {
     pipeline_tx: fmpsc::UnboundedSender<PipelineMessage>,
 
     bridge_thread: Mutex<Option<thread::JoinHandle<()>>>,
+
+    /// Held so `Logger::query` can spawn the per-call `ReadableStream` it
+    /// drains. Same spawner the pipeline uses internally.
+    spawn_fn: pipeline::SpawnFn,
 }
 
 impl Logger {
@@ -132,7 +137,8 @@ impl Logger {
 
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
 
-        let pipeline_tx = pipeline::build_pipeline(&options, Arc::clone(&buffer), spawn_fn);
+        let spawn_fn_for_pipeline = std::sync::Arc::clone(&spawn_fn);
+        let pipeline_tx = pipeline::build_pipeline(&options, Arc::clone(&buffer), spawn_fn_for_pipeline);
 
         // Bridge thread: crossbeam → pipeline channel.
         let bridge_pipeline_tx = pipeline_tx.clone();
@@ -159,6 +165,7 @@ impl Logger {
             backpressure_cache: AtomicU8::new(bp_cache),
             pipeline_tx,
             bridge_thread: Mutex::new(Some(bridge_thread)),
+            spawn_fn,
         }
     }
 
@@ -416,21 +423,47 @@ impl Logger {
         }
     }
 
-    /// Synchronous query — only iterates sync transports. Async transports are
-    /// skipped (calling their futures from a sync context would require
-    /// blocking on a runtime, which deadlocks inside tokio). Use
-    /// [`Logger::query_async`] from async contexts to include both.
-    pub fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
-        let state = self.shared_state.read();
-        let mut results = Vec::new();
+    /// Drain past entries matching `options` from every queryable transport
+    /// and collect them into a `Vec`.
+    ///
+    /// Each transport that exposed a `query_handle` at registration time gets
+    /// asked to open a fresh `ReadableSource<LogInfo>`; we wrap it in a
+    /// `ReadableStream` and drain it. Transports without a query handle are
+    /// skipped silently.
+    ///
+    /// Sources are read sequentially — a slow transport blocks subsequent
+    /// ones. Drop in `futures::future::try_join_all` here if cross-transport
+    /// concurrency becomes worth the complexity.
+    pub async fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
+        // Snapshot the query handles so we don't hold the RwLock across awaits.
+        let handles: Vec<_> = {
+            let state = self.shared_state.read();
+            state
+                .options
+                .transports
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|(_, t)| t.query_handle().cloned())
+                .collect()
+        };
 
-        if let Some(transports) = &state.options.transports {
-            for (_handle, transport) in transports {
-                let Some(sync_t) = transport.as_sync() else {
-                    continue;
-                };
-                match sync_t.query(options) {
-                    Ok(mut logs) => results.append(&mut logs),
+        let mut results = Vec::new();
+        for handle in handles {
+            let Some(source) = handle.query(options) else {
+                continue;
+            };
+            let spawn_for_stream = Arc::clone(&self.spawn_fn);
+            let stream = ReadableStream::builder(BoxedReadableSource(source))
+                .strategy(CountQueuingStrategy::new(64))
+                .spawn(move |fut| spawn_for_stream(fut));
+            let (_locked, reader) = stream
+                .get_reader()
+                .map_err(|_| "Failed to acquire reader".to_string())?;
+            loop {
+                match reader.read().await {
+                    Ok(Some(entry)) => results.push(entry),
+                    Ok(None) => break,
                     Err(e) => return Err(format!("Query failed: {}", e)),
                 }
             }
@@ -439,60 +472,15 @@ impl Logger {
         Ok(results)
     }
 
-    /// Async query — iterates every transport, awaiting async ones. Each
-    /// transport's query runs sequentially so a slow one doesn't race ahead;
-    /// switch to `futures::future::try_join_all` here if cross-transport
-    /// concurrency becomes worth the complexity.
-    pub async fn query_async(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
-        // Snapshot the transport list so we don't hold the RwLock across awaits.
-        let snapshot: Vec<LoggerTransport<LogInfo>> = {
-            let state = self.shared_state.read();
-            state
-                .options
-                .transports
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|(_, t)| t.clone())
-                .collect()
-        };
-
-        let mut results = Vec::new();
-        for transport in snapshot {
-            let chunk = match transport.kind() {
-                crate::logger_transport::TransportKind::Sync(t) => t.query(options),
-                crate::logger_transport::TransportKind::Async(t) => t.query(options).await,
-            };
-            match chunk {
-                Ok(mut logs) => results.append(&mut logs),
-                Err(e) => return Err(format!("Query failed: {}", e)),
-            }
-        }
-
-        Ok(results)
-    }
-
     // ── Dynamic transport management ─────────────────────────────────────────
 
-    pub fn transport(
-        &self,
-        transport: impl Transport<LogInfo> + Send + Sync + 'static,
-    ) -> TransportBuilder<'_> {
+    pub fn transport<T>(&self, transport: T) -> TransportBuilder<'_>
+    where
+        T: Transport,
+    {
         TransportBuilder {
             logger: self,
             logger_transport: LoggerTransport::new(transport),
-        }
-    }
-
-    /// Async counterpart of [`Logger::transport`]. Returns a builder for an
-    /// async-native transport (HTTP, async DB, ...).  See `AsyncTransport`.
-    pub fn transport_async(
-        &self,
-        transport: impl AsyncTransport<LogInfo> + 'static,
-    ) -> TransportBuilder<'_> {
-        TransportBuilder {
-            logger: self,
-            logger_transport: LoggerTransport::new_async(transport),
         }
     }
 
@@ -745,7 +733,16 @@ mod tests {
     use super::*;
     use crate::logger_options::LoggerOptions;
     use std::sync::{Arc, Mutex};
+    use whatwg_streams::{
+        ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
+        WritableStreamDefaultController,
+    };
+    use winston_transport::{DynQueryHandle, DynReadableSource};
 
+    /// Test transport: collects writes into a shared `Vec`. Cloning shares the
+    /// underlying `Arc<Mutex<Vec<LogInfo>>>` so the test thread keeps a handle
+    /// to inspect what got written, even after the Logger consumes the
+    /// transport into its WritableStream.
     #[derive(Clone)]
     struct TestTransport {
         logs: Arc<Mutex<Vec<LogInfo>>>,
@@ -763,17 +760,56 @@ mod tests {
         }
     }
 
-    impl Transport<LogInfo> for TestTransport {
-        fn log(&self, info: LogInfo) {
+    impl WritableSink<LogInfo> for TestTransport {
+        async fn write(
+            &mut self,
+            info: LogInfo,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
             self.logs.lock().unwrap().push(info);
-        }
-
-        fn flush(&self) -> Result<(), String> {
             Ok(())
         }
+    }
 
-        fn query(&self, _: &LogQuery) -> Result<Vec<LogInfo>, String> {
-            Ok(self.get_logs())
+    impl Transport for TestTransport {
+        fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
+            Some(Box::new(TestQueryHandle {
+                logs: Arc::clone(&self.logs),
+            }))
+        }
+    }
+
+    struct TestQueryHandle {
+        logs: Arc<Mutex<Vec<LogInfo>>>,
+    }
+
+    impl DynQueryHandle for TestQueryHandle {
+        fn query(&self, _options: &LogQuery) -> Option<Box<dyn DynReadableSource>> {
+            let snapshot = self.logs.lock().unwrap().clone();
+            Some(Box::new(VecSource {
+                entries: snapshot.into_iter(),
+            }))
+        }
+    }
+
+    struct VecSource {
+        entries: std::vec::IntoIter<LogInfo>,
+    }
+
+    impl ReadableSource<LogInfo> for VecSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<LogInfo>,
+        ) -> StreamResult<()> {
+            match self.entries.next() {
+                Some(entry) => {
+                    let _ = controller.enqueue(entry);
+                }
+                None => {
+                    let _ = controller.close();
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1043,7 +1079,7 @@ mod tests {
         logger.flush().unwrap();
 
         let query = LogQuery::new();
-        let results = logger.query(&query);
+        let results = futures::executor::block_on(logger.query(&query));
         assert!(results.is_ok());
         assert_eq!(results.unwrap().len(), 1);
     }
@@ -1158,184 +1194,22 @@ mod tests {
         assert_eq!(state.options.transports.as_ref().unwrap().len(), 2);
     }
 
-    // ── Async transport tests ────────────────────────────────────────────────
-
-    use crate::logger_transport::Async;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::task::{Context, Poll};
-
-    /// Yields exactly once: returns Pending and then Ready on the next poll.
-    /// Used to force the executor to make progress on other futures, so
-    /// concurrency tests can observe overlapping in-flight log calls.
-    struct YieldOnce(bool);
-
-    impl Future for YieldOnce {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    fn yield_once() -> YieldOnce {
-        YieldOnce(false)
-    }
-
-    #[derive(Clone)]
-    struct AsyncTestTransport {
-        logs: Arc<Mutex<Vec<LogInfo>>>,
-        concurrency: usize,
-        in_flight: Arc<AtomicUsize>,
-        max_observed: Arc<AtomicUsize>,
-    }
-
-    impl AsyncTestTransport {
-        fn new(concurrency: usize) -> Self {
-            Self {
-                logs: Arc::new(Mutex::new(Vec::new())),
-                concurrency,
-                in_flight: Arc::new(AtomicUsize::new(0)),
-                max_observed: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn get_logs(&self) -> Vec<LogInfo> {
-            self.logs.lock().unwrap().clone()
-        }
-
-        fn max_in_flight(&self) -> usize {
-            self.max_observed.load(AtomicOrdering::SeqCst)
-        }
-    }
-
-    impl winston_transport::AsyncTransport<LogInfo> for AsyncTestTransport {
-        fn log<'s>(&'s self, info: LogInfo) -> Pin<Box<dyn Future<Output = ()> + Send + 's>> {
-            let logs = Arc::clone(&self.logs);
-            let in_flight = Arc::clone(&self.in_flight);
-            let max_observed = Arc::clone(&self.max_observed);
-            Box::pin(async move {
-                let cur = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-                max_observed.fetch_max(cur, AtomicOrdering::SeqCst);
-                yield_once().await;
-                logs.lock().unwrap().push(info);
-                in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
-            })
-        }
-
-        fn query<'s>(
-            &'s self,
-            _options: &'s winston_transport::LogQuery,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<LogInfo>, String>> + Send + 's>> {
-            let logs = Arc::clone(&self.logs);
-            Box::pin(async move { Ok(logs.lock().unwrap().clone()) })
-        }
-
-        fn concurrency(&self) -> usize {
-            self.concurrency
-        }
-    }
-
+    /// Verifies query aggregates entries across multiple registered transports.
     #[test]
-    fn test_async_transport_receives_logs() {
+    fn test_query_aggregates_multiple_transports() {
         let logger = Logger::new(None);
-        let transport = AsyncTestTransport::new(1);
-        logger.add_transport(Async(transport.clone()));
+        let t1 = TestTransport::new();
+        let t2 = TestTransport::new();
+        logger.add_transport(t1.clone());
+        logger.add_transport(t2.clone());
 
-        logger.log(LogInfo::new("info", "one"));
-        logger.log(LogInfo::new("info", "two"));
+        logger.log(LogInfo::new("info", "first"));
+        logger.log(LogInfo::new("info", "second"));
         logger.flush().unwrap();
 
-        let logs = transport.get_logs();
-        assert_eq!(logs.len(), 2);
-        assert_eq!(logs[0].message, "one");
-        assert_eq!(logs[1].message, "two");
-    }
-
-    #[test]
-    fn test_async_transport_sequential_keeps_in_flight_at_one() {
-        let logger = Logger::new(None);
-        let transport = AsyncTestTransport::new(1);
-        logger.add_transport(Async(transport.clone()));
-
-        for i in 0..8 {
-            logger.log(LogInfo::new("info", format!("msg {}", i)));
-        }
-        logger.flush().unwrap();
-
-        assert_eq!(transport.get_logs().len(), 8);
-        assert_eq!(
-            transport.max_in_flight(),
-            1,
-            "concurrency=1 must serialize log calls"
-        );
-    }
-
-    #[test]
-    fn test_async_transport_concurrent_overlaps_log_calls() {
-        let logger = Logger::new(None);
-        let transport = AsyncTestTransport::new(4);
-        logger.add_transport(Async(transport.clone()));
-
-        for i in 0..8 {
-            logger.log(LogInfo::new("info", format!("msg {}", i)));
-        }
-        logger.flush().unwrap();
-
-        assert_eq!(transport.get_logs().len(), 8);
-        assert!(
-            transport.max_in_flight() > 1,
-            "concurrency=4 should let multiple log futures be in flight (saw {})",
-            transport.max_in_flight()
-        );
-    }
-
-    #[test]
-    fn test_async_transport_flush_drains_in_flight() {
-        let logger = Logger::new(None);
-        let transport = AsyncTestTransport::new(4);
-        logger.add_transport(Async(transport.clone()));
-
-        for i in 0..16 {
-            logger.log(LogInfo::new("info", format!("msg {}", i)));
-        }
-        // Flush must wait for every in-flight log future before returning.
-        logger.flush().unwrap();
-
-        assert_eq!(transport.get_logs().len(), 16);
-        assert_eq!(
-            transport.in_flight.load(AtomicOrdering::SeqCst),
-            0,
-            "flush must drain all in-flight log futures"
-        );
-    }
-
-    #[test]
-    fn test_query_async_includes_async_transport() {
-        use futures::executor::block_on;
-
-        let logger = Logger::new(None);
-        let async_t = AsyncTestTransport::new(1);
-        let sync_t = TestTransport::new();
-        logger.add_transport(Async(async_t.clone()));
-        logger.add_transport(sync_t.clone());
-
-        logger.log(LogInfo::new("info", "from sync"));
-        logger.log(LogInfo::new("info", "from async"));
-        logger.flush().unwrap();
-
-        let results = block_on(logger.query_async(&LogQuery::new())).unwrap();
-        // Each transport sees both entries; query_async aggregates them.
+        let results =
+            futures::executor::block_on(logger.query(&LogQuery::new())).unwrap();
+        // Each transport saw both entries; query drains both sources.
         assert_eq!(results.len(), 4);
-
-        // Sync query path skips async transports — only the sync transport contributes.
-        let sync_only = logger.query(&LogQuery::new()).unwrap();
-        assert_eq!(sync_only.len(), 2);
     }
 }

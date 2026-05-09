@@ -1,5 +1,4 @@
 use crate::{logger::TransportHandle, Logger};
-use logform::LogInfo;
 use std::sync::OnceLock;
 use winston_transport::Transport;
 
@@ -86,14 +85,18 @@ pub fn close() {
     global_logger().close();
 }
 
-pub fn query(options: &winston_transport::LogQuery) -> Result<Vec<logform::LogInfo>, String> {
-    global_logger().query(options)
+/// Async query against the global logger. Drains every queryable transport's
+/// `ReadableSource<LogInfo>` and returns the collected results.
+pub async fn query(
+    options: &winston_transport::LogQuery,
+) -> Result<Vec<logform::LogInfo>, String> {
+    global_logger().query(options).await
 }
 
 /// Add a transport to the global logger and return a handle for later removal.
 pub fn add_transport<T>(transport: T) -> TransportHandle
 where
-    T: Transport<LogInfo> + Send + Sync + 'static,
+    T: Transport,
 {
     global_logger().add_transport(transport)
 }

@@ -4,7 +4,11 @@ use logform::LogInfo;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use winston_transport::{LogQuery, Transport};
+use whatwg_streams::{
+    ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
+    WritableStreamDefaultController,
+};
+use winston_transport::{DynQueryHandle, DynReadableSource, LogQuery, Transport};
 
 /// Configuration for MockTransport behavior
 #[derive(Clone, Debug)]
@@ -26,7 +30,12 @@ impl Default for MockConfig {
     }
 }
 
-/// A comprehensive mock transport for testing
+/// A comprehensive mock transport for testing.
+///
+/// Implements the new `Transport: WritableSink<LogInfo>` contract. Cloning
+/// shares the underlying `Arc<Mutex<Vec<LogInfo>>>` so the test thread keeps
+/// a handle to inspect what got written, even after the Logger consumes the
+/// transport into its `WritableStream`.
 #[derive(Clone, Debug)]
 pub struct MockTransport {
     pub logs: Arc<Mutex<Vec<LogInfo>>>,
@@ -84,48 +93,78 @@ impl MockTransport {
     }
 }
 
-impl Transport<LogInfo> for MockTransport {
-    fn log(&self, info: LogInfo) {
+impl WritableSink<LogInfo> for MockTransport {
+    async fn write(
+        &mut self,
+        info: LogInfo,
+        _controller: &mut WritableStreamDefaultController,
+    ) -> StreamResult<()> {
         if self.config.should_fail_log {
-            return;
+            return Ok(());
         }
-
         if self.config.delay > Duration::from_millis(0) {
             thread::sleep(self.config.delay);
         }
-
         self.logs.lock().unwrap().push(info);
+        Ok(())
     }
+}
 
-    fn flush(&self) -> Result<(), String> {
-        if self.config.should_fail_flush {
-            Err("Mock flush failure".to_string())
-        } else {
-            Ok(())
-        }
+impl Transport for MockTransport {
+    fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
+        Some(Box::new(MockQueryHandle {
+            logs: Arc::clone(&self.logs),
+        }))
     }
+}
 
-    fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
-        let logs = self.logs.lock().unwrap();
-        Ok(logs
-            .iter()
-            .filter(|log| {
-                // Check level filtering
-                if !options.levels.is_empty() && !options.levels.contains(&log.level) {
-                    return false;
-                }
+struct MockQueryHandle {
+    logs: Arc<Mutex<Vec<LogInfo>>>,
+}
 
-                // Check DSL filter if present
-                if let Some(ref filter) = options.filter {
-                    if !filter.evaluate(&log.to_flat_value()) {
+impl DynQueryHandle for MockQueryHandle {
+    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>> {
+        let snapshot: Vec<LogInfo> = {
+            let logs = self.logs.lock().unwrap();
+            logs.iter()
+                .filter(|log| {
+                    if !options.levels.is_empty() && !options.levels.contains(&log.level) {
                         return false;
                     }
-                }
+                    if let Some(ref filter) = options.filter {
+                        if !filter.evaluate(&log.to_flat_value()) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect()
+        };
+        Some(Box::new(VecSource {
+            entries: snapshot.into_iter(),
+        }))
+    }
+}
 
-                true
-            })
-            .cloned()
-            .collect())
+struct VecSource {
+    entries: std::vec::IntoIter<LogInfo>,
+}
+
+impl ReadableSource<LogInfo> for VecSource {
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableStreamDefaultController<LogInfo>,
+    ) -> StreamResult<()> {
+        match self.entries.next() {
+            Some(entry) => {
+                let _ = controller.enqueue(entry);
+            }
+            None => {
+                let _ = controller.close();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -145,4 +184,13 @@ pub fn cleanup_file(path: &str) {
 /// Helper to wait for async log processing
 pub fn wait_for_logs(logger: &winston::Logger) {
     logger.flush().expect("Failed to flush logger");
+}
+
+/// Block on a Logger::query call. Tests that don't have an async runtime call
+/// query through this helper.
+pub fn query_blocking(
+    logger: &winston::Logger,
+    options: &LogQuery,
+) -> Result<Vec<LogInfo>, String> {
+    futures::executor::block_on(logger.query(options))
 }

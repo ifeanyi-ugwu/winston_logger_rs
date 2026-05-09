@@ -17,6 +17,8 @@ pub use global::{
 pub use logform as format;
 pub use logger::Logger;
 pub use logger_options::{BackpressureStrategy, LoggerOptions};
-pub use logger_transport::{Async, LoggerTransport, TransportKind};
+pub use logger_transport::LoggerTransport;
 pub use pipeline::{default_spawner, single_threaded_spawner, SpawnFn};
-pub use winston_transport::{AsyncTransport, LogQuery, Transport};
+pub use winston_transport::{
+    BoxedReadableSource, DynQueryHandle, DynReadableSource, LogQuery, Transport,
+};

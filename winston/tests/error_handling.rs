@@ -138,7 +138,7 @@ fn test_query_with_no_results() {
     logger.flush().unwrap();
 
     let query = winston::LogQuery::new().levels(vec!["error"]);
-    let results = logger.query(&query).unwrap();
+    let results = common::query_blocking(&logger, &query).unwrap();
 
     assert_eq!(results.len(), 0);
 }

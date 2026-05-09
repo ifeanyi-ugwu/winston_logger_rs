@@ -162,7 +162,7 @@ fn test_query_with_level_filter() {
     wait_for_logs(&logger);
 
     let query = winston::LogQuery::new().levels(vec!["error"]);
-    let results = logger.query(&query).unwrap();
+    let results = common::query_blocking(&logger, &query).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].level, "error");

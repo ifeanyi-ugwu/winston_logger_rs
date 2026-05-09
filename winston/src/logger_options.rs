@@ -11,7 +11,7 @@ pub struct LoggerOptions {
     pub levels: Option<LoggerLevels>,
     pub format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     pub level: Option<String>,
-    pub transports: Option<Vec<(TransportHandle, LoggerTransport<LogInfo>)>>,
+    pub transports: Option<Vec<(TransportHandle, LoggerTransport)>>,
     pub channel_capacity: Option<usize>,
     pub backpressure_strategy: Option<BackpressureStrategy>,
 }

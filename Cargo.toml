@@ -1,15 +1,21 @@
 [workspace]
 resolver = "3"
+# Mid-migration: legacy `Transport<L>`/`AsyncTransport<L>` are being replaced
+# with `Transport: WritableSink<LogInfo>`. Crates that haven't been migrated
+# yet are temporarily excluded from the workspace; they re-join one per
+# follow-up commit as they're ported.
 members = [
     "logform",
     "logmark",
     "winston",
-    "winston_daily_rotate_file",
     "winston_file",
+    "winston_transport",
+]
+exclude = [
+    "winston_daily_rotate_file",
     "winston_http",
     "winston_mongodb",
     "winston_proxy_transport",
-    "winston_transport",
     "winston_tracing",
 ]
 

@@ -151,7 +151,7 @@ fn test_global_query() {
     winston::flush().unwrap();
 
     let query = winston::LogQuery::new().levels(vec!["error"]);
-    let results = winston::query(&query).unwrap();
+    let results = futures::executor::block_on(winston::query(&query)).unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].level, "error");
