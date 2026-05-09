@@ -51,7 +51,7 @@ pub mod prelude {
     use super::*;
 
     // Re-export struct itself
-    use crate::query_dsl::dlc::alpha::a::FieldComparison;
+    use crate::query_dsl::FieldComparison;
 
     /* pub fn gt(value: impl Into<QueryValue>) -> FieldComparison {
         FieldComparison::gt(value)

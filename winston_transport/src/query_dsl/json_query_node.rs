@@ -5,6 +5,7 @@ use super::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -13,26 +14,71 @@ pub enum JsonQueryNode {
     FieldQuery(HashMap<String, HashMap<String, Value>>),
 }
 
-impl From<JsonQueryNode> for QueryNode {
-    fn from(raw: JsonQueryNode) -> Self {
+#[derive(Debug)]
+pub enum QueryParseError {
+    Json(serde_json::Error),
+    UnknownOperator(String),
+    InvalidStructure(&'static str),
+}
+
+impl fmt::Display for QueryParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QueryParseError::Json(e) => write!(f, "invalid query JSON: {}", e),
+            QueryParseError::UnknownOperator(op) => write!(f, "unknown operator: {}", op),
+            QueryParseError::InvalidStructure(msg) => write!(f, "invalid query structure: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for QueryParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            QueryParseError::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for QueryParseError {
+    fn from(e: serde_json::Error) -> Self {
+        QueryParseError::Json(e)
+    }
+}
+
+impl TryFrom<JsonQueryNode> for QueryNode {
+    type Error = QueryParseError;
+
+    fn try_from(raw: JsonQueryNode) -> Result<Self, Self::Error> {
         match raw {
             JsonQueryNode::LogicOp(logic_map) => {
-                assert_eq!(logic_map.len(), 1, "Only one logical operator per object");
+                if logic_map.len() != 1 {
+                    return Err(QueryParseError::InvalidStructure(
+                        "expected exactly one logical operator per object",
+                    ));
+                }
                 let (op_str, sub_queries) = logic_map.into_iter().next().unwrap();
                 let operator = match op_str.as_str() {
                     "$and" => LogicalOperator::And,
                     "$or" => LogicalOperator::Or,
-                    _ => panic!("Unknown logical operator: {}", op_str),
+                    _ => return Err(QueryParseError::UnknownOperator(op_str)),
                 };
-                let children = sub_queries.into_iter().map(Into::into).collect();
-                QueryLogicNode { operator, children }.into()
+                let children = sub_queries
+                    .into_iter()
+                    .map(QueryNode::try_from)
+                    .collect::<Result<_, _>>()?;
+                Ok(QueryLogicNode { operator, children }.into())
             }
             JsonQueryNode::FieldQuery(mut field_map) => {
-                assert_eq!(field_map.len(), 1, "Only one field per condition");
+                if field_map.len() != 1 {
+                    return Err(QueryParseError::InvalidStructure(
+                        "expected exactly one field per condition",
+                    ));
+                }
                 let (field_path, raw_field_query) = field_map.drain().next().unwrap();
                 let path = FieldPath::from(field_path);
-                let field_node = FieldNode::from(raw_field_query);
-                FieldQueryNode::new(path, field_node).into()
+                let field_node = FieldNode::try_from(raw_field_query)?;
+                Ok(FieldQueryNode::new(path, field_node).into())
             }
         }
     }
@@ -48,32 +94,40 @@ impl FieldLogic {
     }
 }
 
-impl From<HashMap<String, Value>> for FieldNode {
-    fn from(op_map: HashMap<String, Value>) -> Self {
-        assert_eq!(op_map.len(), 1, "Expected single operator in field query");
+impl TryFrom<HashMap<String, Value>> for FieldNode {
+    type Error = QueryParseError;
+
+    fn try_from(op_map: HashMap<String, Value>) -> Result<Self, Self::Error> {
+        if op_map.len() != 1 {
+            return Err(QueryParseError::InvalidStructure(
+                "expected exactly one operator in field query",
+            ));
+        }
         let (op_str, value) = op_map.into_iter().next().unwrap();
         match op_str.as_str() {
             "$and" | "$or" => {
-                if let Value::Array(sub_conditions) = value {
-                    let operator = match op_str.as_str() {
-                        "$and" => LogicalOperator::And,
-                        "$or" => LogicalOperator::Or,
-                        _ => unreachable!(),
-                    };
-                    let children: Vec<FieldNode> = sub_conditions
-                        .into_iter()
-                        .map(|sub_cond| {
-                            if let Value::Object(map) = sub_cond {
-                                HashMap::from_iter(map).into()
-                            } else {
-                                panic!("Expected object in logical sub-condition array");
-                            }
-                        })
-                        .collect();
-                    FieldNode::Logic(FieldLogic::new(operator).with_nodes(children))
-                } else {
-                    panic!("Expected array for logical operator value");
-                }
+                let Value::Array(sub_conditions) = value else {
+                    return Err(QueryParseError::InvalidStructure(
+                        "expected array for logical operator value",
+                    ));
+                };
+                let operator = match op_str.as_str() {
+                    "$and" => LogicalOperator::And,
+                    "$or" => LogicalOperator::Or,
+                    _ => unreachable!(),
+                };
+                let children = sub_conditions
+                    .into_iter()
+                    .map(|sub_cond| match sub_cond {
+                        Value::Object(map) => FieldNode::try_from(HashMap::from_iter(map)),
+                        _ => Err(QueryParseError::InvalidStructure(
+                            "expected object in logical sub-condition array",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(FieldNode::Logic(
+                    FieldLogic::new(operator).with_nodes(children),
+                ))
             }
             _ => {
                 let val = QueryValue::from(value);
@@ -84,19 +138,20 @@ impl From<HashMap<String, Value>> for FieldNode {
                     //"$ne" => FieldComparison::ne(val),
                     //"$in" => FieldComparison::in_array(val),
                     //"$nin" => FieldComparison::nin_array(val),
-                    _ => panic!("Unknown field operator: {}", op_str),
+                    _ => return Err(QueryParseError::UnknownOperator(op_str)),
                 };
-                FieldNode::Comparison(comp)
+                Ok(FieldNode::Comparison(comp))
             }
         }
     }
 }
 
-impl From<Value> for QueryNode {
-    fn from(value: Value) -> Self {
-        let raw: JsonQueryNode =
-            serde_json::from_value(value).expect("Failed to parse RawQuery from JSON Value");
-        raw.into()
+impl TryFrom<Value> for QueryNode {
+    type Error = QueryParseError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let raw: JsonQueryNode = serde_json::from_value(value)?;
+        QueryNode::try_from(raw)
     }
 }
 
@@ -122,7 +177,7 @@ mod tests {
 
         let parsed: JsonQueryNode = serde_json::from_value(raw).expect("Failed to parse RawQuery");
         println!("Parsed RawQuery: {:?}", parsed);
-        let query: QueryNode = parsed.into();
+        let query = QueryNode::try_from(parsed).expect("conversion failed");
         println!("Parsed QueryNode: {:?}", query);
 
         let user1 = json!({ "user": { "age": 30, "status": "active" } });
@@ -147,7 +202,7 @@ mod tests {
             }
         });
         let parsed: JsonQueryNode = serde_json::from_value(raw).expect("Failed to parse RawQuery");
-        let query: QueryNode = parsed.into();
+        let query = QueryNode::try_from(parsed).expect("conversion failed");
         let user1 = json!({ "user": { "age": 30 } });
         let user2 = json!({ "user": { "age": 15 } });
         assert!(query.evaluate(&user1));
@@ -180,7 +235,7 @@ mod tests {
             ]
         });
         let parsed: JsonQueryNode = serde_json::from_value(raw).expect("Failed to parse RawQuery");
-        let query: QueryNode = parsed.into();
+        let query = QueryNode::try_from(parsed).expect("conversion failed");
         let user1 = json!({ "user": { "status": "active","age":26 } });
         let user2 = json!({ "user": { "status": "pending","age":26 } });
         let user3 = json!({ "user": { "status": "inactive","age":26 } });
@@ -203,7 +258,7 @@ mod tests {
             }
         });
         let parsed: JsonQueryNode = serde_json::from_value(raw).expect("Failed to parse RawQuery");
-        let query: QueryNode = parsed.into();
+        let query = QueryNode::try_from(parsed).expect("conversion failed");
 
         let user1 = json!({ "user": { "age": 25 } }); // Matches: > 18 and < 30
         let user2 = json!({ "user": { "age": 55 } }); // Matches: > 18 and > 50
@@ -233,7 +288,7 @@ mod tests {
             }
         });
         let parsed: JsonQueryNode = serde_json::from_value(raw).expect("Failed to parse RawQuery");
-        let query: QueryNode = parsed.into();
+        let query = QueryNode::try_from(parsed).expect("conversion failed");
 
         let obj1 = json!({ "user": { "value": 15 } }); // > 10 and < 20
         let obj2 = json!({ "user": { "value": 35 } }); // > 10 and (> 30 and < 40)

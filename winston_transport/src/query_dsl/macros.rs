@@ -1,7 +1,7 @@
 #[macro_export]
 macro_rules! and {
     ( $( $query:expr ),* ) => {
-        $crate::query_dsl::dlc::alpha::a::QueryLogicNode::new($crate::query_dsl::dlc::alpha::a::LogicalOperator::And)
+        $crate::query_dsl::QueryLogicNode::new($crate::query_dsl::LogicalOperator::And)
             $( .with_node($query) )*
     };
 }
@@ -9,7 +9,7 @@ macro_rules! and {
 #[macro_export]
 macro_rules! or {
     ( $( $query:expr ),* ) => {
-        $crate::query_dsl::dlc::alpha::a::QueryLogicNode::new($crate::query_dsl::dlc::alpha::a::LogicalOperator::Or)
+        $crate::query_dsl::QueryLogicNode::new($crate::query_dsl::LogicalOperator::Or)
             $( .with_node($query) )*
     };
 }
@@ -18,7 +18,7 @@ macro_rules! or {
 macro_rules! field_query {
     // Accept a path and any expression that evaluates to FieldComparison or FieldLogic
     ($path:expr, $logic:expr) => {
-        $crate::query_dsl::dlc::alpha::a::FieldQueryNode::new($path, $logic)
+        $crate::query_dsl::FieldQueryNode::new($path, $logic)
     };
 }
 
@@ -26,8 +26,8 @@ macro_rules! field_query {
 macro_rules! field_logic {
     // Case 1: General AND using prelude functions or nested logic
     (and, $( $node:expr ),+ $(,)?) => {{
-        let mut logic = $crate::query_dsl::dlc::alpha::a::FieldLogic::new(
-            $crate::query_dsl::dlc::alpha::a::LogicalOperator::And
+        let mut logic = $crate::query_dsl::FieldLogic::new(
+            $crate::query_dsl::LogicalOperator::And
         );
         $(
             logic = logic.with_node($node);
@@ -36,8 +36,8 @@ macro_rules! field_logic {
     }};
     // Case 2: General OR using prelude functions or nested logic
     (or, $( $node:expr ),+ $(,)?) => {{
-        let mut logic = $crate::query_dsl::dlc::alpha::a::FieldLogic::new(
-            $crate::query_dsl::dlc::alpha::a::LogicalOperator::Or
+        let mut logic = $crate::query_dsl::FieldLogic::new(
+            $crate::query_dsl::LogicalOperator::Or
         );
         $(
             logic = logic.with_node($node);
@@ -48,7 +48,7 @@ macro_rules! field_logic {
 
 #[cfg(test)]
 mod tests {
-    use crate::query_dsl::dlc::alpha::a::field_comparisons::prelude::*;
+    use crate::query_dsl::field_comparisons::prelude::*;
     use serde_json::json;
 
     #[test]
