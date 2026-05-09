@@ -2,7 +2,6 @@ pub mod comparator;
 pub mod field_comparisons;
 pub mod field_path;
 mod json_query_node;
-mod log_query_integration;
 pub mod macros;
 pub mod prelude;
 mod query_value;
