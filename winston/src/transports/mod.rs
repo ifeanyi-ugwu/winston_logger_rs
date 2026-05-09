@@ -3,6 +3,9 @@ pub use winston_file::FileTransport as File;
 pub use winston_transport::transport_adapters::WriterTransport;
 pub use winston_transport::*;
 
+mod writer_sink;
+pub use writer_sink::{stderr_sink, stdout_sink, WriterSink};
+
 // Convenience functions
 pub fn stdout() -> WriterTransport<io::Stdout, LogInfo> {
     WriterTransport::new(io::stdout())

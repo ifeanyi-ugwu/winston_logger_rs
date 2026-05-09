@@ -1,3 +1,6 @@
+mod streams;
+pub use streams::{FileSink, FileSource};
+
 //use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use dateparser::parse;

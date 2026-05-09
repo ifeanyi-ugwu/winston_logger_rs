@@ -3652,8 +3652,10 @@ version = "0.3.2-dev"
 dependencies = [
  "chrono",
  "dateparser",
+ "futures",
  "logform",
  "serde_json",
+ "whatwg_streams",
  "winston_proxy_transport",
  "winston_transport",
 ]
