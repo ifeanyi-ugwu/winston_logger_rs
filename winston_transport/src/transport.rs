@@ -53,4 +53,16 @@ pub trait AsyncTransport<L>: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<L>, String>> + Send + 's>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    /// Maximum number of `log` futures the pipeline may have in flight against
+    /// this transport at once. Defaults to 1 — strict per-transport ordering,
+    /// matching the sync transport contract.
+    ///
+    /// Override to allow concurrent dispatch when the underlying client is
+    /// already concurrency-safe (HTTP pool, async DB) and order doesn't matter.
+    /// Note: ordering across log entries is no longer guaranteed when this
+    /// returns > 1.
+    fn concurrency(&self) -> usize {
+        1
+    }
 }

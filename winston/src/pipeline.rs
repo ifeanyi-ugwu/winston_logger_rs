@@ -6,12 +6,14 @@ use std::{
 };
 
 use futures::channel::mpsc as fmpsc;
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use logform::{Format, LogInfo};
 use whatwg_streams::{
     CountQueuingStrategy, ReadableSource, ReadableStream, ReadableStreamDefaultController,
     StreamResult, WritableSink, WritableStream, WritableStreamDefaultController,
 };
+use winston_transport::AsyncTransport;
 
 use crate::{
     logger::TransportHandle,
@@ -339,6 +341,33 @@ impl WritableSink<PipelineMessage> for FanoutSink {
 // ── Per-transport async task ─────────────────────────────────────────────────
 
 async fn run_transport_task(
+    rx: fmpsc::UnboundedReceiver<TransportMessage>,
+    transport: LoggerTransport<LogInfo>,
+    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+) {
+    // Async transports may opt into concurrent dispatch (`concurrency() > 1`).
+    // The concurrent path uses a FuturesUnordered, so keep the simple
+    // sequential loop as the default to avoid select! overhead in the hot path.
+    if let TransportKind::Async(async_t) = transport.kind() {
+        let concurrency = async_t.concurrency().max(1);
+        if concurrency > 1 {
+            let async_t = Arc::clone(async_t);
+            run_async_concurrent_loop(
+                rx,
+                async_t,
+                transport.get_format(),
+                global_format,
+                concurrency,
+            )
+            .await;
+            return;
+        }
+    }
+
+    run_sequential_loop(rx, transport, global_format).await;
+}
+
+async fn run_sequential_loop(
     mut rx: fmpsc::UnboundedReceiver<TransportMessage>,
     transport: LoggerTransport<LogInfo>,
     global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
@@ -354,9 +383,8 @@ async fn run_transport_task(
                 if let Some(info) = formatted {
                     match transport.kind() {
                         TransportKind::Sync(t) => t.log(info),
-                        // Awaiting sequentially preserves per-transport order;
-                        // cross-transport concurrency comes from each transport
-                        // running on its own task.
+                        // Order-preserving per transport; cross-transport
+                        // concurrency comes from each running on its own task.
                         TransportKind::Async(t) => t.log(info).await,
                     }
                 }
@@ -371,6 +399,65 @@ async fn run_transport_task(
                     }
                 }
                 let _ = tx.send(());
+            }
+        }
+    }
+}
+
+/// Async-transport loop with bounded in-flight log futures.
+///
+/// `log` futures are pushed into a FuturesUnordered up to `concurrency`. While
+/// at capacity we only drain; below it we race the next message against pending
+/// completions so the set keeps draining even when the channel is idle. Flush
+/// drains all in-flight futures before invoking the transport's flush — so
+/// callers of `Logger::flush` still see "all queued entries written" semantics.
+async fn run_async_concurrent_loop(
+    mut rx: fmpsc::UnboundedReceiver<TransportMessage>,
+    async_t: Arc<dyn AsyncTransport<LogInfo> + Send + Sync>,
+    transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    concurrency: usize,
+) {
+    let mut in_flight: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> =
+        FuturesUnordered::new();
+
+    loop {
+        if in_flight.len() >= concurrency {
+            let _ = in_flight.next().await;
+            continue;
+        }
+
+        let msg = if in_flight.is_empty() {
+            rx.next().await
+        } else {
+            futures::select! {
+                m = rx.next() => m,
+                _ = in_flight.select_next_some() => continue,
+            }
+        };
+
+        match msg {
+            Some(TransportMessage::Entry(entry)) => {
+                let formatted = match (&transport_format, &global_format) {
+                    (Some(tf), _) => tf.transform((*entry).clone()),
+                    (None, Some(lf)) => lf.transform((*entry).clone()),
+                    (None, None) => Some((*entry).clone()),
+                };
+                if let Some(info) = formatted {
+                    let t = Arc::clone(&async_t);
+                    in_flight.push(Box::pin(async move {
+                        t.log(info).await;
+                    }));
+                }
+            }
+            Some(TransportMessage::Flush(tx)) => {
+                while in_flight.next().await.is_some() {}
+                let _ = async_t.flush().await;
+                let _ = tx.send(());
+            }
+            None => {
+                while in_flight.next().await.is_some() {}
+                return;
             }
         }
     }
