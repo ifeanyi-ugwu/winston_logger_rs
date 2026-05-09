@@ -1,6 +1,33 @@
 use super::QueryValue;
 use chrono::{DateTime, Datelike, Utc};
-use serde_json::Value;
+use serde_json::{Number, Value};
+use std::cmp::Ordering;
+
+// Lossless ordering between two serde_json::Numbers. Falls through to f64
+// only when the operands aren't both representable as i64 or both as u64,
+// which keeps large i64/u64 values exact.
+fn cmp_numbers(a: &Number, b: &Number) -> Option<Ordering> {
+    if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
+        return Some(ai.cmp(&bi));
+    }
+    if let (Some(au), Some(bu)) = (a.as_u64(), b.as_u64()) {
+        return Some(au.cmp(&bu));
+    }
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
+}
+
+fn is_multiple_of_numbers(a: &Number, b: &Number) -> bool {
+    if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
+        return bi != 0 && ai % bi == 0;
+    }
+    if let (Some(au), Some(bu)) = (a.as_u64(), b.as_u64()) {
+        return bu != 0 && au % bu == 0;
+    }
+    let (Some(af), Some(bf)) = (a.as_f64(), b.as_f64()) else {
+        return false;
+    };
+    bf != 0.0 && af % bf == 0.0
+}
 
 #[derive(Debug, Clone)]
 pub enum Comparator {
@@ -55,22 +82,22 @@ impl Comparator {
                     }
                 }
                 (Comparator::GreaterThan, Some(expected)) => {
-                    if self.compare_numbers(val, expected, |a, b| a > b) {
+                    if self.compare_numbers(val, expected, Ordering::is_gt) {
                         return true;
                     }
                 }
                 (Comparator::LessThan, Some(expected)) => {
-                    if self.compare_numbers(val, expected, |a, b| a < b) {
+                    if self.compare_numbers(val, expected, Ordering::is_lt) {
                         return true;
                     }
                 }
                 (Comparator::GreaterThanOrEqual, Some(expected)) => {
-                    if self.compare_numbers(val, expected, |a, b| a >= b) {
+                    if self.compare_numbers(val, expected, Ordering::is_ge) {
                         return true;
                     }
                 }
                 (Comparator::LessThanOrEqual, Some(expected)) => {
-                    if self.compare_numbers(val, expected, |a, b| a <= b) {
+                    if self.compare_numbers(val, expected, Ordering::is_le) {
                         return true;
                     }
                 }
@@ -200,14 +227,8 @@ impl Comparator {
                 }
                 (Comparator::Length, Some(expected_length)) => {
                     if let Value::Array(actual_array) = val {
-                        if self.compare_numbers(
-                            &Value::Number(
-                                serde_json::Number::from_f64(actual_array.len() as f64)
-                                    .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
-                            ),
-                            expected_length,
-                            |a, b| a == b,
-                        ) {
+                        let len_value = Value::Number(Number::from(actual_array.len() as u64));
+                        if self.compare_numbers(&len_value, expected_length, Ordering::is_eq) {
                             return true;
                         }
                     }
@@ -231,8 +252,8 @@ impl Comparator {
                         if let (Some(start), Some(end)) =
                             (expected_range.first(), expected_range.get(1))
                         {
-                            if self.compare_numbers(val, start, |a, b| a >= b)
-                                && self.compare_numbers(val, end, |a, b| a <= b)
+                            if self.compare_numbers(val, start, Ordering::is_ge)
+                                && self.compare_numbers(val, end, Ordering::is_le)
                             {
                                 return true;
                             }
@@ -244,30 +265,24 @@ impl Comparator {
                         if let (Some(start), Some(end)) =
                             (expected_range.first(), expected_range.get(1))
                         {
-                            if !(self.compare_numbers(val, start, |a, b| a >= b)
-                                && self.compare_numbers(val, end, |a, b| a <= b))
+                            if !(self.compare_numbers(val, start, Ordering::is_ge)
+                                && self.compare_numbers(val, end, Ordering::is_le))
                             {
                                 return true;
                             }
                         }
                     }
                 }
-                (Comparator::IsMultipleOf, Some(expected_multiple)) => {
-                    if let (Value::Number(actual_num), QueryValue::Number(expected_num)) =
-                        (&val, expected_multiple)
-                    {
-                        if actual_num.as_f64().unwrap_or_default() % expected_num == 0.0 {
+                (Comparator::IsMultipleOf, Some(QueryValue::Number(expected_num))) => {
+                    if let Value::Number(actual_num) = val {
+                        if is_multiple_of_numbers(actual_num, expected_num) {
                             return true;
                         }
                     }
                 }
-                (Comparator::IsDivisibleBy, Some(expected_divisor)) => {
-                    if let (Value::Number(actual_num), QueryValue::Number(expected_num)) =
-                        (&val, expected_divisor)
-                    {
-                        if *expected_num != 0.0
-                            && actual_num.as_f64().unwrap_or_default() % expected_num == 0.0
-                        {
+                (Comparator::IsDivisibleBy, Some(QueryValue::Number(expected_num))) => {
+                    if let Value::Number(actual_num) = val {
+                        if is_multiple_of_numbers(actual_num, expected_num) {
                             return true;
                         }
                     }
@@ -312,10 +327,7 @@ impl Comparator {
                 actual_str == expected_str
             }
             (Value::Number(actual_num), QueryValue::Number(expected_num)) => {
-                // TODO: Refactor number comparison to be lossless.
-                // Current f64 conversion may lose precision for large u64/i64 values.
-                // Consider using serde_json::Number's internal comparison or a decimal crate. i.e probably by storing a string or a serde_json::Number in QueryValue::Number
-                actual_num.as_f64().unwrap_or_default() == *expected_num
+                cmp_numbers(actual_num, expected_num).is_some_and(Ordering::is_eq)
             }
             (Value::Bool(actual_bool), QueryValue::Boolean(expected_bool)) => {
                 actual_bool == expected_bool
@@ -342,14 +354,14 @@ impl Comparator {
         }
     }
 
-    fn compare_numbers<F>(&self, actual: &Value, expected: &QueryValue, compare_fn: F) -> bool
+    fn compare_numbers<F>(&self, actual: &Value, expected: &QueryValue, ord_pred: F) -> bool
     where
-        F: Fn(f64, f64) -> bool,
+        F: FnOnce(Ordering) -> bool,
     {
-        if let (Value::Number(actual_num), QueryValue::Number(expected_num)) = (actual, expected) {
-            compare_fn(actual_num.as_f64().unwrap_or_default(), *expected_num)
-        } else {
-            false
-        }
+        let (Value::Number(actual_num), QueryValue::Number(expected_num)) = (actual, expected)
+        else {
+            return false;
+        };
+        cmp_numbers(actual_num, expected_num).is_some_and(ord_pred)
     }
 }

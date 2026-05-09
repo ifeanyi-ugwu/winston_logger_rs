@@ -145,7 +145,18 @@ fn field_path_to_string(
 fn value_to_bson(query_value: &QueryValue) -> Bson {
     match query_value {
         QueryValue::String(s) => Bson::String(s.clone()),
-        QueryValue::Number(n) => Bson::Double(*n),
+        QueryValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Bson::Int64(i)
+            } else if let Some(u) = n.as_u64() {
+                // u64 values above i64::MAX don't fit in BSON's signed Int64;
+                // fall back to Double which matches the storage shape MongoDB
+                // would coerce to anyway.
+                i64::try_from(u).map(Bson::Int64).unwrap_or(Bson::Double(u as f64))
+            } else {
+                Bson::Double(n.as_f64().unwrap_or(0.0))
+            }
+        }
         QueryValue::Boolean(b) => Bson::Boolean(*b),
         QueryValue::Null => Bson::Null,
         QueryValue::Array(arr) => Bson::Array(arr.iter().map(value_to_bson).collect()),

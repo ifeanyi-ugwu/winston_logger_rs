@@ -1,12 +1,12 @@
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Number, Value};
 use std::{fmt, sync::Arc};
 
 #[derive(Clone)]
 pub enum QueryValue {
     String(String),
-    Number(f64),
+    Number(Number),
     Boolean(bool),
     Array(Vec<QueryValue>),
     Regex(Regex),
@@ -54,36 +54,42 @@ impl From<String> for QueryValue {
 
 impl From<i32> for QueryValue {
     fn from(value: i32) -> Self {
-        QueryValue::Number(value as f64)
+        QueryValue::Number(Number::from(value))
     }
 }
 
 impl From<i64> for QueryValue {
     fn from(value: i64) -> Self {
-        QueryValue::Number(value as f64)
+        QueryValue::Number(Number::from(value))
     }
 }
 
 impl From<u32> for QueryValue {
     fn from(value: u32) -> Self {
-        QueryValue::Number(value as f64)
+        QueryValue::Number(Number::from(value))
     }
 }
 
 impl From<u64> for QueryValue {
     fn from(value: u64) -> Self {
-        QueryValue::Number(value as f64)
+        QueryValue::Number(Number::from(value))
     }
 }
 
 impl From<f32> for QueryValue {
     fn from(value: f32) -> Self {
-        QueryValue::Number(value as f64)
+        QueryValue::Number(Number::from_f64(value as f64).unwrap_or_else(|| Number::from(0)))
     }
 }
 
 impl From<f64> for QueryValue {
     fn from(value: f64) -> Self {
+        QueryValue::Number(Number::from_f64(value).unwrap_or_else(|| Number::from(0)))
+    }
+}
+
+impl From<Number> for QueryValue {
+    fn from(value: Number) -> Self {
         QueryValue::Number(value)
     }
 }
@@ -110,15 +116,7 @@ impl From<Value> for QueryValue {
     fn from(value: Value) -> Self {
         match value {
             Value::String(s) => QueryValue::String(s),
-            Value::Number(n) => {
-                // Check if it's an f64 directly
-                if let Some(f) = n.as_f64() {
-                    QueryValue::Number(f)
-                } else {
-                    // Otherwise, convert to f64 (can be i64 or u64, etc.)
-                    QueryValue::Number(n.as_i64().unwrap_or_default() as f64)
-                }
-            }
+            Value::Number(n) => QueryValue::Number(n),
             Value::Bool(b) => QueryValue::Boolean(b),
             Value::Null => QueryValue::Null,
             Value::Array(arr) => QueryValue::Array(arr.into_iter().map(|v| v.into()).collect()),
