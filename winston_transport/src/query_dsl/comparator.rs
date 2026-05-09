@@ -48,98 +48,61 @@ impl Comparator {
                 (Comparator::Equals, Some(expected)) => {
                     if self.compare_values(val, expected) {
                         return true;
-                    } else {
-                        println!("failed at `equals` check");
                     }
                 }
                 (Comparator::NotEquals, Some(expected)) => {
                     if !self.compare_values(val, expected) {
                         return true;
-                    } else {
-                        println!("failed at `not_equals` check");
                     }
                 }
                 (Comparator::GreaterThan, Some(expected)) => {
                     if self.compare_numbers(val, expected, |a, b| a > b) {
                         return true;
-                    } else {
-                        println!("failed at `greater_than` check");
                     }
                 }
                 (Comparator::LessThan, Some(expected)) => {
                     if self.compare_numbers(val, expected, |a, b| a < b) {
                         return true;
-                    } else {
-                        println!(
-                            "failed at `less_than` check: actual={} expected={:?}",
-                            val, expected
-                        );
                     }
                 }
                 (Comparator::GreaterThanOrEqual, Some(expected)) => {
                     if self.compare_numbers(val, expected, |a, b| a >= b) {
                         return true;
-                    } else {
-                        println!("failed at `greater_than_or_equal` check");
                     }
                 }
                 (Comparator::LessThanOrEqual, Some(expected)) => {
                     if self.compare_numbers(val, expected, |a, b| a <= b) {
                         return true;
-                    } else {
-                        println!("failed at `less_than_or_equal` check");
                     }
                 }
-                (Comparator::Exists, None) => {
-                    //println!("Exists check: path={:?}, result=true", self.path);
-                    return true;
-                }
-                (Comparator::NotExists, None) => {
-                    //println!("NotExists check: path={:?}, result=false", self.path);
-                    return false;
-                }
+                (Comparator::Exists, None) => return true,
+                (Comparator::NotExists, None) => return false,
                 (Comparator::Matches, Some(QueryValue::Regex(expected_regex))) => {
                     if let Value::String(actual_str) = val {
                         if expected_regex.is_match(actual_str) {
                             return true;
-                        } else {
-                            println!("failed at `matches` check");
                         }
-                    } else {
-                        println!("failed at `matches` check");
                     }
                 }
                 (Comparator::NotMatches, Some(QueryValue::Regex(expected_regex))) => {
                     if let Value::String(actual_str) = val {
                         if !expected_regex.is_match(actual_str) {
                             return true;
-                        } else {
-                            println!("failed at `not_matches` check");
                         }
-                    } else {
-                        println!("failed at `not_matches` check");
                     }
                 }
                 (Comparator::StartsWith, Some(QueryValue::String(expected_prefix))) => {
                     if let Value::String(actual_str) = val {
                         if actual_str.starts_with(expected_prefix) {
                             return true;
-                        } else {
-                            println!("failed at `starts_with` check");
                         }
-                    } else {
-                        println!("failed at `starts_with` check");
                     }
                 }
                 (Comparator::EndsWith, Some(QueryValue::String(expected_suffix))) => {
                     if let Value::String(actual_str) = val {
                         if actual_str.ends_with(expected_suffix) {
                             return true;
-                        } else {
-                            println!("failed at `ends_with` check");
                         }
-                    } else {
-                        println!("failed at `ends_with` check");
                     }
                 }
                 (Comparator::Contains, Some(QueryValue::String(expected_substring))) => match val {
@@ -151,45 +114,25 @@ impl Comparator {
                                 }
                             }
                         }
-                        println!(
-                "failed at `contains` check: none of the array elements contain substring '{}'",
-                expected_substring
-            );
                     }
                     Value::String(actual_str) => {
                         if actual_str.contains(expected_substring) {
                             return true;
-                        } else {
-                            println!(
-                    "failed at `contains` check: actual string '{}' does not contain substring '{}'",
-                    actual_str, expected_substring
-                );
                         }
                     }
-                    other_value => {
-                        println!(
-                "failed at `contains` check: expected string or array of strings, found {:?}",
-                other_value
-            );
-                    }
+                    _ => {}
                 },
                 (Comparator::NotContains, Some(QueryValue::String(expected_substring))) => {
                     if let Value::String(actual_str) = val {
                         if !actual_str.contains(expected_substring) {
                             return true;
-                        } else {
-                            println!("failed at `not_contains` check");
                         }
-                    } else {
-                        println!("failed at `not_contains` check");
                     }
                 }
                 (Comparator::In, Some(QueryValue::Array(expected_array))) => {
                     for expected_val in expected_array {
                         if self.compare_values(val, expected_val) {
                             return true;
-                        } else {
-                            println!("failed at `in` check");
                         }
                     }
                 }
@@ -203,8 +146,6 @@ impl Comparator {
                     }
                     if !found {
                         return true;
-                    } else {
-                        println!("failed at `not_in` check");
                     }
                 }
                 (Comparator::HasAll, Some(QueryValue::Array(expected_array))) => {
@@ -226,8 +167,6 @@ impl Comparator {
                         if all_found {
                             return true;
                         }
-                    } else {
-                        println!("failed at `has_all` check");
                     }
                 }
                 (Comparator::HasAny, Some(QueryValue::Array(expected_array))) => {
@@ -236,13 +175,9 @@ impl Comparator {
                             for actual_val in actual_array {
                                 if self.compare_values(actual_val, expected_val) {
                                     return true;
-                                } else {
-                                    println!("failed at `has_any` check");
                                 }
                             }
                         }
-                    } else {
-                        println!("failed at `has_any` check");
                     }
                 }
                 (Comparator::HasNone, Some(QueryValue::Array(expected_array))) => {
@@ -262,14 +197,11 @@ impl Comparator {
                         if none_found {
                             return true;
                         }
-                    } else {
-                        println!("failed at `has_none` check");
                     }
                 }
                 (Comparator::Length, Some(expected_length)) => {
                     if let Value::Array(actual_array) = val {
                         if self.compare_numbers(
-                            //&Value::Number(actual_array.len() as f64),
                             &Value::Number(
                                 serde_json::Number::from_f64(actual_array.len() as f64)
                                     .unwrap_or(serde_json::Number::from_f64(0.0).unwrap()),
@@ -278,33 +210,21 @@ impl Comparator {
                             |a, b| a == b,
                         ) {
                             return true;
-                        } else {
-                            println!("failed at `length` check");
                         }
-                    } else {
-                        println!("failed at `length` check");
                     }
                 }
                 (Comparator::Empty, None) => {
                     if let Value::Array(actual_array) = val {
                         if actual_array.is_empty() {
                             return true;
-                        } else {
-                            println!("failed at `empty` check");
                         }
-                    } else {
-                        println!("failed at `empty` check");
                     }
                 }
                 (Comparator::NotEmpty, None) => {
                     if let Value::Array(actual_array) = val {
                         if !actual_array.is_empty() {
                             return true;
-                        } else {
-                            println!("failed at `not_empty` check");
                         }
-                    } else {
-                        println!("failed at `not_empty` check");
                     }
                 }
                 (Comparator::Between, Some(QueryValue::Array(expected_range))) => {
@@ -316,14 +236,8 @@ impl Comparator {
                                 && self.compare_numbers(val, end, |a, b| a <= b)
                             {
                                 return true;
-                            } else {
-                                println!("failed at `between` check");
                             }
-                        } else {
-                            println!("failed at `between` check");
                         }
-                    } else {
-                        println!("failed at `between` check");
                     }
                 }
                 (Comparator::NotBetween, Some(QueryValue::Array(expected_range))) => {
@@ -335,14 +249,8 @@ impl Comparator {
                                 && self.compare_numbers(val, end, |a, b| a <= b))
                             {
                                 return true;
-                            } else {
-                                println!("failed at `not_between` check");
                             }
-                        } else {
-                            println!("failed at `not_between` check");
                         }
-                    } else {
-                        println!("failed at `not_between` check");
                     }
                 }
                 (Comparator::IsMultipleOf, Some(expected_multiple)) => {
@@ -351,11 +259,7 @@ impl Comparator {
                     {
                         if actual_num.as_f64().unwrap_or_default() % expected_num == 0.0 {
                             return true;
-                        } else {
-                            println!("failed at `is_multiple_of` check");
                         }
-                    } else {
-                        println!("failed at `is_multiple_of` check");
                     }
                 }
                 (Comparator::IsDivisibleBy, Some(expected_divisor)) => {
@@ -366,33 +270,21 @@ impl Comparator {
                             && actual_num.as_f64().unwrap_or_default() % expected_num == 0.0
                         {
                             return true;
-                        } else {
-                            println!("failed at `is_divisible_by` check");
                         }
-                    } else {
-                        println!("failed at `is_divisible_by` check");
                     }
                 }
                 (Comparator::Before, Some(QueryValue::DateTime(expected))) => {
                     if let Value::String(actual_str) = val {
                         if let Ok(actual) = DateTime::parse_from_rfc3339(actual_str) {
                             return actual.with_timezone(&Utc) < *expected;
-                        } else {
-                            println!("failed at `before` check");
                         }
-                    } else {
-                        println!("failed at `before` check");
                     }
                 }
                 (Comparator::After, Some(QueryValue::DateTime(expected))) => {
                     if let Value::String(actual_str) = val {
                         if let Ok(actual) = DateTime::parse_from_rfc3339(actual_str) {
                             return actual.with_timezone(&Utc) > *expected;
-                        } else {
-                            println!("failed at `after` check");
                         }
-                    } else {
-                        println!("failed at `after` check");
                     }
                 }
                 (Comparator::SameDay, Some(QueryValue::DateTime(expected))) => {
@@ -402,11 +294,7 @@ impl Comparator {
                             return actual_utc.year() == expected.year()
                                 && actual_utc.month() == expected.month()
                                 && actual_utc.day() == expected.day();
-                        } else {
-                            println!("failed at `same_day` check");
                         }
-                    } else {
-                        println!("failed at `same_day` check");
                     }
                 }
                 /*(Comparator::DurationBetween, Some(unit, other_field_str, expected_duration)) => {
