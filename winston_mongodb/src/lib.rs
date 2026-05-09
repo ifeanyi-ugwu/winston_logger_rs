@@ -587,7 +587,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_dsl_query_filter_with_mongodb() {
-        use winston_transport::query_dsl::dlc::alpha::a::prelude::*;
+        use winston_transport::query_dsl::prelude::*;
         use winston_transport::{and, field_logic as fl, field_query as fq};
 
         dotenv::dotenv().ok();

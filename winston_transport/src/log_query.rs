@@ -3,7 +3,7 @@ use parse_datetime::parse_datetime;
 use regex::Regex;
 use std::str::FromStr;
 
-use crate::query_dsl::dlc::alpha::a::QueryNode;
+use crate::query_dsl::QueryNode;
 #[derive(Debug, Clone)]
 pub struct LogQuery {
     pub from: Option<DateTime<Utc>>,

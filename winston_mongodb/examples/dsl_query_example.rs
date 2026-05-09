@@ -1,7 +1,7 @@
 // Import the macros from winston_transport
 use winston_transport::{and, field_logic, field_query, or};
 // Import the comparison functions from the prelude
-use winston_transport::query_dsl::dlc::alpha::a::prelude::*;
+use winston_transport::query_dsl::prelude::*;
 use winston_transport::LogQuery;
 
 // This example demonstrates how to use the DSL query filter with MongoDB transport

@@ -6,7 +6,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::str::FromStr;
 
-use super::alpha::a::QueryNode;
+use super::QueryNode;
 
 #[derive(Debug)]
 pub struct LogQuery {
@@ -173,7 +173,7 @@ impl LogQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_dsl::dlc::alpha::a::prelude::*;
+    use crate::query_dsl::prelude::*;
     use crate::{and, field_logic as fl, field_query as fq};
     use serde_json::json;
 

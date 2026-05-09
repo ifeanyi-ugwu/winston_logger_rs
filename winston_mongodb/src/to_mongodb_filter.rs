@@ -1,5 +1,5 @@
 use mongodb::bson::{doc, Bson, Document};
-use winston_transport::query_dsl::dlc::alpha::a::{
+use winston_transport::query_dsl::{
     comparator::Comparator, field_comparisons::FieldComparison, FieldLogic, FieldNode,
     FieldQueryNode, LogicalOperator, QueryLogicNode, QueryNode, QueryValue,
 };
@@ -125,9 +125,9 @@ impl ToMongoDbFilter for FieldComparison {
 
 // Helper function to convert FieldPath to a string representation
 fn field_path_to_string(
-    path: &winston_transport::query_dsl::dlc::alpha::a::field_path::FieldPath,
+    path: &winston_transport::query_dsl::field_path::FieldPath,
 ) -> String {
-    use winston_transport::query_dsl::dlc::alpha::a::field_path::PathSegment;
+    use winston_transport::query_dsl::field_path::PathSegment;
 
     path.segments
         .iter()
