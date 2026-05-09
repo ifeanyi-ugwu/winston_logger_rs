@@ -33,7 +33,6 @@ pub enum Comparator {
     Before,
     After,
     SameDay,
-    //DurationBetween,
     Function,
 }
 
@@ -297,65 +296,6 @@ impl Comparator {
                         }
                     }
                 }
-                /*(Comparator::DurationBetween, Some(unit, other_field_str, expected_duration)) => {
-                    let actual_date_str = match val {
-                        Value::String(date_str) => date_str,
-                        _ => {
-                            println!("failed at `DurationBetween` check: actual_date not a string");
-                            return false;
-                        }
-                    };
-
-                    let actual_date = match DateTime::parse_from_rfc3339(&actual_date_str) {
-                        Ok(date) => date.with_timezone(&Utc),
-                        Err(_) => {
-                            println!("failed at `DurationBetween` check: invalid actual_date");
-                            return false;
-                        }
-                    };
-
-                    let other_field_path =
-                        match <FieldPath as std::str::FromStr>::from_str(other_field_str) {
-                            Ok(path) => path,
-                            Err(_) => {
-                                println!(
-                                    "failed at `DurationBetween` check: invalid other_field_path"
-                                );
-                                return false;
-                            }
-                        };
-
-                    let matching_other_values = other_field_path.extract_refs(value);
-
-                    let other_date_str = match matching_other_values.first() {
-                        Some(Value::String(date_str)) => date_str,
-                        _ => {
-                            println!("failed at `DurationBetween` check: other_date not found or not a string");
-                            return false;
-                        }
-                    };
-
-                    let other_date = match DateTime::parse_from_rfc3339(other_date_str) {
-                        Ok(date) => date.with_timezone(&Utc),
-                        Err(_) => {
-                            println!("failed at `DurationBetween` check: invalid other_date");
-                            return false;
-                        }
-                    };
-
-                    let diff = actual_date.signed_duration_since(other_date).abs();
-
-                    return match unit.as_str() {
-                        "days" => diff.num_days() <= expected_duration.num_days(),
-                        "hours" => diff.num_hours() <= expected_duration.num_hours(),
-                        "minutes" => diff.num_minutes() <= expected_duration.num_minutes(),
-                        "seconds" => diff.num_seconds() <= expected_duration.num_seconds(),
-                        _ => {
-                            println!("failed at `DurationBetween` check: invalid unit");
-                            false
-                        }
-                    };
-                }*/
                 (Comparator::Function, Some(QueryValue::Function(func))) if func(val) => {
                     return true;
                 }
