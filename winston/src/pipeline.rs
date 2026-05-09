@@ -32,6 +32,39 @@ pub fn default_spawner() -> SpawnFn {
     })
 }
 
+/// Single-threaded spawner: every spawned future runs on one shared OS thread,
+/// multiplexed cooperatively via a `FuturesUnordered` set.
+///
+/// Use this when all transports are fully async / non-blocking. A transport
+/// that performs synchronous blocking I/O inside `poll` will stall every other
+/// task on the executor — pick `default_spawner` instead in that case.
+pub fn single_threaded_spawner() -> SpawnFn {
+    type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+    let (tx, rx) = fmpsc::unbounded::<BoxFuture>();
+    std::thread::Builder::new()
+        .name("winston-executor".into())
+        .spawn(move || {
+            futures::executor::block_on(async move {
+                let mut rx = rx;
+                let mut tasks = futures::stream::FuturesUnordered::<BoxFuture>::new();
+                loop {
+                    futures::select! {
+                        incoming = rx.next() => match incoming {
+                            Some(fut) => tasks.push(fut),
+                            None => break,
+                        },
+                        _ = tasks.select_next_some() => {},
+                    }
+                }
+                while tasks.next().await.is_some() {}
+            });
+        })
+        .expect("failed to spawn winston executor thread");
+    Arc::new(move |fut| {
+        let _ = tx.unbounded_send(fut);
+    })
+}
+
 // ── Messages flowing through the main pipeline ──────────────────────────────
 
 pub enum PipelineMessage {
