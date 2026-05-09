@@ -4,6 +4,7 @@ use crate::{
     logger_transport::{IntoLoggerTransport, LoggerTransport},
     pipeline::{self, PipelineMessage},
 };
+use winston_transport::AsyncTransport;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use futures::channel::mpsc as fmpsc;
 use logform::LogInfo;
@@ -426,7 +427,12 @@ impl Logger {
 
         if let Some(transports) = &state.options.transports {
             for (_handle, transport) in transports {
-                match transport.get_transport().query(options) {
+                // Async transports don't expose a sync query path yet;
+                // skip them until the async query refactor lands.
+                let Some(sync_t) = transport.as_sync() else {
+                    continue;
+                };
+                match sync_t.query(options) {
                     Ok(mut logs) => results.append(&mut logs),
                     Err(e) => return Err(format!("Query failed: {}", e)),
                 }
@@ -445,6 +451,18 @@ impl Logger {
         TransportBuilder {
             logger: self,
             logger_transport: LoggerTransport::new(transport),
+        }
+    }
+
+    /// Async counterpart of [`Logger::transport`]. Returns a builder for an
+    /// async-native transport (HTTP, async DB, ...).  See `AsyncTransport`.
+    pub fn transport_async(
+        &self,
+        transport: impl AsyncTransport<LogInfo> + 'static,
+    ) -> TransportBuilder<'_> {
+        TransportBuilder {
+            logger: self,
+            logger_transport: LoggerTransport::new_async(transport),
         }
     }
 

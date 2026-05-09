@@ -14,8 +14,10 @@ use whatwg_streams::{
 };
 
 use crate::{
-    logger::TransportHandle, logger_levels::LoggerLevels, logger_options::LoggerOptions,
-    logger_transport::LoggerTransport,
+    logger::TransportHandle,
+    logger_levels::LoggerLevels,
+    logger_options::LoggerOptions,
+    logger_transport::{LoggerTransport, TransportKind},
 };
 
 /// A runtime-agnostic task spawner.  Pass `tokio::runtime::Handle::spawn`,
@@ -350,11 +352,24 @@ async fn run_transport_task(
                     (None, None) => Some((*entry).clone()),
                 };
                 if let Some(info) = formatted {
-                    transport.get_transport().log(info);
+                    match transport.kind() {
+                        TransportKind::Sync(t) => t.log(info),
+                        // Awaiting sequentially preserves per-transport order;
+                        // cross-transport concurrency comes from each transport
+                        // running on its own task.
+                        TransportKind::Async(t) => t.log(info).await,
+                    }
                 }
             }
             TransportMessage::Flush(tx) => {
-                let _ = transport.get_transport().flush();
+                match transport.kind() {
+                    TransportKind::Sync(t) => {
+                        let _ = t.flush();
+                    }
+                    TransportKind::Async(t) => {
+                        let _ = t.flush().await;
+                    }
+                }
                 let _ = tx.send(());
             }
         }

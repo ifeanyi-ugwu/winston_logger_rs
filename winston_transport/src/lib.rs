@@ -7,4 +7,4 @@ pub mod transport_adapters;
 
 pub use log_query::{LogQuery, Order};
 pub use logform::{Format, LogInfo};
-pub use transport::Transport;
+pub use transport::{AsyncTransport, Transport};
