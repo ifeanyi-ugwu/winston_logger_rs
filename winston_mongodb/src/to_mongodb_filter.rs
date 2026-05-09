@@ -124,9 +124,7 @@ impl ToMongoDbFilter for FieldComparison {
 }
 
 // Helper function to convert FieldPath to a string representation
-fn field_path_to_string(
-    path: &winston_transport::query_dsl::field_path::FieldPath,
-) -> String {
+fn field_path_to_string(path: &winston_transport::query_dsl::field_path::FieldPath) -> String {
     use winston_transport::query_dsl::field_path::PathSegment;
 
     path.segments
@@ -152,7 +150,9 @@ fn value_to_bson(query_value: &QueryValue) -> Bson {
                 // u64 values above i64::MAX don't fit in BSON's signed Int64;
                 // fall back to Double which matches the storage shape MongoDB
                 // would coerce to anyway.
-                i64::try_from(u).map(Bson::Int64).unwrap_or(Bson::Double(u as f64))
+                i64::try_from(u)
+                    .map(Bson::Int64)
+                    .unwrap_or(Bson::Double(u as f64))
             } else {
                 Bson::Double(n.as_f64().unwrap_or(0.0))
             }

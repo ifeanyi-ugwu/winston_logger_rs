@@ -125,7 +125,9 @@ impl TryFrom<HashMap<String, Value>> for FieldNode {
                         )),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(FieldNode::Logic(FieldLogic::new(operator).with_nodes(children)))
+                Ok(FieldNode::Logic(
+                    FieldLogic::new(operator).with_nodes(children),
+                ))
             }
             _ => {
                 let val = QueryValue::from(value);
