@@ -31,7 +31,9 @@ use whatwg_streams::{
     ReadableSource, ReadableStreamDefaultController, StreamError, StreamResult, WritableSink,
     WritableStreamDefaultController,
 };
-use winston_transport::{DynQueryHandle, DynReadableSource, LogQuery, Order, Transport};
+use winston_transport::{
+    DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Order, Transport,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LogDocument {
@@ -138,6 +140,55 @@ impl Transport for MongoDBTransport {
         Some(Box::new(MongoDBQueryHandle {
             options: self.options.clone(),
         }))
+    }
+
+    fn ingest_handle(&self) -> Option<Box<dyn DynIngestHandle>> {
+        Some(Box::new(MongoDBIngestHandle {
+            options: self.options.clone(),
+        }))
+    }
+}
+
+/// Out-of-band ingest target. Each call opens a fresh client + collection and
+/// runs `insert_many` for the batch — independent of the live transport's
+/// client. Suitable for low/medium-frequency proxy flows; for high-frequency
+/// proxying you'd want to cache the client across calls.
+pub struct MongoDBIngestHandle {
+    options: MongoDBOptions,
+}
+
+impl DynIngestHandle for MongoDBIngestHandle {
+    fn ingest<'s>(
+        &'s self,
+        logs: Vec<LogInfo>,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+        Box::pin(async move {
+            if logs.is_empty() {
+                return Ok(());
+            }
+            let client = Client::with_uri_str(&self.options.connection_string)
+                .await
+                .map_err(StreamError::other)?;
+            let collection: Collection<LogDocument> = client
+                .database(&self.options.database)
+                .collection(&self.options.collection);
+
+            let docs: Vec<LogDocument> = logs
+                .into_iter()
+                .map(|info| LogDocument {
+                    timestamp: Utc::now(),
+                    level: info.level,
+                    message: info.message,
+                    meta: info.meta,
+                })
+                .collect();
+
+            collection
+                .insert_many(docs)
+                .await
+                .map_err(StreamError::other)?;
+            Ok(())
+        })
     }
 }
 
@@ -474,6 +525,64 @@ mod tests {
             .database(&options.database)
             .collection(&options.collection);
         coll.delete_many(doc! { "message": { "$regex": "^query_streams_results" } })
+            .await
+            .unwrap();
+    }
+
+    /// Verifies `ingest_handle`: extract a handle, ingest a batch, confirm
+    /// the entries land in the collection. The legacy `Proxy::ingest`
+    /// equivalent: out-of-band batch acceptance from another transport.
+    #[tokio::test]
+    async fn ingest_handle_inserts_batch() {
+        let Some(uri) = require_uri() else { return };
+
+        let options = MongoDBOptions {
+            connection_string: uri.clone(),
+            database: "winston_mongodb_test_db".to_string(),
+            collection: "logs_ingest".to_string(),
+        };
+
+        // Cleanup any leftover entries from prior runs.
+        let client = Client::with_uri_str(&options.connection_string).await.unwrap();
+        let coll: Collection<LogDocument> = client
+            .database(&options.database)
+            .collection(&options.collection);
+        coll.delete_many(doc! { "message": { "$regex": "^ingest_handle_inserts" } })
+            .await
+            .unwrap();
+
+        let transport = MongoDBTransport::new(options.clone());
+        let handle = transport.ingest_handle().expect("ingest_handle is Some");
+
+        handle
+            .ingest(vec![
+                LogInfo::new("info", "ingest_handle_inserts a"),
+                LogInfo::new("warn", "ingest_handle_inserts b"),
+            ])
+            .await
+            .expect("ingest");
+
+        // Verify both ended up in the collection.
+        use futures::TryStreamExt;
+        let mut cursor = coll
+            .find(doc! { "message": { "$regex": "^ingest_handle_inserts" } })
+            .await
+            .unwrap();
+        let mut found = Vec::new();
+        while let Some(doc) = cursor.try_next().await.unwrap() {
+            found.push(doc.message);
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "ingest_handle_inserts a".to_string(),
+                "ingest_handle_inserts b".to_string(),
+            ]
+        );
+
+        // Cleanup
+        coll.delete_many(doc! { "message": { "$regex": "^ingest_handle_inserts" } })
             .await
             .unwrap();
     }

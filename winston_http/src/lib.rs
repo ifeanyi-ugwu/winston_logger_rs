@@ -19,7 +19,7 @@ use logform::LogInfo;
 use reqwest::Client;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 use whatwg_streams::{StreamError, StreamResult, WritableSink, WritableStreamDefaultController};
-use winston_transport::Transport;
+use winston_transport::{DynIngestHandle, Transport};
 
 #[derive(Clone)]
 pub struct HttpTransportOptions {
@@ -121,6 +121,59 @@ impl WritableSink<LogInfo> for HttpTransport {
 
 impl Transport for HttpTransport {
     // No query — HTTP transport doesn't keep a local log store.
+
+    fn ingest_handle(&self) -> Option<Box<dyn DynIngestHandle>> {
+        Some(Box::new(HttpIngestHandle {
+            client: self.client.clone(),
+            url: self.options.url.clone(),
+            headers: self.options.headers.clone(),
+        }))
+    }
+}
+
+/// Out-of-band ingest target. Each call POSTs the batch as a single JSON
+/// payload — single entry as an object, multi-entry as an array — matching
+/// the wire shape of the live transport's batched send.
+struct HttpIngestHandle {
+    client: Client,
+    url: String,
+    headers: Option<HashMap<String, String>>,
+}
+
+impl DynIngestHandle for HttpIngestHandle {
+    fn ingest<'s>(
+        &'s self,
+        logs: Vec<LogInfo>,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+        Box::pin(async move {
+            if logs.is_empty() {
+                return Ok(());
+            }
+            let mut request = self.client.post(&self.url);
+            if let Some(headers) = &self.headers {
+                for (key, value) in headers {
+                    request = request.header(key, value);
+                }
+            }
+            let response = if logs.len() == 1 {
+                request.json(&logs[0].to_flat_value())
+            } else {
+                let flat: Vec<_> = logs.iter().map(|log| log.to_flat_value()).collect();
+                request.json(&flat)
+            }
+            .send()
+            .await
+            .map_err(StreamError::other)?;
+
+            if !response.status().is_success() {
+                return Err(StreamError::from(format!(
+                    "HTTP error: {}",
+                    response.status()
+                )));
+            }
+            Ok(())
+        })
+    }
 }
 
 pub struct HttpTransportBuilder {
@@ -447,6 +500,45 @@ mod tests {
         assert!(
             body.get("timestamp").is_some(),
             "Timestamp should be at root level"
+        );
+    }
+
+    /// Verifies `ingest_handle`: extract a handle, ingest a batch, confirm
+    /// the mock server received a single batched JSON array. The live sink
+    /// is not used in this path — out-of-band ingestion only.
+    #[tokio::test]
+    async fn ingest_handle_posts_batch() {
+        let received_data = Arc::new(Mutex::new(Vec::new()));
+        let port = 8084;
+        run_mock_server(received_data.clone(), None, port);
+        let url = format!("http://127.0.0.1:{}", port);
+
+        let transport = HttpTransport::builder().url(&url).build();
+        let handle = transport.ingest_handle().expect("ingest_handle is Some");
+
+        let log_a = timestamp()
+            .transform(LogInfo::new("info", "ingest a"))
+            .unwrap();
+        let log_b = timestamp()
+            .transform(LogInfo::new("warn", "ingest b"))
+            .unwrap();
+        handle.ingest(vec![log_a, log_b]).await.expect("ingest");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let received = received_data.lock().unwrap();
+        let batch = received
+            .first()
+            .and_then(|v| v.as_array())
+            .expect("ingest sends a JSON array for >1 entry");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            batch[0].get("message").and_then(Value::as_str),
+            Some("ingest a")
+        );
+        assert_eq!(
+            batch[1].get("message").and_then(Value::as_str),
+            Some("ingest b")
         );
     }
 }

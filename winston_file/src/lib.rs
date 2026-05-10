@@ -11,7 +11,10 @@ use whatwg_streams::{
     ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
     WritableStreamDefaultController,
 };
-use winston_transport::{DynQueryHandle, DynReadableSource, LogQuery, Transport};
+use std::future::Future;
+use std::pin::Pin;
+use whatwg_streams::StreamError;
+use winston_transport::{DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Transport};
 
 // ── Options / builder ────────────────────────────────────────────────────────
 
@@ -99,6 +102,12 @@ impl Transport for FileTransport {
             path: self.path.clone(),
         }))
     }
+
+    fn ingest_handle(&self) -> Option<Box<dyn DynIngestHandle>> {
+        Some(Box::new(FileIngestHandle {
+            path: self.path.clone(),
+        }))
+    }
 }
 
 /// Read-only handle the Logger keeps after the transport's writer half has
@@ -117,6 +126,38 @@ impl DynQueryHandle for FileQueryHandle {
             visited: 0,
             emitted: 0,
         }))
+    }
+}
+
+/// Out-of-band ingest target. Each call opens a fresh append-mode file
+/// handle, writes every entry as a line, flushes, and closes. Safe to run
+/// concurrently with the live `WritableSink` writer because POSIX `O_APPEND`
+/// guarantees atomic appends per write call (within `PIPE_BUF`).
+struct FileIngestHandle {
+    path: PathBuf,
+}
+
+impl DynIngestHandle for FileIngestHandle {
+    fn ingest<'s>(
+        &'s self,
+        logs: Vec<LogInfo>,
+    ) -> Pin<Box<dyn Future<Output = whatwg_streams::StreamResult<()>> + Send + 's>> {
+        Box::pin(async move {
+            if logs.is_empty() {
+                return Ok(());
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(StreamError::other)?;
+            let mut writer = BufWriter::new(file);
+            for entry in logs {
+                writeln!(&mut writer, "{}", entry).map_err(StreamError::other)?;
+            }
+            writer.flush().map_err(StreamError::other)?;
+            Ok(())
+        })
     }
 }
 
@@ -383,6 +424,35 @@ mod tests {
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0].message, "first");
         assert_eq!(collected[1].message, "third");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Verifies `ingest_handle`: extract a handle, ingest a batch, confirm
+    /// the entries land in the file. Mirrors the legacy `Proxy::ingest`
+    /// use case (out-of-band batch acceptance).
+    #[test]
+    fn ingest_handle_appends_batch_to_file() {
+        let path = unique_path("ingest");
+        let _ = std::fs::remove_file(&path);
+
+        let transport = FileTransport::builder().filename(&path).build();
+        let handle = transport.ingest_handle().expect("ingest_handle is Some");
+
+        futures::executor::block_on(async {
+            handle
+                .ingest(vec![
+                    json_log("info", "first"),
+                    json_log("warn", "second"),
+                ])
+                .await
+                .expect("ingest");
+        });
+        drop(transport);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("first"));
+        assert!(contents.contains("second"));
 
         let _ = std::fs::remove_file(&path);
     }

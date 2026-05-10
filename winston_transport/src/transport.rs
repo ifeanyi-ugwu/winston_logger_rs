@@ -12,25 +12,43 @@ use crate::log_query::LogQuery;
 /// A transport is a `WritableSink<LogInfo>` that the pipeline drives through a
 /// `WritableStream` — writes are serialized into the sink and backpressure is
 /// applied by the stream's queuing strategy. Optionally a transport exposes a
-/// streaming query through [`Transport::query_handle`].
+/// streaming query through [`Transport::query_handle`] and an out-of-band
+/// ingestion endpoint through [`Transport::ingest_handle`].
 ///
 /// There is no longer a sync/async split. Sinks whose work is synchronous just
 /// do `async fn write(...) { sync_work(); Ok(()) }` and the future returns
 /// ready immediately; sinks that perform real async I/O `await` it inside
 /// `write`.
 ///
-/// # Why query is a separate handle
+/// # Why query and ingest are separate handles
 ///
 /// `WritableSink::write` takes `&mut self` and the `WritableStream` owns the
 /// sink for its lifetime, so once the Logger spawns a transport's stream, the
-/// transport instance itself is no longer accessible. Query nevertheless has
-/// to keep working — it scans past entries from the underlying store. The
-/// solution is to *extract* a [`DynQueryHandle`] from the transport before
-/// consuming it. The handle holds whatever stateless config the query needs
-/// (a file path, a DB connection, an HTTP base URL) and opens a fresh
-/// [`ReadableSource`] per call. Default `query_handle` returns `None`.
+/// transport instance itself is no longer accessible. Query and out-of-band
+/// ingest nevertheless have to keep working — query scans past entries from
+/// the underlying store; ingest accepts a batch produced elsewhere (e.g., by
+/// a periodic proxy from another transport).
+///
+/// The solution is to *extract* handles from the transport before consuming
+/// it. The handles hold whatever stateless config their work needs (a file
+/// path, a DB connection string, an HTTP client + URL) and open whatever
+/// per-call resources they need (a fresh cursor, a fresh append-mode file
+/// handle, a single batched POST). Default both return `None`.
 pub trait Transport: WritableSink<LogInfo> + Send + Sync + 'static {
     fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
+        None
+    }
+
+    /// Long-lived handle the Logger keeps after the transport's writer half
+    /// is consumed by the `WritableStream`. Each `ingest(batch)` call accepts
+    /// a `Vec<LogInfo>` and writes it to the transport's underlying store,
+    /// independent of the live `WritableSink` path the Logger is feeding.
+    ///
+    /// Used to implement transport-to-transport proxying: drain a source
+    /// transport's accumulated logs (via `query_handle`) and feed them into
+    /// a target's `ingest_handle`. Default returns `None` for transports
+    /// that aren't sensible ingestion targets (stdout/stderr, etc.).
+    fn ingest_handle(&self) -> Option<Box<dyn DynIngestHandle>> {
         None
     }
 }
@@ -40,6 +58,20 @@ pub trait Transport: WritableSink<LogInfo> + Send + Sync + 'static {
 /// streaming source over the underlying store.
 pub trait DynQueryHandle: Send + Sync + 'static {
     fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>>;
+}
+
+/// Handle for out-of-band batch ingestion into a transport. Holds clonable
+/// config (URL+client, file path, DB connection string) and writes each batch
+/// to the underlying store independently of the live `WritableSink` path.
+///
+/// Implementations should be safe to call concurrently with the transport's
+/// live `write` — typically by opening their own per-call resources rather
+/// than sharing mutable state with the live writer.
+pub trait DynIngestHandle: Send + Sync + 'static {
+    fn ingest<'s>(
+        &'s self,
+        logs: Vec<LogInfo>,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>>;
 }
 
 /// Object-safe wrapper for [`ReadableSource<LogInfo>`].

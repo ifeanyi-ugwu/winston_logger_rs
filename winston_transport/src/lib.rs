@@ -4,4 +4,6 @@ mod transport;
 
 pub use log_query::{LogQuery, Order};
 pub use logform::{Format, LogInfo};
-pub use transport::{BoxedReadableSource, DynQueryHandle, DynReadableSource, Transport};
+pub use transport::{
+    BoxedReadableSource, DynIngestHandle, DynQueryHandle, DynReadableSource, Transport,
+};
