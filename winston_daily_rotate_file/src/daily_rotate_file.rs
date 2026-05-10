@@ -4,6 +4,7 @@ use logform::LogInfo;
 use std::fs::{create_dir_all, read_dir, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
 use winston_transport::Transport;
 
@@ -32,6 +33,10 @@ pub struct DailyRotateFile {
     options: DailyRotateFileOptions,
     last_rotation: DateTime<Utc>,
     file_path: PathBuf,
+    /// Shared with [`DailyRotateRotationHandle`]s for observing the current
+    /// active file. Updated under lock during `rotate()` (rare); read by
+    /// `list_rotated_files`. No contention with the write hot path.
+    active_path_shared: Arc<RwLock<PathBuf>>,
 }
 
 impl DailyRotateFile {
@@ -48,12 +53,28 @@ impl DailyRotateFile {
             writer: BufWriter::new(file),
             options,
             last_rotation: current_date,
+            active_path_shared: Arc::new(RwLock::new(path.clone())),
             file_path: path,
         })
     }
 
     pub fn builder() -> DailyRotateFileBuilder {
         DailyRotateFileBuilder::new()
+    }
+
+    /// Extract a handle for observing rotation. Use it to list already-rotated
+    /// (no longer active) log files for shipping/archiving — see
+    /// [`DailyRotateRotationHandle::list_rotated_files`].
+    ///
+    /// Pull this off the transport before handing it to a Logger; once the
+    /// Logger consumes the transport into its `WritableStream`, the transport
+    /// instance is no longer accessible.
+    pub fn rotation_handle(&self) -> DailyRotateRotationHandle {
+        DailyRotateRotationHandle {
+            dirname: self.options.dirname.clone(),
+            filename: self.options.filename.clone(),
+            active_path: Arc::clone(&self.active_path_shared),
+        }
     }
 
     fn create_file(
@@ -175,8 +196,13 @@ impl DailyRotateFile {
 
         let (new_file, new_path) = Self::create_file(&self.options, &now)?;
         self.writer = BufWriter::new(new_file);
-        self.file_path = new_path;
+        self.file_path = new_path.clone();
         self.last_rotation = now;
+        // Publish the new active path so any rotation handle's
+        // `list_rotated_files` correctly excludes it.
+        if let Ok(mut guard) = self.active_path_shared.write() {
+            *guard = new_path;
+        }
 
         if self.options.zipped_archive {
             if let Err(e) = Self::compress_file(&previous_file_path) {
@@ -353,6 +379,87 @@ impl Transport for DailyRotateFile {
     // means past entries live in N files (and possibly .gz archives) that the
     // transport doesn't track centrally. If you need query, log to a regular
     // `winston_file::FileTransport` (which keeps a single file) alongside.
+}
+
+/// Long-lived handle the user keeps after the transport is consumed by the
+/// Logger's `WritableStream`. Use it to enumerate already-rotated (no longer
+/// active) log files for shipping/archiving.
+///
+/// # Recommended pattern: ship rotated logs to a remote target
+///
+/// ```ignore
+/// # use winston_daily_rotate_file::DailyRotateFile;
+/// # use winston::Logger;
+/// # use winston_transport::Transport;
+/// let drf = DailyRotateFile::builder()
+///     .filename("/var/log/app.log")
+///     .max_files(10)
+///     .build()
+///     .unwrap();
+/// let rotation = drf.rotation_handle();   // pull this off before...
+/// let logger = Logger::builder().transport(drf).build();
+/// // ...the transport is moved.
+///
+/// // Periodically (e.g. on a timer):
+/// for path in rotation.list_rotated_files()? {
+///     // open `path` as a stream of LogInfo, pipe into your target
+///     // (HttpTransport / MongoDBTransport / etc.) via its ingest_handle,
+///     // then std::fs::remove_file(&path)?;
+/// }
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub struct DailyRotateRotationHandle {
+    dirname: Option<PathBuf>,
+    filename: PathBuf,
+    /// Shared with the live transport — `rotate()` updates this so the
+    /// listing always excludes the current active file even after rotations.
+    active_path: Arc<RwLock<PathBuf>>,
+}
+
+impl DailyRotateRotationHandle {
+    /// Returns paths of every rotated log file (plain or `.gz`) the transport
+    /// has produced and not yet been cleaned up by `max_files`. The currently
+    /// active file is excluded.
+    ///
+    /// Files are returned in arbitrary order — sort by mtime if you want
+    /// oldest-first shipping.
+    pub fn list_rotated_files(&self) -> std::io::Result<Vec<PathBuf>> {
+        let log_dir = self
+            .dirname
+            .as_deref()
+            .or_else(|| self.filename.parent())
+            .unwrap_or_else(|| Path::new("."));
+
+        let base_name = self
+            .filename
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("log");
+
+        let active = self.active_path.read().ok().map(|p| p.clone());
+
+        let mut rotated = Vec::new();
+        for entry in read_dir(log_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            // Match the same patterns the rotation logic produces:
+            // "<base>.<date>", "<base>_<n>.<date>", and their `.gz` variants.
+            let matches = filename.starts_with(&format!("{}.", base_name))
+                || filename.starts_with(&format!("{}_", base_name));
+            if !matches {
+                continue;
+            }
+            if active.as_ref().map(|a| a == &path).unwrap_or(false) {
+                continue;
+            }
+            rotated.push(path);
+        }
+        Ok(rotated)
+    }
 }
 
 pub struct DailyRotateFileBuilder {
@@ -636,5 +743,72 @@ mod tests {
             .collect();
 
         assert_eq!(files.len(), 2, "Expected exactly 2 log files after cleanup");
+    }
+
+    /// Verifies that `rotation_handle().list_rotated_files()` returns every
+    /// non-active log file produced by rotation, and that the active file
+    /// (which is being written to) is excluded. The end-to-end shape:
+    /// extract the handle, drive several rotations, list — confirm the
+    /// listing matches the on-disk rotated files minus the active one.
+    #[test]
+    fn rotation_handle_lists_rotated_files() {
+        let temp_dir = setup_temp_dir();
+        let log_path = temp_dir.path().join("test.log");
+
+        let transport = DailyRotateFile::builder()
+            .filename(&log_path)
+            .date_pattern("%Y-%m-%d_%H-%M-%S")
+            .build()
+            .expect("Failed to create transport");
+
+        // Pull the handle off before the WritableStream consumes the transport.
+        let rotation = transport.rotation_handle();
+
+        // Force three rotations by writing across one-second boundaries.
+        drive(transport, |writer| async move {
+            writer
+                .write(LogInfo::new("info", "first"))
+                .await
+                .expect("write");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            writer
+                .write(LogInfo::new("info", "second"))
+                .await
+                .expect("write");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            writer
+                .write(LogInfo::new("info", "third"))
+                .await
+                .expect("write");
+            writer.close().await.expect("close");
+        });
+
+        // Three writes across two rotation boundaries → three log files on
+        // disk (one per second). After `close()`, the most recently active
+        // file is the third one.
+        let on_disk: Vec<_> = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(on_disk.len(), 3, "expected three rotated files on disk");
+
+        // The handle should list two of those three — everything except the
+        // last-active.
+        let rotated = rotation
+            .list_rotated_files()
+            .expect("list_rotated_files");
+        assert_eq!(
+            rotated.len(),
+            2,
+            "expected 2 rotated (non-active) files, got: {rotated:?}"
+        );
+
+        // None of the listed files should be the active path.
+        let active = rotation.active_path.read().unwrap().clone();
+        for path in &rotated {
+            assert_ne!(path, &active, "list must exclude the active file");
+        }
     }
 }
