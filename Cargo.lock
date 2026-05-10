@@ -3457,6 +3457,7 @@ dependencies = [
  "logform",
  "tempfile",
  "whatwg_streams",
+ "winston_file",
  "winston_transport",
 ]
 

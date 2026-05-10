@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use dateparser::parse;
@@ -172,13 +172,29 @@ impl DynIngestHandle for FileIngestHandle {
 /// append-only logs); honoring `Order::Descending` would require reading the
 /// whole file first, which defeats streaming. Consumers that need a specific
 /// order should collect the stream and sort.
-struct FileSource {
+pub struct FileSource {
     reader: Option<BufReader<File>>,
     query: LogQuery,
     /// Matching entries seen so far — drives `query.start` (skip first N).
     visited: usize,
     /// Entries enqueued so far — drives `query.limit`.
     emitted: usize,
+}
+
+impl FileSource {
+    /// Open `path` as a streaming source filtered by `query`. Used directly
+    /// by callers that need to read JSON-lines-formatted log files outside
+    /// the `FileTransport` lifecycle — e.g. shipping rotated files into a
+    /// remote target.
+    pub fn open(path: impl AsRef<Path>, query: LogQuery) -> std::io::Result<Self> {
+        let file = File::open(path.as_ref())?;
+        Ok(Self {
+            reader: Some(BufReader::new(file)),
+            query,
+            visited: 0,
+            emitted: 0,
+        })
+    }
 }
 
 impl ReadableSource<LogInfo> for FileSource {
