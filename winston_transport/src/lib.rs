@@ -1,4 +1,5 @@
 mod log_query;
+pub mod proxy;
 pub mod query_dsl;
 mod transport;
 
