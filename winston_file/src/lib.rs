@@ -208,10 +208,34 @@ impl FileRotateHandle {
             let renamed = unique_renamed_path(&self.path)?;
             std::fs::rename(&self.path, &renamed)?;
             // Reopen at the original path so the live writer keeps going.
-            let new_file = OpenOptions::new()
+            // If this fails, the original path is now empty and the live
+            // writer's still-open handle refers to the renamed inode — roll
+            // the rename back so the path and the handle agree again.
+            let new_file = match OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&self.path)?;
+                .open(&self.path)
+            {
+                Ok(f) => f,
+                Err(open_err) => {
+                    if let Err(rollback_err) = std::fs::rename(&renamed, &self.path) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "rotate_and_drain: reopen of {} failed ({open_err}) and \
+                                 rollback rename {} -> {} also failed ({rollback_err}); \
+                                 the live writer is now appending to {}, which is no longer \
+                                 at the configured path",
+                                self.path.display(),
+                                renamed.display(),
+                                self.path.display(),
+                                renamed.display(),
+                            ),
+                        ));
+                    }
+                    return Err(open_err);
+                }
+            };
             inner.writer = BufWriter::new(new_file);
             renamed
         };
