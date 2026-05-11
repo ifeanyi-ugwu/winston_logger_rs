@@ -33,6 +33,40 @@ use crate::DailyRotateRotationHandle;
 /// continues with the remaining files. Counts of successes and failures are
 /// surfaced via [`ShipStats`]. Failed files will be retried on the next call,
 /// which is the right behavior for periodic shipping.
+///
+/// # Recommended periodic-shipping pattern
+///
+/// `ship_rotated_files` is one pass. For "every N seconds, ship whatever has
+/// rotated since last time," wrap it in your own loop with whatever timer
+/// fits your runtime. The shape is intentionally not packaged here —
+/// runtime choice, retry policy, shutdown signal, and observability are all
+/// caller-specific decisions that a one-size helper would prejudge.
+///
+/// ```ignore
+/// use std::time::Duration;
+/// use winston_daily_rotate_file::archive::ship_rotated_files;
+///
+/// // `rotation`: DailyRotateRotationHandle, `target`: &dyn DynIngestHandle,
+/// // `spawn_fn`: your task spawner (e.g. winston::default_spawner()).
+/// loop {
+///     match ship_rotated_files(&rotation, target, 100, spawn_fn.clone()).await {
+///         Ok(stats) => {
+///             if stats.ship_failures > 0 || stats.delete_failures > 0 {
+///                 eprintln!(
+///                     "shipping: {} ok / {} ship-fail / {} delete-fail: {:?}",
+///                     stats.files_shipped,
+///                     stats.ship_failures,
+///                     stats.delete_failures,
+///                     stats.last_ship_error.as_deref().or(stats.last_delete_error.as_deref()),
+///                 );
+///             }
+///         }
+///         Err(e) => eprintln!("listing rotated files failed: {e}"),
+///     }
+///     tokio::time::sleep(Duration::from_secs(60)).await;
+///     // ...or std::thread::sleep, or whatever timer your runtime uses.
+/// }
+/// ```
 pub async fn ship_rotated_files<F>(
     rotation: &DailyRotateRotationHandle,
     target: &dyn DynIngestHandle,
