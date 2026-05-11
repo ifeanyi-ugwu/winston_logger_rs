@@ -3469,6 +3469,7 @@ dependencies = [
  "dateparser",
  "futures",
  "logform",
+ "parking_lot",
  "serde_json",
  "whatwg_streams",
  "winston_transport",
