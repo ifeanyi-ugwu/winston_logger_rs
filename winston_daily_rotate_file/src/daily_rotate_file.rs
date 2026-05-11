@@ -2,11 +2,15 @@ use chrono::{DateTime, Local, Utc};
 use flate2::{write::GzEncoder, Compression};
 use logform::LogInfo;
 use std::fs::{create_dir_all, read_dir, File, OpenOptions};
+use std::future::Future;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
-use winston_transport::Transport;
+use whatwg_streams::{
+    StreamError, StreamResult, WritableSink, WritableStreamDefaultController,
+};
+use winston_transport::{DynIngestHandle, Transport};
 
 pub struct DailyRotateFileOptions {
     pub filename: PathBuf,
@@ -383,6 +387,53 @@ impl Transport for DailyRotateFile {
     // means past entries live in N files (and possibly .gz archives) that the
     // transport doesn't track centrally. If you need query, log to a regular
     // `winston_file::FileTransport` (which keeps a single file) alongside.
+
+    fn ingest_handle(&self) -> Option<Box<dyn DynIngestHandle>> {
+        Some(Box::new(DailyRotateIngestHandle {
+            active_path: Arc::clone(&self.active_path_shared),
+        }))
+    }
+}
+
+/// Out-of-band ingest target for a daily-rotate file. Each call opens the
+/// *current* active file (read from the shared active-path slot) in append
+/// mode, writes the batch via Display, flushes, closes. Doesn't drive
+/// rotation — the live writer's date/size checks own that — so ingested
+/// batches land in whatever file is active at the moment of the call.
+///
+/// Ordering between ingested entries and the live writer's entries isn't
+/// guaranteed (the live writer is buffered; the ingest handle flushes
+/// immediately). For an archive/consolidation flow that's fine.
+struct DailyRotateIngestHandle {
+    active_path: Arc<RwLock<PathBuf>>,
+}
+
+impl DynIngestHandle for DailyRotateIngestHandle {
+    fn ingest<'s>(
+        &'s self,
+        logs: Vec<LogInfo>,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+        Box::pin(async move {
+            if logs.is_empty() {
+                return Ok(());
+            }
+            let path = match self.active_path.read() {
+                Ok(guard) => guard.clone(),
+                Err(_) => return Err(StreamError::from("daily-rotate active path lock poisoned")),
+            };
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(StreamError::other)?;
+            let mut writer = BufWriter::new(file);
+            for entry in logs {
+                writeln!(&mut writer, "{}", entry).map_err(StreamError::other)?;
+            }
+            writer.flush().map_err(StreamError::other)?;
+            Ok(())
+        })
+    }
 }
 
 /// Long-lived handle the user keeps after the transport is consumed by the
@@ -752,6 +803,44 @@ mod tests {
             .collect();
 
         assert_eq!(files.len(), 2, "Expected exactly 2 log files after cleanup");
+    }
+
+    /// Verifies `ingest_handle`: extract a handle, ingest a batch, confirm
+    /// the entries land in the active file. (`X → DailyRotate` proxy target.)
+    #[test]
+    fn ingest_handle_appends_to_active_file() {
+        use winston_transport::Transport as _;
+
+        let temp_dir = setup_temp_dir();
+        let log_path = temp_dir.path().join("ingest.log");
+        let transport = DailyRotateFile::builder()
+            .filename(&log_path)
+            .date_pattern("%Y-%m-%d")
+            .build()
+            .expect("build transport");
+
+        let active = transport
+            .rotation_handle()
+            .active_path
+            .read()
+            .unwrap()
+            .clone();
+        let handle = transport.ingest_handle().expect("ingest_handle is Some");
+
+        futures::executor::block_on(async {
+            handle
+                .ingest(vec![
+                    LogInfo::new("info", "ingested-1"),
+                    LogInfo::new("warn", "ingested-2"),
+                ])
+                .await
+                .expect("ingest");
+        });
+        drop(transport);
+
+        let contents = std::fs::read_to_string(&active).unwrap();
+        assert!(contents.contains("ingested-1"), "missing first: {contents:?}");
+        assert!(contents.contains("ingested-2"), "missing second: {contents:?}");
     }
 
     /// Verifies that `rotation_handle().list_rotated_files()` returns every
