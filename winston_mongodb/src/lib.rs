@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
@@ -204,6 +204,137 @@ impl DynQueryHandle for MongoDBQueryHandle {
             self.options.clone(),
             options.clone(),
         )))
+    }
+}
+
+impl MongoDBQueryHandle {
+    /// Destructive query: like [`DynQueryHandle::query`], but records the
+    /// `_id` of every document emitted so they can be deleted afterward.
+    ///
+    /// Returns the source plus a [`MongoDBConsumeToken`]. Drain the source
+    /// fully, then call [`MongoDBConsumeToken::delete_consumed`] to remove
+    /// exactly the documents that were read — documents inserted after the
+    /// cursor opened, or skipped by `start`/`limit`, are untouched. This is
+    /// the precise way to "move" logs out of MongoDB into another transport.
+    ///
+    /// If you delete before the source is fully drained, only the documents
+    /// emitted so far are removed.
+    pub fn query_consuming(
+        &self,
+        options: &LogQuery,
+    ) -> (Box<dyn DynReadableSource>, MongoDBConsumeToken) {
+        let consumed: Arc<Mutex<Vec<bson::oid::ObjectId>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let source = MongoDBConsumingSource {
+            options: self.options.clone(),
+            query: options.clone(),
+            cursor: None,
+            initialized: false,
+            consumed: Arc::clone(&consumed),
+        };
+        let token = MongoDBConsumeToken {
+            options: self.options.clone(),
+            consumed,
+        };
+        (Box::new(source), token)
+    }
+}
+
+/// Companion to [`MongoDBQueryHandle::query_consuming`]. Holds the `_id`s of
+/// every document the paired source emitted; [`Self::delete_consumed`]
+/// removes exactly those documents.
+pub struct MongoDBConsumeToken {
+    options: MongoDBOptions,
+    consumed: Arc<Mutex<Vec<bson::oid::ObjectId>>>,
+}
+
+impl MongoDBConsumeToken {
+    /// Delete the documents recorded as consumed so far. Returns the count
+    /// actually deleted. Call once, after the source has been drained.
+    ///
+    /// Safe to call even if nothing was consumed (returns `Ok(0)` without
+    /// hitting the server).
+    pub async fn delete_consumed(&self) -> StreamResult<u64> {
+        let ids: Vec<bson::oid::ObjectId> = {
+            let guard = self.consumed.lock().unwrap();
+            guard.clone()
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let client = Client::with_uri_str(&self.options.connection_string)
+            .await
+            .map_err(StreamError::other)?;
+        let collection: Collection<LogDocument> = client
+            .database(&self.options.database)
+            .collection(&self.options.collection);
+        let result = collection
+            .delete_many(doc! { "_id": { "$in": ids } })
+            .await
+            .map_err(StreamError::other)?;
+        Ok(result.deleted_count)
+    }
+}
+
+/// Like [`MongoDBSource`] but reads raw BSON `Document`s so it can capture
+/// each `_id` into the shared list before converting to `LogInfo`.
+struct MongoDBConsumingSource {
+    options: MongoDBOptions,
+    query: LogQuery,
+    cursor: Option<mongodb::Cursor<Document>>,
+    initialized: bool,
+    consumed: Arc<Mutex<Vec<bson::oid::ObjectId>>>,
+}
+
+impl ReadableSource<LogInfo> for MongoDBConsumingSource {
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableStreamDefaultController<LogInfo>,
+    ) -> StreamResult<()> {
+        if !self.initialized {
+            let client = Client::with_uri_str(&self.options.connection_string)
+                .await
+                .map_err(StreamError::other)?;
+            let collection: Collection<Document> = client
+                .database(&self.options.database)
+                .collection(&self.options.collection);
+            let filter = build_filter(&self.query);
+            let options = build_find_options(&self.query);
+            let cursor = collection
+                .find(filter)
+                .with_options(options)
+                .await
+                .map_err(StreamError::other)?;
+            self.cursor = Some(cursor);
+            self.initialized = true;
+        }
+
+        let Some(cursor) = self.cursor.as_mut() else {
+            return Ok(());
+        };
+
+        match cursor.next().await {
+            None => {
+                let _ = controller.close();
+                self.cursor = None;
+            }
+            Some(Err(e)) => return Err(StreamError::other(e)),
+            Some(Ok(mut raw)) => {
+                // Capture `_id`, then strip it so the flattened `meta` in
+                // `LogDocument` doesn't pick it up.
+                if let Some(bson::Bson::ObjectId(id)) = raw.remove("_id") {
+                    self.consumed.lock().unwrap().push(id);
+                }
+                let log_doc: LogDocument =
+                    bson::from_document(raw).map_err(StreamError::other)?;
+                let mut log_info = document_to_loginfo(log_doc);
+                if !self.query.fields.is_empty() {
+                    apply_field_projection(&mut log_info, &self.query.fields);
+                }
+                let _ = controller.enqueue(log_info);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -583,6 +714,93 @@ mod tests {
 
         // Cleanup
         coll.delete_many(doc! { "message": { "$regex": "^ingest_handle_inserts" } })
+            .await
+            .unwrap();
+    }
+
+    /// Verifies `query_consuming` + `delete_consumed`: insert N docs, drain
+    /// them through the consuming source, delete exactly those, confirm the
+    /// collection no longer holds them — and that a doc inserted *after* the
+    /// cursor opened is NOT deleted.
+    #[tokio::test]
+    async fn query_consuming_then_delete_removes_exactly_consumed() {
+        let Some(uri) = require_uri() else { return };
+
+        let options = MongoDBOptions {
+            connection_string: uri.clone(),
+            database: "winston_mongodb_test_db".to_string(),
+            collection: "logs_consume".to_string(),
+        };
+
+        let client = Client::with_uri_str(&options.connection_string).await.unwrap();
+        let coll: Collection<LogDocument> = client
+            .database(&options.database)
+            .collection(&options.collection);
+        coll.delete_many(doc! { "message": { "$regex": "^consume_test" } })
+            .await
+            .unwrap();
+
+        // Insert three docs to consume.
+        let ingest = MongoDBIngestHandle {
+            options: options.clone(),
+        };
+        ingest
+            .ingest(vec![
+                LogInfo::new("info", "consume_test a"),
+                LogInfo::new("info", "consume_test b"),
+                LogInfo::new("info", "consume_test c"),
+            ])
+            .await
+            .expect("seed ingest");
+
+        // Open the consuming source over those three.
+        let handle = MongoDBQueryHandle {
+            options: options.clone(),
+        };
+        let mut q = LogQuery::new();
+        q.levels = vec!["info".to_string()];
+        // Note: this query matches *all* info docs; we rely on the regex
+        // cleanup above to keep the collection scoped to this test's data.
+        let (source, token) = handle.query_consuming(&q);
+
+        // Drain the source.
+        let read_stream = ReadableStream::builder(BoxedReadableSource(source))
+            .strategy(CountQueuingStrategy::new(8))
+            .spawn(|fut| {
+                tokio::spawn(fut);
+            });
+        let (_locked, reader) = read_stream.get_reader().expect("get_reader");
+        let mut drained = Vec::new();
+        while let Some(entry) = reader.read().await.expect("read") {
+            drained.push(entry);
+        }
+        assert_eq!(drained.len(), 3);
+
+        // Insert a fourth doc AFTER the cursor was drained — it must survive
+        // the delete because its _id wasn't recorded.
+        ingest
+            .ingest(vec![LogInfo::new("info", "consume_test d_after")])
+            .await
+            .expect("post-drain ingest");
+
+        // Delete exactly the consumed docs.
+        let deleted = token.delete_consumed().await.expect("delete_consumed");
+        assert_eq!(deleted, 3, "should delete exactly the 3 consumed docs");
+
+        // The fourth doc should remain.
+        use futures::TryStreamExt;
+        let mut cursor = coll
+            .find(doc! { "message": { "$regex": "^consume_test" } })
+            .await
+            .unwrap();
+        let mut remaining = Vec::new();
+        while let Some(d) = cursor.try_next().await.unwrap() {
+            remaining.push(d.message);
+        }
+        assert_eq!(remaining, vec!["consume_test d_after".to_string()]);
+
+        // Cleanup
+        coll.delete_many(doc! { "message": { "$regex": "^consume_test" } })
             .await
             .unwrap();
     }
