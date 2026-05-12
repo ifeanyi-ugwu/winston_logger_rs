@@ -247,6 +247,44 @@ impl FileRotateHandle {
             stream,
         })
     }
+
+    /// List drain files left behind by a [`Self::rotate_and_drain`] that
+    /// didn't finish — i.e. the process crashed after the rename but before
+    /// the caller drained and deleted the renamed file. These are frozen
+    /// snapshots (the live writer reopened a fresh file at the original
+    /// path), so they're safe to read.
+    ///
+    /// Startup-recovery pattern: after building the transport but before
+    /// handing it to a Logger, call this, re-ship each file via
+    /// [`FileSource::open`] + your target's `ingest_handle`, and delete it on
+    /// success — so a crash mid-`rotate_and_drain` doesn't strand data.
+    ///
+    /// Returned in arbitrary order. Caveat — multi-process: if two processes
+    /// proxy the same file, each could pick up the other's in-flight drain
+    /// and double-ship it. Don't run two destructive proxies on one file.
+    pub fn list_pending_drains(&self) -> std::io::Result<Vec<PathBuf>> {
+        let stem = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("log");
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let prefix = format!("{stem}.drain-");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with(&prefix) {
+                    out.push(p);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Outcome of [`FileRotateHandle::rotate_and_drain`]. Holds the renamed
@@ -693,6 +731,46 @@ mod tests {
             !after.contains("before-rotate"),
             "active file should NOT contain pre-rotate entries (those were drained)"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Verifies `list_pending_drains`: after a `rotate_and_drain` whose
+    /// `FileDrain` we deliberately *don't* clean up (simulating a crash),
+    /// the renamed file is discoverable for startup recovery; once we delete
+    /// it the list is empty again.
+    #[test]
+    fn list_pending_drains_finds_orphaned_drain_files() {
+        let path = unique_path("orphan");
+        let _ = std::fs::remove_file(&path);
+
+        let transport = FileTransport::builder().filename(&path).build();
+        let rotate = transport.rotate_handle();
+        let stream = WritableStream::builder(transport)
+            .strategy(CountQueuingStrategy::new(8))
+            .spawn(thread_spawner);
+        let (_locked, writer) = stream.get_writer().expect("get_writer");
+        futures::executor::block_on(async {
+            writer.write(json_log("info", "stranded")).await.unwrap();
+        });
+
+        // Rotate, but drop the FileDrain without draining/deleting it —
+        // this is the "crashed mid-ship" state.
+        let drain = rotate.rotate_and_drain(thread_spawner).expect("rotate");
+        let orphan_path = drain.path().to_path_buf();
+        drop(drain);
+        assert!(orphan_path.exists());
+
+        // Startup recovery would call this:
+        let pending = rotate.list_pending_drains().expect("list_pending_drains");
+        assert_eq!(pending, vec![orphan_path.clone()]);
+
+        // After cleanup, nothing pending.
+        std::fs::remove_file(&orphan_path).unwrap();
+        assert!(rotate
+            .list_pending_drains()
+            .expect("list_pending_drains")
+            .is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
