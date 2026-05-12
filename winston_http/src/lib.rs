@@ -278,13 +278,14 @@ mod tests {
 
     /// Mock HTTP server that records POSTed JSON bodies and (optionally) the
     /// request headers from each POST. Polls accept with a 5s deadline so it
-    /// shuts down cleanly even if the test forgets to drain it.
+    /// shuts down cleanly even if the test forgets to drain it. Binds an
+    /// OS-assigned port and returns it, so concurrent tests never collide.
     fn run_mock_server(
         received_data: Arc<Mutex<Vec<Value>>>,
         last_headers: Option<Arc<Mutex<HashMap<String, String>>>>,
-        port: u16,
-    ) {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).expect("set_nonblocking");
 
         thread::spawn(move || {
@@ -365,6 +366,7 @@ mod tests {
                 }
             }
         });
+        port
     }
 
     /// Spawner that schedules tasks onto the current tokio runtime. Same shape
@@ -380,8 +382,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_log_http_send() {
         let received_data = Arc::new(Mutex::new(Vec::new()));
-        let port = 8081;
-        run_mock_server(received_data.clone(), None, port);
+        let port = run_mock_server(received_data.clone(), None);
         let url = format!("http://127.0.0.1:{}", port);
 
         let transport = HttpTransport::builder().url(&url).build();
@@ -412,8 +413,7 @@ mod tests {
     #[tokio::test]
     async fn test_batched_logs_http_send() {
         let received_data = Arc::new(Mutex::new(Vec::new()));
-        let port = 8082;
-        run_mock_server(received_data.clone(), None, port);
+        let port = run_mock_server(received_data.clone(), None);
 
         let url = format!("http://127.0.0.1:{}", port);
         let transport = HttpTransport::builder().url(&url).batch_size(2).build();
@@ -469,12 +469,7 @@ mod tests {
         let received_data = Arc::new(Mutex::new(Vec::new()));
         let received_headers: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let port = 8083;
-        run_mock_server(
-            received_data.clone(),
-            Some(received_headers.clone()),
-            port,
-        );
+        let port = run_mock_server(received_data.clone(), Some(received_headers.clone()));
 
         let url = format!("http://127.0.0.1:{}", port);
         let mut headers = HashMap::new();
@@ -524,8 +519,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_handle_posts_batch() {
         let received_data = Arc::new(Mutex::new(Vec::new()));
-        let port = 8084;
-        run_mock_server(received_data.clone(), None, port);
+        let port = run_mock_server(received_data.clone(), None);
         let url = format!("http://127.0.0.1:{}", port);
 
         let transport = HttpTransport::builder().url(&url).build();
