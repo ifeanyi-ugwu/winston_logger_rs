@@ -3525,12 +3525,14 @@ dependencies = [
  "chrono",
  "dateparser",
  "futures",
+ "hex",
  "jsonpath-rust",
  "logform",
  "parse_datetime",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "whatwg_streams",
 ]
 

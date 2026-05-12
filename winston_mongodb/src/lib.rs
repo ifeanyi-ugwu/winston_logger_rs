@@ -45,6 +45,21 @@ struct LogDocument {
     meta: HashMap<String, serde_json::Value>,
 }
 
+/// Like [`LogDocument`] but with an explicit string `_id` — used by the
+/// idempotent ingest path, where `_id` is the entry's `content_id`. Inserting
+/// the same logical entry twice then collides on `_id` and is a no-op.
+#[derive(Debug, Serialize)]
+struct LogDocumentWithId {
+    #[serde(rename = "_id")]
+    id: String,
+    #[serde(with = "bson::serde_helpers::chrono_datetime_as_bson_datetime")]
+    timestamp: DateTime<Utc>,
+    level: String,
+    message: String,
+    #[serde(flatten)]
+    meta: HashMap<String, serde_json::Value>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MongoDBOptions {
     pub connection_string: String,
@@ -145,16 +160,43 @@ impl Transport for MongoDBTransport {
     fn ingest_handle(&self) -> Option<Box<dyn DynIngestHandle>> {
         Some(Box::new(MongoDBIngestHandle {
             options: self.options.clone(),
+            idempotent: false,
         }))
     }
 }
 
+impl MongoDBTransport {
+    /// Like [`Transport::ingest_handle`], but each document is keyed on its
+    /// [`winston_transport::content_id`] as `_id`. Re-ingesting the same
+    /// logical entry then collides on `_id` and is a no-op — so a re-ship
+    /// after a crash converges instead of duplicating. This is the target
+    /// half of the exactly-once-ish proxy recipe.
+    ///
+    /// Note: this changes the `_id` scheme for documents written through this
+    /// handle (string content-hash, not the auto-generated `ObjectId` the
+    /// live `write` path uses). Don't mix idempotent-ingest and live-write
+    /// against the same collection unless you're fine with two `_id` schemes
+    /// coexisting; for a dedicated archive collection it's exactly what you
+    /// want.
+    pub fn idempotent_ingest_handle(&self) -> Box<dyn DynIngestHandle> {
+        Box::new(MongoDBIngestHandle {
+            options: self.options.clone(),
+            idempotent: true,
+        })
+    }
+}
+
 /// Out-of-band ingest target. Each call opens a fresh client + collection and
-/// runs `insert_many` for the batch — independent of the live transport's
-/// client. Suitable for low/medium-frequency proxy flows; for high-frequency
-/// proxying you'd want to cache the client across calls.
+/// inserts the batch — independent of the live transport's client. Suitable
+/// for low/medium-frequency proxy flows; for high-frequency proxying you'd
+/// want to cache the client across calls.
+///
+/// When `idempotent`, documents are keyed on `content_id` as `_id` and
+/// duplicate-key errors on re-insert are swallowed (the doc is already
+/// there). Otherwise it's a plain `insert_many` with auto-generated `_id`s.
 pub struct MongoDBIngestHandle {
     options: MongoDBOptions,
+    idempotent: bool,
 }
 
 impl DynIngestHandle for MongoDBIngestHandle {
@@ -169,26 +211,77 @@ impl DynIngestHandle for MongoDBIngestHandle {
             let client = Client::with_uri_str(&self.options.connection_string)
                 .await
                 .map_err(StreamError::other)?;
-            let collection: Collection<LogDocument> = client
-                .database(&self.options.database)
-                .collection(&self.options.collection);
+            let db = client.database(&self.options.database);
 
-            let docs: Vec<LogDocument> = logs
-                .into_iter()
-                .map(|info| LogDocument {
-                    timestamp: Utc::now(),
-                    level: info.level,
-                    message: info.message,
-                    meta: info.meta,
-                })
-                .collect();
-
-            collection
-                .insert_many(docs)
-                .await
-                .map_err(StreamError::other)?;
-            Ok(())
+            if self.idempotent {
+                let collection: Collection<LogDocumentWithId> =
+                    db.collection(&self.options.collection);
+                let docs: Vec<LogDocumentWithId> = logs
+                    .into_iter()
+                    .map(|info| LogDocumentWithId {
+                        id: winston_transport::content_id(&info),
+                        timestamp: Utc::now(),
+                        level: info.level,
+                        message: info.message,
+                        meta: info.meta,
+                    })
+                    .collect();
+                match collection
+                    .insert_many(docs)
+                    .with_options(
+                        mongodb::options::InsertManyOptions::builder()
+                            .ordered(false)
+                            .build(),
+                    )
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    // With `ordered: false`, a batch that's entirely (or
+                    // partly) already-present comes back as a write error
+                    // whose entries are all duplicate-key (code 11000); the
+                    // new docs still got inserted. Treat that as success —
+                    // that's the whole point of idempotent ingest. Any
+                    // other write error (or a write-concern error) is real.
+                    Err(e) if is_all_duplicate_key(&e) => Ok(()),
+                    Err(e) => Err(StreamError::other(e)),
+                }
+            } else {
+                let collection: Collection<LogDocument> =
+                    db.collection(&self.options.collection);
+                let docs: Vec<LogDocument> = logs
+                    .into_iter()
+                    .map(|info| LogDocument {
+                        timestamp: Utc::now(),
+                        level: info.level,
+                        message: info.message,
+                        meta: info.meta,
+                    })
+                    .collect();
+                collection
+                    .insert_many(docs)
+                    .await
+                    .map_err(StreamError::other)?;
+                Ok(())
+            }
         })
+    }
+}
+
+/// `true` iff `e` is an `insert_many` failure whose every write error is a
+/// duplicate-key error (MongoDB code 11000) and there's no write-concern
+/// error — i.e. nothing went wrong except "some of these were already there."
+fn is_all_duplicate_key(e: &mongodb::error::Error) -> bool {
+    use mongodb::error::ErrorKind;
+    match *e.kind {
+        ErrorKind::InsertMany(ref ime) => {
+            ime.write_concern_error.is_none()
+                && ime
+                    .write_errors
+                    .as_ref()
+                    .map(|errs| !errs.is_empty() && errs.iter().all(|w| w.code == 11000))
+                    .unwrap_or(false)
+        }
+        _ => false,
     }
 }
 
@@ -763,6 +856,7 @@ mod tests {
         // Insert three docs to consume.
         let ingest = MongoDBIngestHandle {
             options: options.clone(),
+            idempotent: false,
         };
         ingest
             .ingest(vec![
@@ -841,6 +935,60 @@ mod tests {
 
         // Cleanup
         coll.delete_many(doc! { "message": { "$regex": "^consume_test" } })
+            .await
+            .unwrap();
+    }
+
+    /// Verifies idempotent ingest: ingesting the same batch twice via
+    /// `idempotent_ingest_handle` leaves the collection with one copy of each
+    /// entry (the second insert collides on the `content_id` `_id` and is
+    /// swallowed). This is the target half of exactly-once-ish proxying.
+    #[tokio::test]
+    async fn idempotent_ingest_dedups_on_resend() {
+        let Some(uri) = require_uri() else { return };
+
+        let options = MongoDBOptions {
+            connection_string: uri.clone(),
+            database: "winston_mongodb_test_db".to_string(),
+            collection: "logs_idem".to_string(),
+        };
+
+        let client = Client::with_uri_str(&options.connection_string).await.unwrap();
+        let coll: Collection<bson::Document> = client
+            .database(&options.database)
+            .collection(&options.collection);
+        coll.delete_many(doc! { "message": { "$regex": "^idem_test" } })
+            .await
+            .unwrap();
+
+        let transport = MongoDBTransport::new(options.clone());
+        let handle = transport.idempotent_ingest_handle();
+
+        let batch = vec![
+            LogInfo::new("info", "idem_test a"),
+            LogInfo::new("warn", "idem_test b"),
+            LogInfo::new("info", "idem_test c"),
+        ];
+
+        handle.ingest(batch.clone()).await.expect("first ingest");
+        // Re-send the exact same batch — must be a no-op, not a triplicate.
+        handle.ingest(batch.clone()).await.expect("second ingest");
+        // ...and a third time for good measure.
+        handle.ingest(batch).await.expect("third ingest");
+
+        use futures::TryStreamExt;
+        let mut cursor = coll
+            .find(doc! { "message": { "$regex": "^idem_test" } })
+            .await
+            .unwrap();
+        let mut count = 0usize;
+        while cursor.try_next().await.unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3, "re-sends must not duplicate; expected 3, got {count}");
+
+        // Cleanup
+        coll.delete_many(doc! { "message": { "$regex": "^idem_test" } })
             .await
             .unwrap();
     }

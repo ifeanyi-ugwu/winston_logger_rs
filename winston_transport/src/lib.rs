@@ -5,7 +5,7 @@ mod transport;
 
 pub use log_query::{LogQuery, Order};
 pub use logform::{Format, LogInfo};
-pub use proxy::{DrainReceipt, FanOutStats};
+pub use proxy::{content_id, DrainReceipt, FanOutStats};
 pub use transport::{
     BoxedReadableSource, DynIngestHandle, DynQueryHandle, DynReadableSource, Transport,
 };

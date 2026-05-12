@@ -184,10 +184,7 @@ mod tests {
     use logform::{json, timestamp, Format, LogInfo};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
-    use whatwg_streams::{
-        CountQueuingStrategy, StreamResult, WritableSink, WritableStream,
-        WritableStreamDefaultController,
-    };
+    use whatwg_streams::{CountQueuingStrategy, StreamResult, WritableStream};
     use winston_transport::DynIngestHandle;
 
     use crate::DailyRotateFile;

@@ -17,9 +17,23 @@
 
 use logform::LogInfo;
 use reqwest::Client;
+use serde_json::Value;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 use whatwg_streams::{StreamError, StreamResult, WritableSink, WritableStreamDefaultController};
-use winston_transport::{DynIngestHandle, Transport};
+use winston_transport::{content_id, DynIngestHandle, Transport};
+
+/// Flatten `entry` to JSON and stamp an `_id` field with its [`content_id`].
+/// The endpoint can dedup on `_id` to make a re-POST (after a crash-retry on
+/// the sender side) a no-op — that's how an HTTP target becomes idempotent.
+/// If the endpoint ignores `_id`, the field is harmless.
+fn flat_with_id(entry: &LogInfo) -> Value {
+    let mut v = entry.to_flat_value();
+    if let Value::Object(ref mut map) = v {
+        map.entry("_id".to_string())
+            .or_insert_with(|| Value::String(content_id(entry)));
+    }
+    v
+}
 
 #[derive(Clone)]
 pub struct HttpTransportOptions {
@@ -69,11 +83,12 @@ impl HttpTransport {
         }
 
         // Single-entry payload as JSON object; multi-entry as an array —
-        // matches the legacy wire format.
+        // matches the legacy wire format. Each entry carries an `_id` so a
+        // dedup-aware endpoint can absorb retried POSTs.
         let response = if logs.len() == 1 {
-            request.json(&logs[0].to_flat_value())
+            request.json(&flat_with_id(&logs[0]))
         } else {
-            let flat_logs: Vec<_> = logs.iter().map(|log| log.to_flat_value()).collect();
+            let flat_logs: Vec<_> = logs.iter().map(flat_with_id).collect();
             request.json(&flat_logs)
         }
         .send()
@@ -156,9 +171,9 @@ impl DynIngestHandle for HttpIngestHandle {
                 }
             }
             let response = if logs.len() == 1 {
-                request.json(&logs[0].to_flat_value())
+                request.json(&flat_with_id(&logs[0]))
             } else {
-                let flat: Vec<_> = logs.iter().map(|log| log.to_flat_value()).collect();
+                let flat: Vec<_> = logs.iter().map(flat_with_id).collect();
                 request.json(&flat)
             }
             .send()

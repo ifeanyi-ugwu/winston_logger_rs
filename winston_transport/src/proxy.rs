@@ -13,9 +13,63 @@ use std::{future::Future, pin::Pin};
 
 use futures::future::join_all;
 use logform::LogInfo;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use whatwg_streams::{CountQueuingStrategy, ReadableStream, StreamError, StreamResult};
 
 use crate::{BoxedReadableSource, DynIngestHandle, DynReadableSource};
+
+/// A stable content-derived identifier for a log entry — the dedup key that
+/// turns at-least-once delivery into effectively exactly-once *for an
+/// idempotent target* (one that upserts on this key).
+///
+/// It's `sha256` of a *canonical* JSON serialization of the entry: an object
+/// `{"level": ..., "message": ..., ...meta}` with **all keys sorted
+/// recursively**. The recursive sort means the id doesn't depend on
+/// `HashMap` iteration order, `serde_json`'s `Map` backing, or which order a
+/// formatter happened to write the meta fields — re-reading a persisted entry
+/// (e.g. a JSON line from a rotated file) and hashing it again yields the same
+/// id, which is exactly what a re-ship after a crash needs.
+///
+/// Returned as a 64-char lowercase hex string, suitable as a MongoDB `_id` or
+/// an HTTP idempotency key.
+///
+/// Caveat: two log calls that produce byte-identical `(level, message, meta)`
+/// get the *same* id and will be deduped to one. For logs that's almost
+/// always desirable; if you have genuinely-distinct events that must not
+/// collide, add a disambiguator to `meta` (a sequence number, a UUID) before
+/// they're persisted.
+pub fn content_id(info: &LogInfo) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("level".to_string(), Value::String(info.level.clone()));
+    obj.insert("message".to_string(), Value::String(info.message.clone()));
+    for (k, v) in &info.meta {
+        obj.insert(k.clone(), v.clone());
+    }
+    let canonical = canonicalize(&Value::Object(obj));
+    // `serde_json::to_string` on a value we built in sorted order preserves
+    // that order regardless of the `Map` backing.
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    hex::encode(digest)
+}
+
+/// Recursively rebuild a JSON value with every object's keys sorted.
+fn canonicalize(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut out = serde_json::Map::new();
+            for (k, val) in entries {
+                out.insert(k.clone(), canonicalize(val));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(canonicalize).collect()),
+        other => other.clone(),
+    }
+}
 
 /// Proof that a drain completed — every entry the source produced was handed
 /// to (and acknowledged by) the target.
@@ -300,6 +354,24 @@ mod tests {
 
     fn thread_spawner(fut: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
         std::thread::spawn(move || futures::executor::block_on(fut));
+    }
+
+    #[test]
+    fn content_id_is_stable_and_order_independent() {
+        // Build the "same" entry two different ways: meta keys inserted in
+        // different orders, plus a nested object also in different orders.
+        let a = LogInfo::new("info", "hello")
+            .with_meta("b", serde_json::json!({"y": 2, "x": 1}))
+            .with_meta("a", 1);
+        let b = LogInfo::new("info", "hello")
+            .with_meta("a", 1)
+            .with_meta("b", serde_json::json!({"x": 1, "y": 2}));
+        assert_eq!(content_id(&a), content_id(&b), "key order must not matter");
+        assert_eq!(content_id(&a).len(), 64, "sha256 hex is 64 chars");
+
+        // A different message → different id.
+        let c = LogInfo::new("info", "goodbye");
+        assert_ne!(content_id(&a), content_id(&c));
     }
 
     #[test]
