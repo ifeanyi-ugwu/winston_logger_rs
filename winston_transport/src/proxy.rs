@@ -1,13 +1,95 @@
-//! Proxy primitives.
+//! Proxying: moving log entries from one transport to another.
 //!
-//! Building blocks for moving log entries from one transport to another, on
-//! top of the [`Transport`](crate::Transport) trait's `query_handle` and
-//! `ingest_handle` methods.
+//! Built on the [`Transport`](crate::Transport) trait's three handle kinds —
+//! `query_handle` (non-destructive read), `ingest_handle` (write), and the
+//! transport-specific *destructive* reads
+//! ([`FileRotateHandle::rotate_and_drain`](../../winston_file/struct.FileRotateHandle.html#method.rotate_and_drain),
+//! [`MongoDBQueryHandle::query_consuming`](../../winston_mongodb/struct.MongoDBQueryHandle.html#method.query_consuming)).
 //!
-//! The atomic operation is [`pipe_to_ingest`] — drain a single
-//! [`DynReadableSource`] into a single [`DynIngestHandle`] in batches. Higher-
-//! level helpers (one-shot directory shipping, periodic timers, multi-target
-//! fan-out) compose this primitive.
+//! # The delivery model
+//!
+//! Moving data across a process boundary that might crash, you get to pick:
+//!
+//! - **at-most-once** — delete from the source *before* the target confirms.
+//!   Crash in between ⇒ lost. Never the default here.
+//! - **at-least-once** — target confirms, *then* delete from the source.
+//!   Crash in between ⇒ the next run re-ships ⇒ duplicate at the target.
+//!   **This is what these primitives give you.**
+//! - **exactly-once** = at-least-once **+ an idempotent target** (one that
+//!   dedups on a stable key). The target absorbs the re-ship, so it converges
+//!   with no net duplicates.
+//!
+//! There is no fourth option without distributed-transaction machinery the
+//! stream layer can't provide. So: the building blocks are at-least-once
+//! (they never lose data); "exactly-once" means layering idempotency on top.
+//!
+//! # The pieces
+//!
+//! **Sources** (where unshipped data lives across a crash):
+//!
+//! | source | destructive read | crash-recoverable? |
+//! |---|---|---|
+//! | `DailyRotateFile` | rotated files via `rotation_handle().list_rotated_files()` | ✅ rotated files have predictable names; re-discovered every pass |
+//! | `MongoDBTransport` | `query_handle().query_consuming(opts)` → `(source, token)` | ✅ docs stay in the collection until `token.delete_consumed(receipt)` |
+//! | `FileTransport` | `rotate_handle().rotate_and_drain(spawn)` → `FileDrain` | ⚠️ a crash after the rename orphans the `*.drain-*` file — recover with `rotate_handle().list_pending_drains()` at startup |
+//! | `HttpTransport`, stdout/stderr | — | n/a (no local store to read from) |
+//!
+//! **Targets** (the write side):
+//!
+//! | target | `ingest_handle` | idempotent variant |
+//! |---|---|---|
+//! | `MongoDBTransport` | plain `insert_many`, auto `_id` | `idempotent_ingest_handle()` — keys on [`content_id`] as `_id`; re-ship = no-op |
+//! | `HttpTransport` | POST; each entry carries `_id = content_id` | the *endpoint* must dedup on `_id` (out of our hands) |
+//! | `FileTransport`, `DailyRotateFile` | append a line | **not idempotent** — appending the same line twice gives two lines, and a flat file has no key-based upsert |
+//! | stdout/stderr | — | n/a |
+//!
+//! **Glue:**
+//!
+//! - [`pipe_to_ingest`] — drain one source into one target, batched. Returns
+//!   a [`DrainReceipt`] on full success; that receipt is what authorizes the
+//!   source-side delete (`MongoDBConsumeToken::delete_consumed` *requires* it,
+//!   so "delete before the ship completed" is a type error).
+//! - [`fan_out_to_ingests`] — broadcast one source to N targets in parallel.
+//!   `FanOutStats::into_drain_receipt()` yields `Some` only if every target
+//!   took the whole payload (don't delete the source otherwise).
+//! - [`ship_rotated_files`](../../winston_daily_rotate_file/archive/fn.ship_rotated_files.html)
+//!   — the DailyRotate workflow: list rotated files (decompressing `.gz`),
+//!   drain each into a target, delete on success. Owns the delete internally
+//!   so it's safe by construction.
+//! - [`content_id`] — the dedup key: a recursively-key-sorted sha256 of the
+//!   entry, stable across re-reads.
+//!
+//! # The rules
+//!
+//! 1. **Delete the source only after a [`DrainReceipt`].** Enforced by the
+//!    type system for `delete_consumed`; for the `ship_rotated_files` /
+//!    `remove_file` path it's enforced because the delete is on the `Ok`
+//!    branch of the same function.
+//! 2. **One proxy per source.** Two processes draining the same collection or
+//!    file both ship overlapping sets ⇒ duplicates (absorbed only by an
+//!    idempotent target).
+//! 3. **No overlapping ship passes.** If pass N+1 starts before pass N
+//!    deleted the file it's still draining, both ship it. Serialize passes
+//!    (a process-local mutex, or a single scheduler).
+//! 4. **Flat-file targets are not idempotent.** Re-ship after a crash
+//!    re-appends. For exactly-once, the target must be a keyed store —
+//!    `idempotent_ingest_handle` MongoDB, or a dedup-aware HTTP endpoint.
+//! 5. **Recover orphaned drains.** If you use `FileTransport::rotate_and_drain`,
+//!    call `list_pending_drains()` at startup and re-ship anything left over.
+//!
+//! # The exactly-once-ish recipe
+//!
+//! `DailyRotateFile` (source) → `MongoDBTransport::idempotent_ingest_handle`
+//! (target), keyed on `content_id`:
+//!
+//! 1. DailyRotate writes `logform::json()` lines (canonical — sorted keys),
+//!    rotating by date or size.
+//! 2. Periodically: for each rotated file, drain it via [`pipe_to_ingest`]
+//!    (it's `ship_rotated_files`' loop) into the idempotent Mongo handle;
+//!    delete the file once the `DrainReceipt` is in hand.
+//! 3. Crash anywhere ⇒ the rotated file survives ⇒ the next pass re-ships ⇒
+//!    upserts no-op the docs that made it, insert the rest ⇒ converges. No
+//!    loss, no net duplicates — given rules 2 and 3 above.
 
 use std::{future::Future, pin::Pin};
 
