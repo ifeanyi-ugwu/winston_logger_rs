@@ -20,5 +20,6 @@ pub use logger_options::{BackpressureStrategy, LoggerOptions};
 pub use logger_transport::LoggerTransport;
 pub use pipeline::{default_spawner, single_threaded_spawner, SpawnFn};
 pub use winston_transport::{
-    BoxedReadableSource, DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Transport,
+    BoxedReadableSource, DrainReceipt, DynIngestHandle, DynQueryHandle, DynReadableSource,
+    FanOutStats, LogQuery, Transport,
 };

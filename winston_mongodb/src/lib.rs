@@ -32,7 +32,7 @@ use whatwg_streams::{
     WritableStreamDefaultController,
 };
 use winston_transport::{
-    DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Order, Transport,
+    DrainReceipt, DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Order, Transport,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -249,16 +249,36 @@ pub struct MongoDBConsumeToken {
 }
 
 impl MongoDBConsumeToken {
-    /// Delete the documents recorded as consumed so far. Returns the count
-    /// actually deleted. Call once, after the source has been drained.
+    /// Delete the documents the paired source emitted. Returns the count
+    /// actually deleted.
     ///
-    /// Safe to call even if nothing was consumed (returns `Ok(0)` without
-    /// hitting the server).
-    pub async fn delete_consumed(&self) -> StreamResult<u64> {
+    /// Requires the [`DrainReceipt`] produced by the drain that shipped this
+    /// source's data — `pipe_to_ingest`'s return value, or
+    /// `FanOutStats::into_drain_receipt()` for the fan-out case. Demanding the
+    /// receipt makes "delete the source before the ship actually completed"
+    /// a type error rather than silent data loss. The receipt is consumed.
+    ///
+    /// As a sanity check, the receipt's `entries_shipped()` must equal the
+    /// number of documents this source emitted; a mismatch (usually a receipt
+    /// from a *different* drain) is rejected without touching the database.
+    /// This isn't airtight — two equal-sized drains would pass — but it
+    /// catches the common mistake.
+    ///
+    /// If the source emitted nothing, this is `Ok(0)` without hitting the
+    /// server (and the receipt's count must be 0 too).
+    pub async fn delete_consumed(self, receipt: DrainReceipt) -> StreamResult<u64> {
         let ids: Vec<bson::oid::ObjectId> = {
             let guard = self.consumed.lock().unwrap();
             guard.clone()
         };
+        if receipt.entries_shipped() != ids.len() {
+            return Err(StreamError::from(format!(
+                "delete_consumed: receipt reports {} shipped but this source \
+                 emitted {} — did you pass a receipt from a different drain?",
+                receipt.entries_shipped(),
+                ids.len(),
+            )));
+        }
         if ids.is_empty() {
             return Ok(0);
         }
@@ -753,7 +773,9 @@ mod tests {
             .await
             .expect("seed ingest");
 
-        // Open the consuming source over those three.
+        // Open the consuming source over those three and drain it via the
+        // real `pipe_to_ingest` into a capture sink — that yields the
+        // `DrainReceipt` `delete_consumed` requires.
         let handle = MongoDBQueryHandle {
             options: options.clone(),
         };
@@ -763,18 +785,33 @@ mod tests {
         // cleanup above to keep the collection scoped to this test's data.
         let (source, token) = handle.query_consuming(&q);
 
-        // Drain the source.
-        let read_stream = ReadableStream::builder(BoxedReadableSource(source))
-            .strategy(CountQueuingStrategy::new(8))
-            .spawn(|fut| {
-                tokio::spawn(fut);
-            });
-        let (_locked, reader) = read_stream.get_reader().expect("get_reader");
-        let mut drained = Vec::new();
-        while let Some(entry) = reader.read().await.expect("read") {
-            drained.push(entry);
+        let drained = Arc::new(Mutex::new(Vec::<LogInfo>::new()));
+        struct CaptureIngest(Arc<Mutex<Vec<LogInfo>>>);
+        impl DynIngestHandle for CaptureIngest {
+            fn ingest<'s>(
+                &'s self,
+                logs: Vec<LogInfo>,
+            ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+                let store = Arc::clone(&self.0);
+                Box::pin(async move {
+                    store.lock().unwrap().extend(logs);
+                    Ok(())
+                })
+            }
         }
-        assert_eq!(drained.len(), 3);
+        let capture = CaptureIngest(Arc::clone(&drained));
+        let receipt = winston_transport::proxy::pipe_to_ingest(
+            source,
+            &capture,
+            8,
+            |fut| {
+                tokio::spawn(fut);
+            },
+        )
+        .await
+        .expect("pipe_to_ingest");
+        assert_eq!(receipt.entries_shipped(), 3);
+        assert_eq!(drained.lock().unwrap().len(), 3);
 
         // Insert a fourth doc AFTER the cursor was drained — it must survive
         // the delete because its _id wasn't recorded.
@@ -783,8 +820,11 @@ mod tests {
             .await
             .expect("post-drain ingest");
 
-        // Delete exactly the consumed docs.
-        let deleted = token.delete_consumed().await.expect("delete_consumed");
+        // Delete exactly the consumed docs, authorized by the receipt.
+        let deleted = token
+            .delete_consumed(receipt)
+            .await
+            .expect("delete_consumed");
         assert_eq!(deleted, 3, "should delete exactly the 3 consumed docs");
 
         // The fourth doc should remain.

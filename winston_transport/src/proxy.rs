@@ -17,18 +17,50 @@ use whatwg_streams::{CountQueuingStrategy, ReadableStream, StreamError, StreamRe
 
 use crate::{BoxedReadableSource, DynIngestHandle, DynReadableSource};
 
-/// Drain `source` into `target` in batches of `batch_size`, returning the
-/// number of entries shipped on success.
+/// Proof that a drain completed — every entry the source produced was handed
+/// to (and acknowledged by) the target.
+///
+/// Returned by [`pipe_to_ingest`] only on full success, and by
+/// [`FanOutStats::into_drain_receipt`] only when every fan-out target
+/// succeeded. It exists so that source-side commit operations that *delete*
+/// the just-shipped data — most notably
+/// [`MongoDBConsumeToken::delete_consumed`](../../winston_mongodb/struct.MongoDBConsumeToken.html#method.delete_consumed)
+/// — can require one as a parameter, turning "I deleted the source before the
+/// ship actually completed" from a silent data-loss footgun into a
+/// type error.
+///
+/// Non-`Clone`, consumed when passed to a commit op — one drain, one receipt,
+/// one commit. Pass the receipt from the drain that shipped *this* source's
+/// data; the type system can't verify that linkage, so don't mix receipts
+/// from different drains.
+#[derive(Debug)]
+pub struct DrainReceipt {
+    entries_shipped: usize,
+}
+
+impl DrainReceipt {
+    /// How many entries the drain shipped.
+    pub fn entries_shipped(&self) -> usize {
+        self.entries_shipped
+    }
+}
+
+/// Drain `source` into `target` in batches of `batch_size`.
 ///
 /// `spawn_fn` is the same kind of spawner you hand to a Logger: it must accept
 /// a `Pin<Box<dyn Future<Output = ()> + Send + 'static>>` and arrange for it
 /// to run to completion. The returned `WritableStream` task drives the
 /// underlying source's `pull`.
 ///
-/// On error, the entries already shipped stay shipped — there's no rollback.
-/// Callers that need transactional semantics should batch into a
-/// transport-specific store first, ingest from there, and treat any failure
-/// as "retry the remainder."
+/// Returns a [`DrainReceipt`] on full success — pass it to a source-side
+/// commit op (e.g. `MongoDBConsumeToken::delete_consumed`) to authorize
+/// deleting the just-shipped data.
+///
+/// On error, the entries already shipped stay shipped — there's no rollback,
+/// and **no receipt is returned**, so the source-side delete can't happen.
+/// The contract is at-least-once: on failure, leave the source intact and
+/// let the next run re-ship; the target must tolerate duplicates (be
+/// idempotent — dedup on a stable key) or you accept them.
 ///
 /// # Example
 ///
@@ -37,22 +69,23 @@ use crate::{BoxedReadableSource, DynIngestHandle, DynReadableSource};
 /// # async fn ex(
 /// #     source: Box<dyn DynReadableSource>,
 /// #     target: &dyn DynIngestHandle,
-/// # ) -> Result<(), winston_transport::__Stub> {
-/// let shipped = pipe_to_ingest(
+/// # ) {
+/// let receipt = pipe_to_ingest(
 ///     source,
 ///     target,
 ///     /*batch_size*/ 100,
 ///     |fut| { std::thread::spawn(move || futures::executor::block_on(fut)); },
-/// ).await?;
-/// println!("shipped {shipped} entries");
-/// # Ok(()) }
+/// ).await.expect("ship failed");
+/// println!("shipped {} entries", receipt.entries_shipped());
+/// // ...now `token.delete_consumed(receipt)` is allowed.
+/// # }
 /// ```
 pub async fn pipe_to_ingest<F, R>(
     source: Box<dyn DynReadableSource>,
     target: &dyn DynIngestHandle,
     batch_size: usize,
     spawn_fn: F,
-) -> StreamResult<usize>
+) -> StreamResult<DrainReceipt>
 where
     F: FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> R,
 {
@@ -81,7 +114,9 @@ where
         target.ingest(batch).await?;
         total += n;
     }
-    Ok(total)
+    Ok(DrainReceipt {
+        entries_shipped: total,
+    })
 }
 
 /// Drain `source` into every target in `targets`, in parallel batches.
@@ -194,6 +229,31 @@ pub struct FanOutStats {
     pub per_target_failed: Vec<usize>,
 }
 
+impl FanOutStats {
+    /// `true` iff there was at least one target and none of them failed any
+    /// batch.
+    pub fn all_targets_clean(&self) -> bool {
+        !self.per_target_shipped.is_empty()
+            && self.per_target_failed.iter().all(|&n| n == 0)
+    }
+
+    /// Consume the stats and produce a [`DrainReceipt`] *iff* every target
+    /// took the full payload — i.e. there was at least one target and zero
+    /// failures. `None` otherwise (no targets, or some target fell behind),
+    /// which is the signal to NOT delete the source: the next run must
+    /// re-ship so the lagging target catches up.
+    pub fn into_drain_receipt(self) -> Option<DrainReceipt> {
+        if self.all_targets_clean() {
+            Some(DrainReceipt {
+                // On a fully-clean fan-out every target got the same count.
+                entries_shipped: self.per_target_shipped.first().copied().unwrap_or(0),
+            })
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +313,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let target = CaptureIngest(Arc::clone(&captured));
 
-        let total = futures::executor::block_on(pipe_to_ingest(
+        let receipt = futures::executor::block_on(pipe_to_ingest(
             source,
             &target,
             3,
@@ -261,7 +321,7 @@ mod tests {
         ))
         .expect("pipe_to_ingest");
 
-        assert_eq!(total, 7);
+        assert_eq!(receipt.entries_shipped(), 7);
         let got = captured.lock().unwrap();
         assert_eq!(got.len(), 7);
         assert_eq!(got[0].message, "entry 0");
@@ -293,6 +353,7 @@ mod tests {
 
         assert_eq!(stats.per_target_shipped, vec![5, 5, 5]);
         assert_eq!(stats.per_target_failed, vec![0, 0, 0]);
+        assert!(stats.all_targets_clean());
 
         for store in [&c1, &c2, &c3] {
             let got = store.lock().unwrap();
@@ -300,6 +361,10 @@ mod tests {
             assert_eq!(got[0].message, "e0");
             assert_eq!(got[4].message, "e4");
         }
+
+        // A clean fan-out yields a receipt with the (shared) shipped count.
+        let receipt = stats.into_drain_receipt().expect("clean fan-out → Some");
+        assert_eq!(receipt.entries_shipped(), 5);
     }
 
     #[test]
@@ -317,6 +382,11 @@ mod tests {
 
         assert!(stats.per_target_shipped.is_empty());
         assert!(stats.per_target_failed.is_empty());
+        assert!(!stats.all_targets_clean(), "no targets → not clean");
+        assert!(
+            stats.into_drain_receipt().is_none(),
+            "no targets → no receipt (don't delete the source)"
+        );
     }
 
     /// A failing target records the failure but doesn't abort other targets.
@@ -354,5 +424,10 @@ mod tests {
         assert_eq!(stats.per_target_shipped, vec![4, 0]);
         assert_eq!(stats.per_target_failed, vec![0, 2]);
         assert_eq!(captured.lock().unwrap().len(), 4);
+        assert!(!stats.all_targets_clean());
+        assert!(
+            stats.into_drain_receipt().is_none(),
+            "a failing target → no receipt (don't delete the source)"
+        );
     }
 }

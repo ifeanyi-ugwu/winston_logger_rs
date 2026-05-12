@@ -132,10 +132,10 @@ where
         };
     let source: Box<dyn DynReadableSource> =
         Box::new(FileSource::from_reader(reader, LogQuery::new()));
-    let n = pipe_to_ingest(source, target, batch_size, move |fut| spawn_fn(fut))
+    let receipt = pipe_to_ingest(source, target, batch_size, move |fut| spawn_fn(fut))
         .await
         .map_err(|e| ShipError::Pipe(e.to_string()))?;
-    Ok(n)
+    Ok(receipt.entries_shipped())
 }
 
 /// Outcome of one `ship_rotated_files` pass. Counters are independent — a
