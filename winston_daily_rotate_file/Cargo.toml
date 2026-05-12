@@ -19,3 +19,6 @@ winston_transport.workspace = true
 [dev-dependencies]
 futures.workspace = true
 tempfile = "3.17.1"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+winston.workspace = true
+winston_mongodb = { path = "../winston_mongodb" }

@@ -3456,8 +3456,11 @@ dependencies = [
  "futures",
  "logform",
  "tempfile",
+ "tokio",
  "whatwg_streams",
+ "winston",
  "winston_file",
+ "winston_mongodb",
  "winston_transport",
 ]
 
