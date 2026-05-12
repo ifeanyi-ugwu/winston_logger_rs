@@ -584,4 +584,148 @@ mod tests {
             "a failing target → no receipt (don't delete the source)"
         );
     }
+
+    // ── Delivery-contract tests ─────────────────────────────────────────────
+    //
+    // These encode the at-least-once / exactly-once semantics as executable
+    // specs: a pipe that fails mid-stream returns no `DrainReceipt`, and a
+    // retry of the whole source re-ships the batches that already made it.
+    // Whether that re-ship produces *net* duplicates depends entirely on the
+    // target: a plain (append-style) target shows them; an idempotent target
+    // (dedups on `content_id`) absorbs them.
+
+    use std::collections::HashSet;
+
+    /// Target that fails its Nth `ingest` call exactly once, then behaves
+    /// forever after. When `idempotent`, it dedups stored entries on
+    /// `content_id`; otherwise it appends every entry (so duplicates are
+    /// visible in `plain`).
+    #[derive(Clone)]
+    struct FailingTarget {
+        state: Arc<Mutex<FtState>>,
+        idempotent: bool,
+    }
+    struct FtState {
+        calls: usize,
+        fail_on_call: usize,
+        plain: Vec<LogInfo>,
+        deduped: HashSet<String>,
+    }
+    impl FailingTarget {
+        fn new(fail_on_call: usize, idempotent: bool) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FtState {
+                    calls: 0,
+                    fail_on_call,
+                    plain: Vec::new(),
+                    deduped: HashSet::new(),
+                })),
+                idempotent,
+            }
+        }
+        fn plain_len(&self) -> usize {
+            self.state.lock().unwrap().plain.len()
+        }
+        fn deduped_len(&self) -> usize {
+            self.state.lock().unwrap().deduped.len()
+        }
+    }
+    impl DynIngestHandle for FailingTarget {
+        fn ingest<'s>(
+            &'s self,
+            logs: Vec<LogInfo>,
+        ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+            let idempotent = self.idempotent;
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut st = state.lock().unwrap();
+                st.calls += 1;
+                if st.calls == st.fail_on_call {
+                    return Err(StreamError::from("simulated mid-stream failure"));
+                }
+                if idempotent {
+                    for e in &logs {
+                        st.deduped.insert(content_id(e));
+                    }
+                } else {
+                    st.plain.extend(logs);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn four_entries() -> Box<dyn DynReadableSource> {
+        Box::new(VecSource(
+            (0..4)
+                .map(|i| LogInfo::new("info", &format!("e{i}")))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        ))
+    }
+
+    /// At-least-once with a plain (non-idempotent) target: the run-1 failure
+    /// (on the 2nd batch) yields no receipt, run 2 re-ships the whole source,
+    /// and the first batch ends up at the target twice.
+    #[test]
+    fn at_least_once_plain_target_shows_duplicates_on_retry() {
+        let target = FailingTarget::new(/*fail_on_call*/ 2, /*idempotent*/ false);
+
+        // Run 1: batch [e0,e1] ships (call 1), batch [e2,e3] fails (call 2).
+        let r1 = futures::executor::block_on(pipe_to_ingest(
+            four_entries(),
+            &target,
+            /*batch_size*/ 2,
+            thread_spawner,
+        ));
+        assert!(r1.is_err(), "the failing batch must surface as Err");
+        assert_eq!(target.plain_len(), 2, "only the first batch made it");
+
+        // Run 2: re-ship the whole source. Batch [e0,e1] ships AGAIN, then
+        // [e2,e3]. Now e0,e1 are at the target twice.
+        let r2 = futures::executor::block_on(pipe_to_ingest(
+            four_entries(),
+            &target,
+            2,
+            thread_spawner,
+        ))
+        .expect("retry should succeed (the target only fails once)");
+        assert_eq!(r2.entries_shipped(), 4);
+        assert_eq!(
+            target.plain_len(),
+            6,
+            "non-idempotent target: 2 (run1) + 4 (run2) = 6, with e0/e1 duped"
+        );
+    }
+
+    /// Same scenario, but the target dedups on `content_id`: the re-shipped
+    /// first batch is a no-op, so the target converges to exactly the 4
+    /// distinct entries — effectively exactly-once.
+    #[test]
+    fn at_least_once_idempotent_target_converges_on_retry() {
+        let target = FailingTarget::new(/*fail_on_call*/ 2, /*idempotent*/ true);
+
+        let r1 = futures::executor::block_on(pipe_to_ingest(
+            four_entries(),
+            &target,
+            2,
+            thread_spawner,
+        ));
+        assert!(r1.is_err());
+        assert_eq!(target.deduped_len(), 2);
+
+        let r2 = futures::executor::block_on(pipe_to_ingest(
+            four_entries(),
+            &target,
+            2,
+            thread_spawner,
+        ))
+        .expect("retry should succeed");
+        assert_eq!(r2.entries_shipped(), 4);
+        assert_eq!(
+            target.deduped_len(),
+            4,
+            "idempotent target: re-ship absorbed, converges to 4 distinct"
+        );
+    }
 }
