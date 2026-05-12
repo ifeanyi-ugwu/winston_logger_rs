@@ -14,8 +14,15 @@
 //! target, then delete the file on success. Run it on a timer for the legacy
 //! `ProxyTransport`'s "every N seconds" behavior.
 
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{
+    fs::File,
+    future::Future,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    pin::Pin,
+};
 
+use flate2::read::GzDecoder;
 use winston_file::FileSource;
 use winston_transport::{
     proxy::pipe_to_ingest, DynIngestHandle, DynReadableSource, LogQuery,
@@ -105,7 +112,7 @@ where
 }
 
 async fn ship_one<F>(
-    path: &std::path::Path,
+    path: &Path,
     target: &dyn DynIngestHandle,
     batch_size: usize,
     spawn_fn: F,
@@ -113,8 +120,18 @@ async fn ship_one<F>(
 where
     F: Fn(Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync + 'static,
 {
-    let source = FileSource::open(path, LogQuery::new()).map_err(ShipError::Open)?;
-    let source: Box<dyn DynReadableSource> = Box::new(source);
+    // `zipped_archive` rotated files arrive here as `.gz` — decompress on the
+    // fly so they ship (and then get deleted) just like plain files. Anything
+    // else is read as a plain JSON-lines file.
+    let file = File::open(path).map_err(ShipError::Open)?;
+    let reader: Box<dyn BufRead + Send> =
+        if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+            Box::new(BufReader::new(GzDecoder::new(file)))
+        } else {
+            Box::new(BufReader::new(file))
+        };
+    let source: Box<dyn DynReadableSource> =
+        Box::new(FileSource::from_reader(reader, LogQuery::new()));
     let n = pipe_to_ingest(source, target, batch_size, move |fut| spawn_fn(fut))
         .await
         .map_err(|e| ShipError::Pipe(e.to_string()))?;
@@ -284,5 +301,79 @@ mod tests {
             "only the active file should remain, found {}",
             remaining.len()
         );
+    }
+
+    /// With `zipped_archive`, rotated files arrive as `.gz`. `ship_rotated_files`
+    /// must decompress, ship, and delete them — not mangle or skip.
+    #[test]
+    fn ship_rotated_files_handles_gzipped_files() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let log_path = temp_dir.path().join("gz.log");
+
+        let transport = DailyRotateFile::builder()
+            .filename(&log_path)
+            .date_pattern("%Y-%m-%d")
+            .max_size(100) // small enough that JSON lines trigger rotation fast
+            .zipped_archive(true)
+            .build()
+            .expect("build transport");
+        let rotation = transport.rotation_handle();
+
+        // Write enough JSON-formatted entries to force several size rotations,
+        // each producing a compressed `.gz` rotated file.
+        drive(transport, |writer| async move {
+            for i in 0..6 {
+                writer
+                    .write(json_log("info", &format!("gz-entry-{i}")))
+                    .await
+                    .expect("write");
+            }
+            writer.close().await.expect("close");
+        });
+
+        // Confirm there are .gz rotated files present before shipping.
+        let gz_before: Vec<_> = rotation
+            .list_rotated_files()
+            .expect("list")
+            .into_iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gz"))
+            .collect();
+        assert!(
+            !gz_before.is_empty(),
+            "expected at least one .gz rotated file, found none"
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::<LogInfo>::new()));
+        let target = CaptureIngest(Arc::clone(&captured));
+        let stats = futures::executor::block_on(ship_rotated_files(
+            &rotation,
+            &target,
+            10,
+            thread_spawner,
+        ))
+        .expect("ship_rotated_files");
+
+        assert_eq!(stats.ship_failures, 0, "no ship failures expected");
+        assert!(
+            stats.entries_shipped >= 1,
+            "should have shipped entries from the gz files, shipped {}",
+            stats.entries_shipped
+        );
+
+        // Every .gz file we saw before is now gone.
+        for p in &gz_before {
+            assert!(!p.exists(), "gz file should be deleted after shipping: {p:?}");
+        }
+
+        // Captured entries are real LogInfos (decompressed + parsed), not garbage.
+        let entries = captured.lock().unwrap();
+        assert!(!entries.is_empty());
+        for e in entries.iter() {
+            assert!(
+                e.message.starts_with("gz-entry-"),
+                "decompressed entry has unexpected message: {:?}",
+                e.message
+            );
+        }
     }
 }

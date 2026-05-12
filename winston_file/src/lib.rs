@@ -151,13 +151,9 @@ struct FileQueryHandle {
 
 impl DynQueryHandle for FileQueryHandle {
     fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>> {
-        let file = File::open(&self.path).ok()?;
-        Some(Box::new(FileSource {
-            reader: Some(BufReader::new(file)),
-            query: options.clone(),
-            visited: 0,
-            emitted: 0,
-        }))
+        FileSource::open(&self.path, options.clone())
+            .ok()
+            .map(|s| Box::new(s) as Box<dyn DynReadableSource>)
     }
 }
 
@@ -351,7 +347,7 @@ impl DynIngestHandle for FileIngestHandle {
 /// whole file first, which defeats streaming. Consumers that need a specific
 /// order should collect the stream and sort.
 pub struct FileSource {
-    reader: Option<BufReader<File>>,
+    reader: Option<Box<dyn BufRead + Send>>,
     query: LogQuery,
     /// Matching entries seen so far — drives `query.start` (skip first N).
     visited: usize,
@@ -366,12 +362,24 @@ impl FileSource {
     /// remote target.
     pub fn open(path: impl AsRef<Path>, query: LogQuery) -> std::io::Result<Self> {
         let file = File::open(path.as_ref())?;
-        Ok(Self {
-            reader: Some(BufReader::new(file)),
+        Ok(Self::from_reader(Box::new(BufReader::new(file)), query))
+    }
+
+    /// Build a source over an arbitrary line reader. Useful when the bytes
+    /// aren't a plain file — e.g. wrap a `flate2::read::GzDecoder` to read a
+    /// gzipped rotated log file:
+    ///
+    /// ```ignore
+    /// let r = BufReader::new(GzDecoder::new(File::open(path)?));
+    /// let source = FileSource::from_reader(Box::new(r), LogQuery::new());
+    /// ```
+    pub fn from_reader(reader: Box<dyn BufRead + Send>, query: LogQuery) -> Self {
+        Self {
+            reader: Some(reader),
             query,
             visited: 0,
             emitted: 0,
-        })
+        }
     }
 }
 
