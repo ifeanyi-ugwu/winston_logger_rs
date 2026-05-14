@@ -241,7 +241,6 @@ impl HttpTransportBuilder {
     }
 }
 
-// ── Spawner helper ──────────────────────────────────────────────────────────
 
 /// Returns a `SpawnFn` that schedules tasks onto the *current* tokio runtime.
 ///

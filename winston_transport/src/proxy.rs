@@ -585,7 +585,6 @@ mod tests {
         );
     }
 
-    // ── Delivery-contract tests ─────────────────────────────────────────────
     //
     // These encode the at-least-once / exactly-once semantics as executable
     // specs: a pipe that fails mid-stream returns no `DrainReceipt`, and a

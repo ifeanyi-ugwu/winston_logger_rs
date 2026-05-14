@@ -37,11 +37,9 @@ async fn main() {
         return;
     };
 
-    // --- temp dir for the rolling log file -------------------------------
     let tmp = tempfile::tempdir().expect("temp dir");
     let log_path = tmp.path().join("app.log");
 
-    // --- the live transport: a daily-rotating file ----------------------
     // Tiny `max_size` so a handful of JSON lines forces several rotations,
     // giving us real rotated files to ship. In production you'd rotate by
     // date (or a sane size) and ship on a timer.
@@ -55,7 +53,6 @@ async fn main() {
     // Pull the rotation handle off BEFORE the Logger consumes the transport.
     let rotation = drf.rotation_handle();
 
-    // --- the Logger, on a tokio-aware spawner ---------------------------
     // MongoDB needs a tokio reactor; the Logger's per-transport WritableStream
     // tasks must run inside one. (DailyRotate itself doesn't need tokio, but
     // using a single tokio spawner for the whole Logger keeps things simple
@@ -66,7 +63,6 @@ async fn main() {
     );
     logger.add_transport(drf);
 
-    // --- produce some logs ---------------------------------------------
     // The Logger's global `json()` format serializes each entry to a JSON
     // line — that's what makes the rotated files round-trip through
     // `FileSource` when they're shipped.
@@ -75,7 +71,6 @@ async fn main() {
     }
     logger.flush().expect("flush");
 
-    // --- the target: MongoDB, idempotent ingest -------------------------
     let mongo = MongoDBTransport::new(MongoDBOptions {
         connection_string: uri.clone(),
         database: "winston_proxy_example".to_string(),
@@ -88,7 +83,6 @@ async fn main() {
         tokio::spawn(fut);
     };
 
-    // --- ship: pass 1 --------------------------------------------------
     let stats1 = ship_rotated_files(&rotation, &*mongo_ingest, 50, spawn)
         .await
         .expect("ship pass 1");
@@ -100,7 +94,6 @@ async fn main() {
         stats1.delete_failures,
     );
 
-    // --- ship: pass 2 (nothing left — the files were deleted on pass 1) -
     let stats2 = ship_rotated_files(&rotation, &*mongo_ingest, 50, spawn)
         .await
         .expect("ship pass 2");
@@ -109,7 +102,6 @@ async fn main() {
         stats2.entries_shipped,
     );
 
-    // --- demonstrate the idempotency that makes crash-retry safe --------
     // Re-ingest the same batch three times directly — the `_id` collision
     // means the collection ends up with exactly one copy of each entry.
     let dup_batch = vec![

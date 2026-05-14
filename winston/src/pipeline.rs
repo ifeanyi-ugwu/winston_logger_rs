@@ -68,7 +68,6 @@ pub fn single_threaded_spawner() -> SpawnFn {
     })
 }
 
-// ── Messages flowing through the main pipeline ──────────────────────────────
 
 pub enum PipelineMessage {
     Entry(Arc<LogInfo>),
@@ -100,14 +99,12 @@ pub enum PipelineMessage {
 unsafe impl Send for PipelineMessage {}
 unsafe impl Sync for PipelineMessage {}
 
-// ── Per-transport messages ───────────────────────────────────────────────────
 
 pub enum TransportMessage {
     Entry(Arc<LogInfo>),
     Flush(futures::channel::oneshot::Sender<()>),
 }
 
-// ── Pipeline source: wraps an unbounded mpsc Receiver ───────────────────────
 
 pub struct PipelineSource {
     rx: fmpsc::UnboundedReceiver<PipelineMessage>,
@@ -132,7 +129,6 @@ impl ReadableSource<PipelineMessage> for PipelineSource {
     }
 }
 
-// ── Per-transport task slot ──────────────────────────────────────────────────
 
 struct TransportSlot {
     handle: TransportHandle,
@@ -142,7 +138,6 @@ struct TransportSlot {
     tx: fmpsc::UnboundedSender<TransportMessage>,
 }
 
-// ── Fanout sink ──────────────────────────────────────────────────────────────
 
 /// Receives pipeline messages, fans log entries out to per-transport tasks,
 /// and handles dynamic transport add/remove without any external locking.
@@ -345,7 +340,6 @@ impl WritableSink<PipelineMessage> for FanoutSink {
     }
 }
 
-// ── Per-transport task ───────────────────────────────────────────────────────
 
 /// Drives one transport.
 ///
@@ -404,7 +398,6 @@ pub async fn run_transport_task<T>(
     let _ = writer.close().await;
 }
 
-// ── Pipeline constructor ─────────────────────────────────────────────────────
 
 /// Builds and returns the pipeline channel sender.
 ///

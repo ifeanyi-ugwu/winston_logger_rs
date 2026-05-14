@@ -55,7 +55,6 @@ impl<'a> TransportBuilder<'a> {
     }
 }
 
-// ── Crossbeam bridge messages ────────────────────────────────────────────────
 // These flow from the sync caller → bridge thread → pipeline channel.
 
 #[derive(Debug)]
@@ -65,7 +64,6 @@ pub enum LogMessage {
     Flush,
 }
 
-// ── Shared state (level metadata only — transports live in FanoutSink) ───────
 
 #[derive(Debug)]
 pub(crate) struct SharedState {
@@ -76,7 +74,6 @@ pub(crate) struct SharedState {
     transport_levels: Vec<(TransportHandle, Option<String>)>,
 }
 
-// ── Logger ───────────────────────────────────────────────────────────────────
 
 pub struct Logger {
     /// Sync caller interface — same as before.
@@ -169,7 +166,6 @@ impl Logger {
         }
     }
 
-    // ── Bridge ────────────────────────────────────────────────────────────────
 
     fn bridge_loop(
         receiver: Arc<Receiver<LogMessage>>,
@@ -209,7 +205,6 @@ impl Logger {
         }
     }
 
-    // ── Level helpers ─────────────────────────────────────────────────────────
 
     fn compute_min_severity(options: &LoggerOptions) -> Option<u8> {
         let levels = options.levels.as_ref()?;
@@ -283,7 +278,6 @@ impl Logger {
         false
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
 
     /// Lock-free level check for use in the caller's hot path.
     ///
@@ -472,7 +466,6 @@ impl Logger {
         Ok(results)
     }
 
-    // ── Dynamic transport management ─────────────────────────────────────────
 
     pub fn transport<T>(&self, transport: T) -> TransportBuilder<'_>
     where
@@ -726,7 +719,6 @@ impl<'kvs> log::kv::Visitor<'kvs> for KeyValueCollector {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

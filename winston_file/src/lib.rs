@@ -23,7 +23,6 @@ use winston_transport::{
     BoxedReadableSource, DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Transport,
 };
 
-// ── Options / builder ────────────────────────────────────────────────────────
 
 pub struct FileTransportOptions {
     pub filename: PathBuf,
@@ -57,7 +56,6 @@ impl FileTransportBuilder {
     }
 }
 
-// ── FileTransport ────────────────────────────────────────────────────────────
 
 /// File-backed transport.
 ///
@@ -373,7 +371,6 @@ impl DynIngestHandle for FileIngestHandle {
     }
 }
 
-// ── FileSource (streaming query) ─────────────────────────────────────────────
 
 /// Reads the underlying file line-by-line, enqueuing entries that match the
 /// query one at a time. Backpressure is handled by the `ReadableStream` the
@@ -480,7 +477,6 @@ impl ReadableSource<LogInfo> for FileSource {
     }
 }
 
-// ── Parsing / matching helpers ──────────────────────────────────────────────
 
 fn parse_log_entry(line: &str) -> Option<LogInfo> {
     let parsed: Value = serde_json::from_str(line).ok()?;
@@ -564,7 +560,6 @@ fn project_fields(entry: LogInfo, fields: &[String]) -> LogInfo {
     )
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -705,7 +700,6 @@ mod tests {
             .expect("rotate_and_drain");
         let (renamed_path, drain_stream) = drain.into_parts();
 
-        // Read everything from the renamed file's stream.
         let drained: Vec<LogInfo> = futures::executor::block_on(async {
             let (_locked_r, reader) = drain_stream.get_reader().expect("get_reader");
             let mut out = Vec::new();

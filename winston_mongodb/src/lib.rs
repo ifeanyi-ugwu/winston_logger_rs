@@ -521,7 +521,6 @@ impl ReadableSource<LogInfo> for MongoDBSource {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn build_filter(query: &LogQuery) -> Document {
     let mut filter_parts = Vec::new();
@@ -624,7 +623,6 @@ async fn create_indexes(collection: &Collection<LogDocument>) -> Result<(), mong
     Ok(())
 }
 
-// ── Spawner helper ──────────────────────────────────────────────────────────
 
 /// Returns a `SpawnFn` that schedules tasks onto the *current* tokio runtime.
 ///
@@ -644,7 +642,6 @@ pub fn tokio_spawner() -> Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send + 's
     })
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -689,7 +686,6 @@ mod tests {
             .expect("write");
         writer.close().await.expect("close");
 
-        // Verify
         let client = Client::with_uri_str(&options.connection_string).await.unwrap();
         let coll: Collection<LogDocument> = client
             .database(&options.database)
@@ -698,7 +694,6 @@ mod tests {
         let result = coll.find_one(filter.clone()).await.unwrap();
         assert!(result.is_some());
 
-        // Cleanup
         coll.delete_one(filter).await.unwrap();
     }
 
@@ -712,7 +707,6 @@ mod tests {
             collection: "logs_query".to_string(),
         };
 
-        // Cleanup any leftover entries from prior runs
         {
             let client = Client::with_uri_str(&options.connection_string).await.unwrap();
             let coll: Collection<LogDocument> = client
@@ -723,7 +717,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Insert via WritableStream
         let transport = MongoDBTransport::new(options.clone());
         let stream = WritableStream::builder(transport)
             .strategy(CountQueuingStrategy::new(8))
@@ -763,7 +756,6 @@ mod tests {
         }
         assert_eq!(collected.len(), 3);
 
-        // Cleanup
         let client = Client::with_uri_str(&options.connection_string).await.unwrap();
         let coll: Collection<LogDocument> = client
             .database(&options.database)
@@ -786,7 +778,6 @@ mod tests {
             collection: "logs_ingest".to_string(),
         };
 
-        // Cleanup any leftover entries from prior runs.
         let client = Client::with_uri_str(&options.connection_string).await.unwrap();
         let coll: Collection<LogDocument> = client
             .database(&options.database)
@@ -806,7 +797,6 @@ mod tests {
             .await
             .expect("ingest");
 
-        // Verify both ended up in the collection.
         use futures::TryStreamExt;
         let mut cursor = coll
             .find(doc! { "message": { "$regex": "^ingest_handle_inserts" } })
@@ -825,7 +815,6 @@ mod tests {
             ]
         );
 
-        // Cleanup
         coll.delete_many(doc! { "message": { "$regex": "^ingest_handle_inserts" } })
             .await
             .unwrap();
@@ -853,7 +842,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Insert three docs to consume.
         let ingest = MongoDBIngestHandle {
             options: options.clone(),
             idempotent: false,
@@ -933,7 +921,6 @@ mod tests {
         }
         assert_eq!(remaining, vec!["consume_test d_after".to_string()]);
 
-        // Cleanup
         coll.delete_many(doc! { "message": { "$regex": "^consume_test" } })
             .await
             .unwrap();
@@ -987,7 +974,6 @@ mod tests {
         }
         assert_eq!(count, 3, "re-sends must not duplicate; expected 3, got {count}");
 
-        // Cleanup
         coll.delete_many(doc! { "message": { "$regex": "^idem_test" } })
             .await
             .unwrap();
