@@ -497,7 +497,14 @@ fn parse_log_entry(line: &str) -> Option<LogInfo> {
             }
         })
         .collect::<HashMap<_, _>>();
-    Some(LogInfo::from_parts(level, message, meta))
+    // Preserve the original line as the finalized form, so an entry read
+    // from a JSON-lines file and written back out (e.g. proxied File → File)
+    // round-trips byte-for-byte instead of degrading to the `level message`
+    // Display fallback. Consumers that want the parts still read `.level` /
+    // `.message` / `.meta`; a re-applied formatter overwrites `.formatted`.
+    let mut info = LogInfo::from_parts(level, message, meta);
+    info.formatted = Some(line.to_string());
+    Some(info)
 }
 
 fn extract_timestamp(entry: &LogInfo) -> Option<DateTime<Utc>> {

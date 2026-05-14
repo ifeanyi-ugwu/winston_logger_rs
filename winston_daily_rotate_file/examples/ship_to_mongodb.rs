@@ -23,7 +23,7 @@ use std::env;
 use std::pin::Pin;
 use std::time::Duration;
 
-use logform::{json, timestamp, Format, LogInfo};
+use logform::{json, LogInfo};
 use winston::{Logger, LoggerOptions};
 use winston_daily_rotate_file::{archive::ship_rotated_files, DailyRotateFile};
 use winston_mongodb::{MongoDBOptions, MongoDBTransport};
@@ -67,13 +67,11 @@ async fn main() {
     logger.add_transport(drf);
 
     // --- produce some logs ---------------------------------------------
+    // The Logger's global `json()` format serializes each entry to a JSON
+    // line — that's what makes the rotated files round-trip through
+    // `FileSource` when they're shipped.
     for i in 0..20 {
-        // Apply `timestamp()` so each line is a realistic JSON log entry.
-        // (The Logger's global `json()` format also applies; both are fine.)
-        let entry = timestamp()
-            .transform(LogInfo::new("info", &format!("event {i}")))
-            .unwrap();
-        logger.log(entry);
+        logger.log(LogInfo::new("info", &format!("event {i}")));
     }
     logger.flush().expect("flush");
 

@@ -373,4 +373,110 @@ mod tests {
             );
         }
     }
+
+    /// End-to-end *pairing* test, no external deps: log into a DailyRotate,
+    /// then `ship_rotated_files` into a real `winston_file::FileTransport`'s
+    /// `ingest_handle` — i.e. two genuine transports composed through the
+    /// proxy helper. Asserts the shipped entries land in the destination
+    /// file, the rotated source files are deleted, the active source file
+    /// survives, and a second ship pass is a no-op.
+    #[test]
+    fn ship_dailyrotate_into_real_file_transport_end_to_end() {
+        use winston_file::FileTransport;
+        use winston_transport::Transport as _;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let src_path = temp_dir.path().join("src.log");
+        let dst_path = temp_dir.path().join("archive.log");
+        let _ = std::fs::remove_file(&dst_path);
+
+        // Source: a daily-rotate file, small max_size so it rotates fast.
+        let src = DailyRotateFile::builder()
+            .filename(&src_path)
+            .date_pattern("%Y-%m-%d")
+            .max_size(120)
+            .build()
+            .expect("build src");
+        let rotation = src.rotation_handle();
+
+        // Produce JSON-formatted entries so the rotated lines round-trip
+        // through FileSource.
+        drive(src, |writer| async move {
+            for i in 0..8 {
+                writer
+                    .write(json_log("info", &format!("paired-{i}")))
+                    .await
+                    .expect("write");
+            }
+            writer.close().await.expect("close");
+        });
+
+        // Target: a real FileTransport at a different path. Its ingest_handle
+        // appends each entry as a line.
+        let dst = FileTransport::builder().filename(&dst_path).build();
+        let dst_ingest = dst.ingest_handle().expect("FileTransport has ingest_handle");
+
+        let stats = futures::executor::block_on(ship_rotated_files(
+            &rotation,
+            &*dst_ingest,
+            /*batch_size*/ 16,
+            thread_spawner,
+        ))
+        .expect("ship pass 1");
+        assert_eq!(stats.ship_failures, 0);
+        assert_eq!(stats.delete_failures, 0);
+        assert!(stats.entries_shipped >= 1);
+        assert!(stats.files_shipped >= 1);
+
+        // The destination file holds exactly the shipped entries. (Not all 8
+        // necessarily shipped — the last one or two may still be in the active
+        // source file — but the destination count must match `entries_shipped`,
+        // and every line must be a `paired-N` entry.)
+        let dst_contents = std::fs::read_to_string(&dst_path).expect("read dst");
+        let shipped_msgs: Vec<String> = dst_contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| {
+                v.get("message").and_then(|m| m.as_str().map(str::to_owned))
+            })
+            .collect();
+        assert_eq!(
+            shipped_msgs.len(),
+            stats.entries_shipped,
+            "destination line count must match shipped count"
+        );
+        for m in &shipped_msgs {
+            assert!(m.starts_with("paired-"), "unexpected shipped message: {m}");
+        }
+
+        // Rotated source files are gone; only the active one remains.
+        let remaining_src: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.starts_with("src.log"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            remaining_src.len(),
+            1,
+            "only the active source file should remain, found {remaining_src:?}"
+        );
+
+        // Pass 2: nothing left to ship.
+        let stats2 = futures::executor::block_on(ship_rotated_files(
+            &rotation,
+            &*dst_ingest,
+            16,
+            thread_spawner,
+        ))
+        .expect("ship pass 2");
+        assert_eq!(stats2.files_shipped, 0);
+        assert_eq!(stats2.entries_shipped, 0);
+    }
 }

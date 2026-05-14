@@ -3455,6 +3455,7 @@ dependencies = [
  "flate2",
  "futures",
  "logform",
+ "serde_json",
  "tempfile",
  "tokio",
  "whatwg_streams",
