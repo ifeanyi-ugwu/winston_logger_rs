@@ -1,39 +1,23 @@
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{fmt, sync::Arc};
 
-use futures::channel::mpsc as fmpsc;
 use logform::{Format, LogInfo};
 use parking_lot::Mutex;
 use winston_transport::{DynQueryHandle, Transport};
 
-use crate::pipeline::{run_transport_task, SpawnFn, TransportMessage};
-
-/// One-shot builder that captures a typed transport and, when invoked by the
-/// pipeline, produces the future for that transport's per-transport task.
-///
-/// The transport is type-erased into the closure so a heterogeneous list of
-/// `LoggerTransport`s can live in the FanoutSink. Mutex<Option<_>> gives
-/// "callable exactly once" — the slot empties when the pipeline takes it.
-type TaskBuilder = Box<
-    dyn FnOnce(
-            fmpsc::UnboundedReceiver<TransportMessage>,
-            Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>, // transport-level
-            Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>, // global
-            SpawnFn,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>
-        + Send,
->;
+use crate::pipeline::{make_writer_builder, TransportWriterBuilder};
 
 /// Configuration the Logger holds about a registered transport.
 ///
 /// The write side of a `Transport: WritableSink<LogInfo>` is consumed when
-/// the pipeline spawns the per-transport task — at that point the typed
-/// transport is moved into a `WritableStream`. The read side (`query_handle`)
-/// is extracted before consumption and stored separately so `Logger::query`
+/// the fanout task admits the transport — at that point the typed transport
+/// is moved into a `WritableStream`. The read side (`query_handle`) is
+/// extracted before consumption and stored separately so `Logger::query`
 /// keeps working independently of the writer's lifetime.
 #[derive(Clone)]
 pub struct LoggerTransport {
-    /// One-shot. The pipeline takes this when spawning; subsequent reads see `None`.
-    builder: Arc<Mutex<Option<TaskBuilder>>>,
+    /// One-shot. The fanout takes this when admitting the transport;
+    /// subsequent reads see `None`.
+    builder: Arc<Mutex<Option<TransportWriterBuilder>>>,
     /// Long-lived. Open as many query streams as you like, even after the
     /// writer side has been consumed.
     query_handle: Option<Arc<dyn DynQueryHandle>>,
@@ -47,24 +31,12 @@ impl LoggerTransport {
         T: Transport,
     {
         // Extract the read-side handle *before* the transport gets sealed
-        // into the task builder closure (which moves it).
+        // into the writer builder closure (which moves it).
         let query_handle: Option<Arc<dyn DynQueryHandle>> =
             transport.query_handle().map(Arc::from);
 
-        let builder: TaskBuilder = Box::new(
-            move |rx, transport_format, global_format, spawn_fn| {
-                Box::pin(run_transport_task(
-                    rx,
-                    transport,
-                    transport_format,
-                    global_format,
-                    spawn_fn,
-                ))
-            },
-        );
-
         Self {
-            builder: Arc::new(Mutex::new(Some(builder))),
+            builder: Arc::new(Mutex::new(Some(make_writer_builder(transport)))),
             query_handle,
             level: None,
             format: None,
@@ -96,9 +68,9 @@ impl LoggerTransport {
         self.query_handle.as_ref()
     }
 
-    /// Take the one-shot task builder. Returns `None` if already consumed.
-    /// Only the pipeline calls this.
-    pub(crate) fn take_builder(&self) -> Option<TaskBuilder> {
+    /// Take the one-shot writer builder. Returns `None` if already consumed.
+    /// Only the fanout task calls this.
+    pub(crate) fn take_builder(&self) -> Option<TransportWriterBuilder> {
         self.builder.lock().take()
     }
 }

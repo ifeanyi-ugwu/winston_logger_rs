@@ -9,8 +9,8 @@ use futures::channel::mpsc as fmpsc;
 use futures::StreamExt;
 use logform::{Format, LogInfo};
 use whatwg_streams::{
-    CountQueuingStrategy, ReadableSource, ReadableStream, ReadableStreamDefaultController,
-    StreamResult, WritableSink, WritableStream, WritableStreamDefaultController,
+    CountQueuingStrategy, StreamResult, WritableSink, WritableStream,
+    WritableStreamDefaultWriter,
 };
 use winston_transport::Transport;
 
@@ -72,7 +72,7 @@ pub fn single_threaded_spawner() -> SpawnFn {
 pub enum PipelineMessage {
     Entry(Arc<LogInfo>),
     Flush(Arc<(Mutex<bool>, Condvar)>),
-    /// Add a transport at runtime; the FanoutSink spawns its task.
+    /// Add a transport at runtime; the fanout task spawns its WritableStream.
     AddTransport {
         handle: TransportHandle,
         transport: LoggerTransport,
@@ -100,82 +100,100 @@ unsafe impl Send for PipelineMessage {}
 unsafe impl Sync for PipelineMessage {}
 
 
-pub enum TransportMessage {
-    Entry(Arc<LogInfo>),
-    Flush(futures::channel::oneshot::Sender<()>),
+/// Sink-type-erased view of a `WritableStreamDefaultWriter<LogInfo, _>`.
+///
+/// Each transport has a different concrete `Sink` type, so the fanout task
+/// can't store their writers in a homogeneous `Vec` directly. This trait
+/// forwards the only two operations the fanout actually performs against a
+/// writer — `write` and `close` — through dynamic dispatch.
+pub(crate) trait ErasedWriter: Send + Sync {
+    fn write<'a>(
+        &'a self,
+        info: LogInfo,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
+
+    fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
 }
 
+impl<Sink> ErasedWriter for WritableStreamDefaultWriter<LogInfo, Sink>
+where
+    Sink: WritableSink<LogInfo> + Send + Sync + 'static,
+{
+    fn write<'a>(
+        &'a self,
+        info: LogInfo,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>> {
+        Box::pin(WritableStreamDefaultWriter::write(self, info))
+    }
 
-pub struct PipelineSource {
-    rx: fmpsc::UnboundedReceiver<PipelineMessage>,
-}
-
-impl PipelineSource {
-    pub fn new(rx: fmpsc::UnboundedReceiver<PipelineMessage>) -> Self {
-        Self { rx }
+    fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>> {
+        Box::pin(WritableStreamDefaultWriter::close(self))
     }
 }
 
-impl ReadableSource<PipelineMessage> for PipelineSource {
-    async fn pull(
-        &mut self,
-        ctrl: &mut ReadableStreamDefaultController<PipelineMessage>,
-    ) -> StreamResult<()> {
-        match self.rx.next().await {
-            Some(msg) => ctrl.enqueue(msg)?,
-            None => ctrl.close()?,
-        }
-        Ok(())
-    }
+/// One-shot factory the fanout invokes when admitting a transport.
+///
+/// Captures the typed transport, spawns its `WritableStream` pump task through
+/// the supplied `SpawnFn`, and returns the sink-erased writer.
+pub type TransportWriterBuilder =
+    Box<dyn FnOnce(SpawnFn) -> Box<dyn ErasedWriter> + Send>;
+
+/// Per-transport queue depth applied via `CountQueuingStrategy`.
+///
+/// A slow transport applies backpressure to the fanout task only once its
+/// WritableStream queue fills; until then, `writer.write(...)` resolves
+/// immediately and the fanout moves on. Sizing this is the per-transport
+/// memory bound under sustained slowness.
+pub const TRANSPORT_QUEUE_HIGH_WATER_MARK: usize = 1024;
+
+/// Construct the type-erased builder used by `LoggerTransport`.
+///
+/// Wraps the typed transport in a `WritableStream` (whose pump task runs on
+/// the spawner supplied at admission time), takes its writer, and erases the
+/// Sink type parameter via `ErasedWriter`.
+pub(crate) fn make_writer_builder<T>(transport: T) -> TransportWriterBuilder
+where
+    T: Transport,
+{
+    Box::new(move |spawn_fn: SpawnFn| {
+        let stream = WritableStream::builder(transport)
+            .strategy(CountQueuingStrategy::new(TRANSPORT_QUEUE_HIGH_WATER_MARK))
+            .spawn(move |fut| spawn_fn(fut));
+
+        // A freshly-built stream is never locked, so this can't fail. We drop
+        // the locked-handle returned alongside the writer — the writer alone
+        // keeps the stream task alive (it holds a clone of the command sender).
+        let (_locked, writer) = stream
+            .get_writer()
+            .expect("fresh WritableStream cannot already be locked");
+        Box::new(writer) as Box<dyn ErasedWriter>
+    })
 }
 
 
 struct TransportSlot {
     handle: TransportHandle,
     level: Option<String>,
-    // Dropping tx closes the channel; run_transport_task drains remaining
-    // messages and exits naturally — no runtime-specific abort needed.
-    tx: fmpsc::UnboundedSender<TransportMessage>,
+    transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    /// Dropping the writer alone does *not* trigger `WritableSink::close`;
+    /// the fanout task awaits `writer.close()` explicitly before discarding
+    /// the slot so transports get their drain-and-close lifecycle.
+    writer: Box<dyn ErasedWriter>,
 }
 
 
-/// Receives pipeline messages, fans log entries out to per-transport tasks,
-/// and handles dynamic transport add/remove without any external locking.
-///
-/// Driven by the writable-stream task; `&mut self` access is always exclusive.
-pub struct FanoutSink {
+struct FanoutState {
     spawn_fn: SpawnFn,
-    transport_tasks: Vec<TransportSlot>,
+    slots: Vec<TransportSlot>,
     global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     global_level: Option<String>,
     levels: Option<LoggerLevels>,
-    /// Entries buffered before the first transport arrives.
+    /// Entries logged before any transport was admitted. Drained into the
+    /// slots the moment the first transport arrives.
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
 }
 
-impl FanoutSink {
-    pub fn new(
-        spawn_fn: SpawnFn,
-        global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-        global_level: Option<String>,
-        levels: Option<LoggerLevels>,
-        buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-        initial_transports: Vec<(TransportHandle, LoggerTransport)>,
-    ) -> Self {
-        let mut sink = Self {
-            spawn_fn,
-            transport_tasks: Vec::new(),
-            global_format,
-            global_level,
-            levels,
-            buffer,
-        };
-        for (handle, transport) in initial_transports {
-            sink.spawn_transport(handle, transport);
-        }
-        sink
-    }
-
+impl FanoutState {
     fn passes_level(&self, entry_level: &str, transport_level: Option<&String>) -> bool {
         let levels = match &self.levels {
             Some(l) => l,
@@ -195,57 +213,67 @@ impl FanoutSink {
         }
     }
 
-    fn spawn_transport(&mut self, handle: TransportHandle, transport: LoggerTransport) {
+    fn admit(&mut self, handle: TransportHandle, transport: LoggerTransport) {
         let level = transport.get_level().cloned();
-        let transport_fmt = transport.get_format();
-        let global_fmt = self.global_format.clone();
-
-        // Take the one-shot builder out of the LoggerTransport. Skip silently
-        // if the transport has already been consumed (e.g. duplicate add).
+        let transport_format = transport.get_format();
         let Some(builder) = transport.take_builder() else {
-            return;
+            return; // Already consumed (e.g. duplicate add) — ignore silently.
         };
-
-        let (tx, rx) = fmpsc::unbounded::<TransportMessage>();
-        let spawn_fn = Arc::clone(&self.spawn_fn);
-        (self.spawn_fn)(builder(rx, transport_fmt, global_fmt, spawn_fn));
-        self.transport_tasks.push(TransportSlot { handle, level, tx });
+        let writer = builder(Arc::clone(&self.spawn_fn));
+        self.slots.push(TransportSlot {
+            handle,
+            level,
+            transport_format,
+            writer,
+        });
     }
 
-    fn stop_transport(&mut self, handle: TransportHandle) {
-        // Removing the slot drops tx, closing the channel. The task drains any
-        // remaining messages and exits on its own — no runtime abort needed.
-        if let Some(pos) = self.transport_tasks.iter().position(|s| s.handle == handle) {
-            self.transport_tasks.remove(pos);
+    /// Format an entry for a specific slot, applying transport-level format
+    /// when present and falling back to the global format otherwise.
+    fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<LogInfo> {
+        match (&slot.transport_format, &self.global_format) {
+            (Some(tf), _) => tf.transform(entry.clone()),
+            (None, Some(gf)) => gf.transform(entry.clone()),
+            (None, None) => Some(entry.clone()),
         }
     }
 
-    fn drain_buffer_to_slots(&mut self) {
+    /// Concurrently writes the entry to every transport whose level admits it.
+    ///
+    /// `join_all` keeps transports isolated within a single entry: a slow
+    /// transport doesn't gate faster ones receiving the same chunk. Across
+    /// entries the fanout is serial — the next entry waits until every
+    /// transport accepted the current one, which is what bounds memory growth
+    /// once each transport's `CountQueuingStrategy` queue fills.
+    async fn fan_entry(&self, entry: &Arc<LogInfo>) {
+        let writes = self.slots.iter().filter_map(|slot| {
+            if !self.passes_level(&entry.level, slot.level.as_ref()) {
+                return None;
+            }
+            let info = self.format_for(slot, entry)?;
+            Some(async move {
+                let _ = slot.writer.write(info).await;
+            })
+        });
+        let _ = futures::future::join_all(writes).await;
+    }
+
+    async fn drain_buffer(&mut self) {
         let buffered: Vec<Arc<LogInfo>> = {
             let mut buf = self.buffer.lock().unwrap();
             buf.drain(..).collect()
         };
-        for entry in buffered {
-            self.fan_entry_to_slots(&entry);
+        for entry in &buffered {
+            self.fan_entry(entry).await;
         }
     }
 
-    fn fan_entry_to_slots(&self, entry: &Arc<LogInfo>) {
-        for slot in &self.transport_tasks {
-            if self.passes_level(&entry.level, slot.level.as_ref()) {
-                let _ = slot
-                    .tx
-                    .unbounded_send(TransportMessage::Entry(Arc::clone(entry)));
-            }
-        }
-    }
-
-    fn process_entry(&mut self, entry: Arc<LogInfo>) {
+    async fn process_entry(&mut self, entry: Arc<LogInfo>) {
         if entry.message.is_empty() && entry.meta.is_empty() {
             return;
         }
 
-        if self.transport_tasks.is_empty() {
+        if self.slots.is_empty() {
             self.buffer.lock().unwrap().push_back(Arc::clone(&entry));
             eprintln!(
                 "[winston] Attempt to write logs with no transports, which can increase memory usage: {}",
@@ -254,61 +282,95 @@ impl FanoutSink {
             return;
         }
 
-        self.drain_buffer_to_slots();
-        self.fan_entry_to_slots(&entry);
+        self.drain_buffer().await;
+        self.fan_entry(&entry).await;
     }
 
-    async fn process_flush(&self, flush_complete: Arc<(Mutex<bool>, Condvar)>) {
-        let rxs: Vec<_> = self
-            .transport_tasks
-            .iter()
-            .map(|slot| {
-                let (tx, rx) = futures::channel::oneshot::channel::<()>();
-                let _ = slot.tx.unbounded_send(TransportMessage::Flush(tx));
-                rx
-            })
-            .collect();
-
-        let _ = futures::future::join_all(rxs).await;
-
-        let (lock, cvar) = &*flush_complete;
-        let mut done = lock.lock().unwrap();
-        *done = true;
-        cvar.notify_one();
-    }
-
-    fn clear_all_transports(&mut self) {
-        // Draining drops every tx, closing all transport channels gracefully.
-        self.transport_tasks.clear();
+    /// Close every transport's writer in parallel and drop the slots.
+    ///
+    /// Awaiting `writer.close()` drives the stream task through
+    /// `WritableSink::close`, which is where transports flush their internal
+    /// buffers (e.g. `BufWriter` → disk). Simply dropping the writer would
+    /// cut the stream task off mid-queue without ever calling `close()`.
+    async fn close_all(&mut self) {
+        let drained: Vec<TransportSlot> = self.slots.drain(..).collect();
+        let closes = drained.iter().map(|slot| async move {
+            let _ = slot.writer.close().await;
+        });
+        let _ = futures::future::join_all(closes).await;
     }
 }
 
-impl WritableSink<PipelineMessage> for FanoutSink {
-    async fn write(
-        &mut self,
-        msg: PipelineMessage,
-        _ctrl: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+
+/// The fanout task.
+///
+/// One async task per Logger consumes every `PipelineMessage`, applies
+/// per-slot formatting and level filtering, and fans entries into each
+/// transport's `WritableStream` writer concurrently. There is no
+/// per-transport receive task — each transport's only async work is its
+/// stream's pump task.
+///
+/// # Flush semantics
+///
+/// WHATWG streams have no mid-life flush primitive — only `close`. By the
+/// time a `Flush` message reaches us through the pipeline channel, every
+/// prior `writer.write(...).await` has resolved, meaning each transport's
+/// stream has *received* every queued entry. Whether the sink's *internal*
+/// buffer (e.g. `BufWriter`) has hit disk is up to the sink. The flush is
+/// acked eagerly here; durable flush happens at transport teardown, when
+/// `writer.close()` runs `WritableSink::close`.
+pub async fn run_fanout(
+    mut rx: fmpsc::UnboundedReceiver<PipelineMessage>,
+    spawn_fn: SpawnFn,
+    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    global_level: Option<String>,
+    levels: Option<LoggerLevels>,
+    buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+    initial_transports: Vec<(TransportHandle, LoggerTransport)>,
+) {
+    let mut state = FanoutState {
+        spawn_fn,
+        slots: Vec::new(),
+        global_format,
+        global_level,
+        levels,
+        buffer,
+    };
+    for (handle, transport) in initial_transports {
+        state.admit(handle, transport);
+    }
+
+    while let Some(msg) = rx.next().await {
         match msg {
-            PipelineMessage::Entry(entry) => self.process_entry(entry),
+            PipelineMessage::Entry(entry) => state.process_entry(entry).await,
 
-            PipelineMessage::Flush(fc) => self.process_flush(fc).await,
-
-            PipelineMessage::AddTransport { handle, transport } => {
-                self.spawn_transport(handle, transport);
-                self.drain_buffer_to_slots();
+            PipelineMessage::Flush(fc) => {
+                let (lock, cvar) = &*fc;
+                let mut done = lock.lock().unwrap();
+                *done = true;
+                cvar.notify_one();
             }
 
-            PipelineMessage::RemoveTransport(handle) => self.stop_transport(handle),
+            PipelineMessage::AddTransport { handle, transport } => {
+                state.admit(handle, transport);
+                state.drain_buffer().await;
+            }
+
+            PipelineMessage::RemoveTransport(handle) => {
+                if let Some(pos) = state.slots.iter().position(|s| s.handle == handle) {
+                    let slot = state.slots.remove(pos);
+                    let _ = slot.writer.close().await;
+                }
+            }
 
             PipelineMessage::Reconfigure {
                 format,
                 level,
                 levels,
             } => {
-                self.global_format = format;
-                self.global_level = level;
-                self.levels = levels;
+                state.global_format = format;
+                state.global_level = level;
+                state.levels = levels;
             }
 
             PipelineMessage::Configure {
@@ -317,93 +379,33 @@ impl WritableSink<PipelineMessage> for FanoutSink {
                 levels,
                 transports,
             } => {
-                self.clear_all_transports();
-                self.global_format = format;
-                self.global_level = level;
-                self.levels = levels;
+                state.close_all().await;
+                state.global_format = format;
+                state.global_level = level;
+                state.levels = levels;
                 for (handle, transport) in transports {
-                    self.spawn_transport(handle, transport);
+                    state.admit(handle, transport);
                 }
-                self.drain_buffer_to_slots();
+                state.drain_buffer().await;
             }
 
             PipelineMessage::Shutdown => {
-                self.clear_all_transports();
-            }
-        }
-        Ok(())
-    }
-
-    async fn close(mut self) -> StreamResult<()> {
-        self.clear_all_transports();
-        Ok(())
-    }
-}
-
-
-/// Drives one transport.
-///
-/// Wraps the transport in a `WritableStream<LogInfo, T>` so writes are
-/// serialized into the sink and backpressure is applied by the queuing
-/// strategy. Per-transport mpsc messages flow in from the FanoutSink; we
-/// translate them to writes against the stream's writer.
-///
-/// # Flush semantics
-///
-/// WHATWG streams have no mid-life flush primitive — only `close`. Each prior
-/// `writer.write(...).await` is fully resolved by the time `Logger::flush`
-/// reaches us, so the sink has *received* every queued entry. Whether the
-/// sink's *internal* buffer (e.g. `BufWriter`) has hit disk is up to the
-/// sink. We ack the flush eagerly; durable flush happens at task shutdown
-/// when the channel closes and `writer.close()` runs (which calls
-/// `WritableSink::close`).
-pub async fn run_transport_task<T>(
-    mut rx: fmpsc::UnboundedReceiver<TransportMessage>,
-    transport: T,
-    transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    spawn_fn: SpawnFn,
-) where
-    T: Transport,
-{
-    let spawn_for_stream = Arc::clone(&spawn_fn);
-    let stream = WritableStream::builder(transport)
-        .strategy(CountQueuingStrategy::new(1024))
-        .spawn(move |fut| spawn_for_stream(fut));
-
-    let Ok((_locked, writer)) = stream.get_writer() else {
-        return;
-    };
-
-    while let Some(msg) = rx.next().await {
-        match msg {
-            TransportMessage::Entry(entry) => {
-                let formatted = match (&transport_format, &global_format) {
-                    (Some(tf), _) => tf.transform((*entry).clone()),
-                    (None, Some(lf)) => lf.transform((*entry).clone()),
-                    (None, None) => Some((*entry).clone()),
-                };
-                if let Some(info) = formatted {
-                    let _ = writer.write(info).await;
-                }
-            }
-            TransportMessage::Flush(tx) => {
-                // Best-effort — see method docs.
-                let _ = tx.send(());
+                state.close_all().await;
             }
         }
     }
 
-    // Channel closed: drain the writer's queue and let the sink's `close` run.
-    let _ = writer.close().await;
+    // Pipeline channel closed: ensure every transport drains and closes its
+    // sink before this task exits.
+    state.close_all().await;
 }
 
 
 /// Builds and returns the pipeline channel sender.
 ///
-/// All tasks are submitted through `spawn_fn`.  The pipeline itself has no
-/// knowledge of the underlying executor — callers wrap whatever runtime they
-/// use into a `SpawnFn` and hand it in.
+/// Spawns exactly one fanout task. All other tasks are spawned indirectly,
+/// one per transport, when a `WritableStream` is built inside the fanout —
+/// no extra plumbing tasks.
 pub fn build_pipeline(
     options: &LoggerOptions,
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
@@ -416,29 +418,16 @@ pub fn build_pipeline(
     let levels = options.levels.clone();
     let initial_transports = options.transports.clone().unwrap_or_default();
 
-    let sink = FanoutSink::new(
-        Arc::clone(&spawn_fn),
+    let fanout_spawn = Arc::clone(&spawn_fn);
+    spawn_fn(Box::pin(run_fanout(
+        rx,
+        fanout_spawn,
         global_format,
         global_level,
         levels,
         buffer,
         initial_transports,
-    );
-    let source = PipelineSource::new(rx);
-
-    let sp = Arc::clone(&spawn_fn);
-    let readable = ReadableStream::builder(source)
-        .strategy(CountQueuingStrategy::new(1))
-        .spawn(move |fut| sp(Box::pin(fut)));
-
-    let sp = Arc::clone(&spawn_fn);
-    let writable = WritableStream::builder(sink)
-        .strategy(CountQueuingStrategy::new(1))
-        .spawn(move |fut| sp(Box::pin(fut)));
-
-    spawn_fn(Box::pin(async move {
-        let _ = readable.pipe_to(&writable, None).await;
-    }));
+    )));
 
     tx
 }

@@ -82,7 +82,7 @@ pub struct Logger {
 
     pub(crate) shared_state: Arc<RwLock<SharedState>>,
 
-    /// Entries buffered when no transports are present.  Shared with FanoutSink.
+    /// Entries buffered when no transports are present. Shared with the fanout task.
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
 
     flush_complete: Arc<(Mutex<bool>, Condvar)>,
@@ -183,8 +183,8 @@ impl Logger {
                     }
                 }
                 LogMessage::Flush => {
-                    // Send flush into the pipeline and let FanoutSink signal
-                    // the condvar when all transports have flushed.
+                    // Send flush into the pipeline and let the fanout task signal
+                    // the condvar once it has processed every prior entry.
                     let fc = Arc::clone(&flush_complete);
                     if pipeline_tx
                         .unbounded_send(PipelineMessage::Flush(fc))
@@ -239,7 +239,7 @@ impl Logger {
 
     fn refresh_effective_levels(state: &mut SharedState, severity_cache: &AtomicU8) {
         // Recompute using transport_levels list (not from options.transports, which
-        // may be stale — the real transports live in FanoutSink).
+        // may be stale — the real transports live in the fanout task).
         let levels = match &state.options.levels {
             Some(l) => l,
             None => {
@@ -386,9 +386,11 @@ impl Logger {
         }
 
         // Flush inline: flush() guards against is_closed so we can't call it here.
-        // The Flush message travels through the pipeline and, once FanoutSink has
-        // forwarded it to every transport task and they all respond, it signals the
-        // condvar — guaranteeing every queued entry is written before we proceed.
+        // The Flush message travels through the pipeline; once the fanout task has
+        // consumed every prior entry from the channel (and therefore awaited each
+        // per-transport write into its WritableStream queue), it signals the
+        // condvar. See `run_fanout`'s flush-semantics doc comment for what
+        // "flushed" means in stream terms.
         {
             let (lock, cvar) = &*self.flush_complete;
             let mut completed = lock.lock().unwrap();
