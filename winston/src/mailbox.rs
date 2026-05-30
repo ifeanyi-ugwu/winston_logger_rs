@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use futures::stream::Stream;
 use futures::task::AtomicWaker;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 /// A bounded SPSC mailbox tailored to the per-transport pump.
 ///
@@ -19,16 +19,23 @@ use parking_lot::Mutex;
 ///   DropOldest` requires.
 ///
 /// This mailbox is single-producer / single-consumer with a fixed capacity,
-/// supports synchronous `try_push`, an async `send` that awaits room, and
-/// a drop-oldest `force_push` that overwrites the head when full. Wake-up
-/// uses one `AtomicWaker` per side — sufficient for one consumer and one
-/// producer at a time. Closing the sender drains-then-ends the receiver.
+/// supports synchronous `try_push`, a synchronous `push_blocking` that parks
+/// the calling thread on a `Condvar` when full, an async `send` that awaits
+/// room, and a drop-oldest `force_push` that overwrites the head when full.
+/// Wake-up uses one `AtomicWaker` per side (for the async paths) plus a
+/// producer-side `Condvar` (for `push_blocking`). Closing the sender
+/// drains-then-ends the receiver; dropping the receiver unblocks any waiting
+/// producer with an error.
 pub(crate) struct MailboxInner<T> {
     queue: Mutex<VecDeque<T>>,
     capacity: usize,
     consumer_waker: AtomicWaker,
     producer_waker: AtomicWaker,
+    producer_condvar: Condvar,
+    /// Sender dropped — consumer's `poll_next` returns `None` after draining.
     closed: AtomicBool,
+    /// Receiver dropped — producer's `push_blocking` / `send` return Err.
+    receiver_dropped: AtomicBool,
 }
 
 pub(crate) struct MailboxSender<T> {
@@ -54,7 +61,9 @@ pub(crate) fn channel<T>(capacity: usize) -> (MailboxSender<T>, MailboxReceiver<
         capacity: capacity.max(1),
         consumer_waker: AtomicWaker::new(),
         producer_waker: AtomicWaker::new(),
+        producer_condvar: Condvar::new(),
         closed: AtomicBool::new(false),
+        receiver_dropped: AtomicBool::new(false),
     });
     (
         MailboxSender {
@@ -68,7 +77,7 @@ impl<T> MailboxSender<T> {
     /// Non-blocking push. Returns `Full(msg)` if the queue is at capacity,
     /// `Closed(msg)` if the receiver dropped.
     pub(crate) fn try_push(&mut self, msg: T) -> Result<(), TryPushError<T>> {
-        if self.inner.closed.load(Ordering::Acquire) {
+        if self.inner.receiver_dropped.load(Ordering::Acquire) {
             return Err(TryPushError::Closed(msg));
         }
         let mut q = self.inner.queue.lock();
@@ -94,6 +103,28 @@ impl<T> MailboxSender<T> {
         drop(q);
         self.inner.consumer_waker.wake();
         dropped
+    }
+
+    /// Synchronous push that parks the calling thread on a `Condvar` when
+    /// the queue is full. Returns `Err(SendError(msg))` if the receiver
+    /// drops while we're waiting (no point completing the push).
+    ///
+    /// Designed for the sync `logger.log()` caller path under
+    /// `OverflowPolicy::Block`.
+    pub(crate) fn push_blocking(&mut self, msg: T) -> Result<(), SendError<T>> {
+        let capacity = self.inner.capacity;
+        let receiver_dropped = &self.inner.receiver_dropped;
+        let mut q = self.inner.queue.lock();
+        self.inner.producer_condvar.wait_while(&mut q, |q| {
+            q.len() >= capacity && !receiver_dropped.load(Ordering::Acquire)
+        });
+        if receiver_dropped.load(Ordering::Acquire) {
+            return Err(SendError(msg));
+        }
+        q.push_back(msg);
+        drop(q);
+        self.inner.consumer_waker.wake();
+        Ok(())
     }
 
     /// Async push that awaits room. Errors only if the receiver dropped
@@ -126,7 +157,7 @@ impl<'a, T: Unpin> Future for Send<'a, T> {
     type Output = Result<(), SendError<T>>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.sender.inner.closed.load(Ordering::Acquire) {
+        if this.sender.inner.receiver_dropped.load(Ordering::Acquire) {
             return Poll::Ready(Err(SendError(this.msg.take().expect("polled after Ready"))));
         }
         let mut q = this.sender.inner.queue.lock();
@@ -147,7 +178,7 @@ impl<'a, T: Unpin> Future for Send<'a, T> {
             this.sender.inner.consumer_waker.wake();
             return Poll::Ready(Ok(()));
         }
-        if this.sender.inner.closed.load(Ordering::Acquire) {
+        if this.sender.inner.receiver_dropped.load(Ordering::Acquire) {
             return Poll::Ready(Err(SendError(this.msg.take().expect("polled after Ready"))));
         }
         Poll::Pending
@@ -162,6 +193,7 @@ impl<T> Stream for MailboxReceiver<T> {
         if let Some(msg) = q.pop_front() {
             drop(q);
             this.inner.producer_waker.wake();
+            this.inner.producer_condvar.notify_one();
             return Poll::Ready(Some(msg));
         }
         if this.inner.closed.load(Ordering::Acquire) {
@@ -173,12 +205,22 @@ impl<T> Stream for MailboxReceiver<T> {
         if let Some(msg) = q.pop_front() {
             drop(q);
             this.inner.producer_waker.wake();
+            this.inner.producer_condvar.notify_one();
             return Poll::Ready(Some(msg));
         }
         if this.inner.closed.load(Ordering::Acquire) {
             return Poll::Ready(None);
         }
         Poll::Pending
+    }
+}
+
+impl<T> Drop for MailboxReceiver<T> {
+    fn drop(&mut self) {
+        self.inner.receiver_dropped.store(true, Ordering::Release);
+        // Unblock any producer parked in `push_blocking` or async `send`.
+        self.inner.producer_waker.wake();
+        self.inner.producer_condvar.notify_all();
     }
 }
 
@@ -248,5 +290,50 @@ mod tests {
             send_fut.await
         });
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn push_blocking_waits_for_room_then_pushes() {
+        let (mut tx, mut rx) = channel::<u32>(1);
+        tx.try_push(1).unwrap();
+
+        // Producer thread parks in push_blocking; main thread pops, which
+        // notifies the condvar and wakes the producer.
+        let producer = std::thread::spawn(move || tx.push_blocking(2));
+
+        // Give the producer thread time to enter the wait.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let popped = block_on(async { rx.next().await });
+        assert_eq!(popped, Some(1));
+
+        let push_result = producer.join().unwrap();
+        assert!(push_result.is_ok());
+
+        // The producer's value should now be queued.
+        let next = block_on(async { rx.next().await });
+        assert_eq!(next, Some(2));
+    }
+
+    #[test]
+    fn push_blocking_returns_err_when_receiver_dropped_while_waiting() {
+        let (mut tx, rx) = channel::<u32>(1);
+        tx.try_push(1).unwrap();
+
+        let producer = std::thread::spawn(move || tx.push_blocking(2));
+
+        // Let the producer park, then drop the receiver to wake it with err.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(rx);
+
+        let push_result = producer.join().unwrap();
+        assert!(matches!(push_result, Err(SendError(2))));
+    }
+
+    #[test]
+    fn try_push_returns_closed_after_receiver_dropped() {
+        let (mut tx, rx) = channel::<u32>(2);
+        drop(rx);
+        assert!(matches!(tx.try_push(1), Err(TryPushError::Closed(1))));
     }
 }
