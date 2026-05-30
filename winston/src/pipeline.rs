@@ -355,40 +355,52 @@ impl FanoutState {
         }
     }
 
-    /// Dispatches an entry into one slot's mailbox according to its policy.
+    /// Dispatches an entry into each slot's mailbox according to its policy.
     ///
     /// `try_send` is non-blocking. On full, `Block` slots await `send` —
     /// which couples the fanout to this slot's drain rate (and via the
     /// fanout, every other slot for the duration), propagating pressure
     /// upstream. `DropNewest` slots drop the entry silently.
-    async fn dispatch_to_slot(&self, slot: &TransportSlot, entry: &Arc<LogInfo>) {
-        if !self.passes_level(&entry.level, slot.level.as_ref()) {
-            return;
-        }
-        let Some(info) = self.format_for(slot, entry) else { return };
+    ///
+    /// Uses `&mut` on the slot's owned sender — must NOT clone, because
+    /// `fmpsc::channel`'s capacity is `buffer + num_senders` and every
+    /// live clone would inflate the bound, defeating the mailbox cap.
+    async fn fan_entry(&mut self, entry: &Arc<LogInfo>) {
+        for i in 0..self.slots.len() {
+            // Phase 1: level / format checks with immutable borrows on
+            // self (passes_level, format_for) and the slot.
+            let (info_opt, overflow) = {
+                let slot = &self.slots[i];
+                let info = if self.passes_level(&entry.level, slot.level.as_ref()) {
+                    self.format_for(slot, entry)
+                } else {
+                    None
+                };
+                (info, slot.overflow)
+            };
+            let Some(info) = info_opt else { continue };
 
-        let mut tx = slot.mailbox_tx.clone();
-        match tx.try_send(SlotMessage::Entry(info)) {
-            Ok(()) => {
-                slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) if e.is_full() => match slot.overflow {
-                OverflowPolicy::Block => {
-                    if tx.send(e.into_inner()).await.is_ok() {
-                        slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+            // Phase 2: mutable borrow only on the slot — `mailbox_tx`
+            // stays single-sender so the channel's capacity is exactly
+            // `buffer + 1`, not `buffer + N_dispatches`.
+            let slot = &mut self.slots[i];
+            let result = slot.mailbox_tx.try_send(SlotMessage::Entry(info));
+            match result {
+                Ok(()) => {
+                    slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) if e.is_full() => match overflow {
+                    OverflowPolicy::Block => {
+                        if slot.mailbox_tx.send(e.into_inner()).await.is_ok() {
+                            slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                }
-                OverflowPolicy::DropNewest => {
-                    slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
-                }
-            },
-            Err(_) => {} // pump gone — slot is being torn down
-        }
-    }
-
-    async fn fan_entry(&self, entry: &Arc<LogInfo>) {
-        for slot in &self.slots {
-            self.dispatch_to_slot(slot, entry).await;
+                    OverflowPolicy::DropNewest => {
+                        slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                Err(_) => {} // pump gone — slot is being torn down
+            }
         }
     }
 
