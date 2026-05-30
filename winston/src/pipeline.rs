@@ -516,20 +516,33 @@ impl FanoutState {
 
     /// Tear down every slot: send `Close`, then join each pump.
     ///
+    /// Both the `Close` sends and the pump-done waits run in parallel.
+    /// Serial sends would compound under multi-slow-sink shutdown — each
+    /// `send.await` waits for that slot's mailbox to drain, so serial is
+    /// O(N · slow-sink-latency) while parallel is O(max). Pump-done was
+    /// already parallel; this brings the send half in line.
+    ///
     /// The pump runs `writer.close()` (which drives `WritableSink::close`)
     /// before exiting. Without joining, dropping the mailbox would race the
     /// pump's close future and skip the sink's flush-and-close lifecycle.
     async fn close_all(&mut self) {
         let drained: Vec<TransportSlot> = self.slots.drain(..).collect();
+        let mut closes = Vec::with_capacity(drained.len());
         let mut dones = Vec::with_capacity(drained.len());
         let mut handles = Vec::with_capacity(drained.len());
         for mut slot in drained {
             handles.push(slot.handle);
-            let _ = slot.mailbox_tx.send(SlotMessage::Close).await;
             if let Some(rx) = slot.pump_done.take() {
                 dones.push(rx);
             }
+            // Partial-move: own mailbox_tx into the close future so each
+            // send can race against its own pump independently.
+            let mut tx = slot.mailbox_tx;
+            closes.push(async move {
+                let _ = tx.send(SlotMessage::Close).await;
+            });
         }
+        let _ = futures::future::join_all(closes).await;
         let _ = futures::future::join_all(dones).await;
         let mut map = self.stats_map.write().unwrap();
         for h in handles {
