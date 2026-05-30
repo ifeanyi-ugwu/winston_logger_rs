@@ -1,6 +1,6 @@
 use crate::{
     logger_builder::LoggerBuilder,
-    logger_options::{BackpressureStrategy, LoggerOptions},
+    logger_options::{BackpressureStrategy, LoggerOptions, OverflowPolicy},
     logger_transport::{IntoLoggerTransport, LoggerTransport},
     pipeline::{self, PipelineMessage},
 };
@@ -47,6 +47,11 @@ impl<'a> TransportBuilder<'a> {
         F: logform::Format<Input = LogInfo> + Send + Sync + 'static,
     {
         self.logger_transport = self.logger_transport.with_format(format);
+        self
+    }
+
+    pub fn with_overflow_policy(mut self, policy: OverflowPolicy) -> Self {
+        self.logger_transport = self.logger_transport.with_overflow_policy(policy);
         self
     }
 

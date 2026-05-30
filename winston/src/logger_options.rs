@@ -189,3 +189,26 @@ pub enum BackpressureStrategy {
     Block,
     DropCurrent,
 }
+
+/// Per-transport policy applied when the slot's mailbox is full.
+///
+/// `Block` propagates pressure end-to-end: a saturated `Block` slot stalls
+/// the fanout, which fills the main channel and trips the caller-side
+/// `BackpressureStrategy`. Pick this for durability sinks (file, daily-rotate)
+/// where dropping is unacceptable.
+///
+/// `DropNewest` short-circuits at the mailbox boundary: the slot never
+/// couples the fanout, but loses entries under sustained pressure. Pick this
+/// for telemetry lanes (HTTP, Mongo, console) where freshness matters more
+/// than completeness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    Block,
+    DropNewest,
+}
+
+impl Default for OverflowPolicy {
+    fn default() -> Self {
+        OverflowPolicy::Block
+    }
+}

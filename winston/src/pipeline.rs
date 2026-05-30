@@ -5,8 +5,8 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
-use futures::channel::mpsc as fmpsc;
-use futures::StreamExt;
+use futures::channel::{mpsc as fmpsc, oneshot};
+use futures::{SinkExt, StreamExt};
 use logform::{Format, LogInfo};
 use whatwg_streams::{
     CountQueuingStrategy, StreamResult, WritableSink, WritableStream,
@@ -17,7 +17,7 @@ use winston_transport::Transport;
 use crate::{
     logger::TransportHandle,
     logger_levels::LoggerLevels,
-    logger_options::LoggerOptions,
+    logger_options::{LoggerOptions, OverflowPolicy},
     logger_transport::LoggerTransport,
 };
 
@@ -102,15 +102,21 @@ unsafe impl Sync for PipelineMessage {}
 
 /// Sink-type-erased view of a `WritableStreamDefaultWriter<LogInfo, _>`.
 ///
-/// Each transport has a different concrete `Sink` type, so the fanout task
-/// can't store their writers in a homogeneous `Vec` directly. This trait
-/// forwards the only two operations the fanout actually performs against a
-/// writer — `write` and `close` — through dynamic dispatch.
+/// Each transport has a different concrete `Sink` type, so the slot pump
+/// can't store its writer behind a homogeneous interface directly. The
+/// pump needs:
+/// - `enqueue_when_ready` — fire chunks into the stream queue (bounded by
+///   HWM via `ready()`), so multiple writes can pipeline through the sink.
+/// - `flush` — wait until every queued + in-flight chunk has been processed
+///   by the sink, without closing the stream.
+/// - `close` — drive `WritableSink::close` at teardown.
 pub(crate) trait ErasedWriter: Send + Sync {
-    fn write<'a>(
+    fn enqueue_when_ready<'a>(
         &'a self,
         info: LogInfo,
     ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
+
+    fn flush<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
 
     fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
 }
@@ -119,11 +125,15 @@ impl<Sink> ErasedWriter for WritableStreamDefaultWriter<LogInfo, Sink>
 where
     Sink: WritableSink<LogInfo> + Send + Sync + 'static,
 {
-    fn write<'a>(
+    fn enqueue_when_ready<'a>(
         &'a self,
         info: LogInfo,
     ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>> {
-        Box::pin(WritableStreamDefaultWriter::write(self, info))
+        Box::pin(WritableStreamDefaultWriter::enqueue_when_ready(self, info))
+    }
+
+    fn flush<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>> {
+        Box::pin(WritableStreamDefaultWriter::flush(self))
     }
 
     fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>> {
@@ -171,14 +181,66 @@ where
 }
 
 
+/// Mailbox capacity used for every per-transport queue.
+///
+/// Sized to match `TRANSPORT_QUEUE_HIGH_WATER_MARK` so the two layered bounds
+/// (fanout→pump mailbox and pump→WritableStream queue) have the same shape.
+pub const TRANSPORT_MAILBOX_CAPACITY: usize = 1024;
+
+/// Message sent from the fanout to a slot's pump task.
+enum SlotMessage {
+    Entry(LogInfo),
+    /// Barrier: pump processes prior `Entry` messages, drains until the
+    /// stream is ready, then acks. Used to implement logger-level flush.
+    Flush(oneshot::Sender<()>),
+    /// Pump runs `writer.close()` (driving `WritableSink::close`), then exits.
+    Close,
+}
+
 struct TransportSlot {
     handle: TransportHandle,
     level: Option<String>,
     transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    /// Dropping the writer alone does *not* trigger `WritableSink::close`;
-    /// the fanout task awaits `writer.close()` explicitly before discarding
-    /// the slot so transports get their drain-and-close lifecycle.
+    overflow: OverflowPolicy,
+    /// Bounded channel into the per-slot pump. Fanout dispatches via
+    /// `try_send` here; on full, `overflow` decides what happens next.
+    mailbox_tx: fmpsc::Sender<SlotMessage>,
+    /// Resolves when the pump task has exited (after `writer.close()`).
+    pump_done: Option<oneshot::Receiver<()>>,
+}
+
+/// The per-transport pump task.
+///
+/// Owns the slot's writer and drains the mailbox in order. Entries go
+/// through `enqueue_when_ready` — the pump parks when the WritableStream's
+/// queue hits its high-water mark, so the HWM does real work and chunks
+/// pipeline through the sink instead of being serialised on completion.
+///
+/// `Flush` translates to `writer.flush()`, which awaits every queued and
+/// in-flight chunk against the sink without tearing the stream down. The
+/// pump is policy-agnostic — `OverflowPolicy` only governs the fanout's
+/// dispatch on a full mailbox.
+async fn slot_pump(
+    mut mailbox_rx: fmpsc::Receiver<SlotMessage>,
     writer: Box<dyn ErasedWriter>,
+    done: oneshot::Sender<()>,
+) {
+    while let Some(msg) = mailbox_rx.next().await {
+        match msg {
+            SlotMessage::Entry(info) => {
+                let _ = writer.enqueue_when_ready(info).await;
+            }
+            SlotMessage::Flush(ack) => {
+                let _ = writer.flush().await;
+                let _ = ack.send(());
+            }
+            SlotMessage::Close => {
+                let _ = writer.close().await;
+                break;
+            }
+        }
+    }
+    let _ = done.send(());
 }
 
 
@@ -216,15 +278,24 @@ impl FanoutState {
     fn admit(&mut self, handle: TransportHandle, transport: LoggerTransport) {
         let level = transport.get_level().cloned();
         let transport_format = transport.get_format();
+        let overflow = transport.overflow_policy();
         let Some(builder) = transport.take_builder() else {
             return; // Already consumed (e.g. duplicate add) — ignore silently.
         };
         let writer = builder(Arc::clone(&self.spawn_fn));
+
+        let (mailbox_tx, mailbox_rx) = fmpsc::channel::<SlotMessage>(TRANSPORT_MAILBOX_CAPACITY);
+        let (done_tx, done_rx) = oneshot::channel();
+        let pump = slot_pump(mailbox_rx, writer, done_tx);
+        (self.spawn_fn)(Box::pin(pump));
+
         self.slots.push(TransportSlot {
             handle,
             level,
             transport_format,
-            writer,
+            overflow,
+            mailbox_tx,
+            pump_done: Some(done_rx),
         });
     }
 
@@ -238,24 +309,35 @@ impl FanoutState {
         }
     }
 
-    /// Concurrently writes the entry to every transport whose level admits it.
+    /// Dispatches an entry into one slot's mailbox according to its policy.
     ///
-    /// `join_all` keeps transports isolated within a single entry: a slow
-    /// transport doesn't gate faster ones receiving the same chunk. Across
-    /// entries the fanout is serial — the next entry waits until every
-    /// transport accepted the current one, which is what bounds memory growth
-    /// once each transport's `CountQueuingStrategy` queue fills.
+    /// `try_send` is non-blocking. On full, `Block` slots await `send` —
+    /// which couples the fanout to this slot's drain rate (and via the
+    /// fanout, every other slot for the duration), propagating pressure
+    /// upstream. `DropNewest` slots drop the entry silently.
+    async fn dispatch_to_slot(&self, slot: &TransportSlot, entry: &Arc<LogInfo>) {
+        if !self.passes_level(&entry.level, slot.level.as_ref()) {
+            return;
+        }
+        let Some(info) = self.format_for(slot, entry) else { return };
+
+        let mut tx = slot.mailbox_tx.clone();
+        match tx.try_send(SlotMessage::Entry(info)) {
+            Ok(()) => {}
+            Err(e) if e.is_full() => match slot.overflow {
+                OverflowPolicy::Block => {
+                    let _ = tx.send(e.into_inner()).await;
+                }
+                OverflowPolicy::DropNewest => {}
+            },
+            Err(_) => {} // pump gone — slot is being torn down
+        }
+    }
+
     async fn fan_entry(&self, entry: &Arc<LogInfo>) {
-        let writes = self.slots.iter().filter_map(|slot| {
-            if !self.passes_level(&entry.level, slot.level.as_ref()) {
-                return None;
-            }
-            let info = self.format_for(slot, entry)?;
-            Some(async move {
-                let _ = slot.writer.write(info).await;
-            })
-        });
-        let _ = futures::future::join_all(writes).await;
+        for slot in &self.slots {
+            self.dispatch_to_slot(slot, entry).await;
+        }
     }
 
     async fn drain_buffer(&mut self) {
@@ -286,18 +368,46 @@ impl FanoutState {
         self.fan_entry(&entry).await;
     }
 
-    /// Close every transport's writer in parallel and drop the slots.
+    /// Send Flush barriers into every slot and await all acks.
     ///
-    /// Awaiting `writer.close()` drives the stream task through
-    /// `WritableSink::close`, which is where transports flush their internal
-    /// buffers (e.g. `BufWriter` → disk). Simply dropping the writer would
-    /// cut the stream task off mid-queue without ever calling `close()`.
+    /// `send().await` (not `try_send`) guarantees the barrier reaches the
+    /// back of each mailbox even when full — flush is a synchronisation
+    /// point, not a drop candidate. Each pump processes the barrier after
+    /// all prior `Entry` messages.
+    async fn flush_all(&mut self) {
+        let mut acks = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let (tx, rx) = oneshot::channel();
+            let mut mbox = slot.mailbox_tx.clone();
+            if mbox.send(SlotMessage::Flush(tx)).await.is_ok() {
+                acks.push(rx);
+            }
+        }
+        for rx in acks {
+            let _ = rx.await;
+        }
+    }
+
+    /// Tear down every slot: send `Close`, then join each pump.
+    ///
+    /// The pump runs `writer.close()` (which drives `WritableSink::close`)
+    /// before exiting. Without joining, dropping the mailbox would race the
+    /// pump's close future and skip the sink's flush-and-close lifecycle.
     async fn close_all(&mut self) {
         let drained: Vec<TransportSlot> = self.slots.drain(..).collect();
-        let closes = drained.iter().map(|slot| async move {
-            let _ = slot.writer.close().await;
-        });
+        let mut closes = Vec::with_capacity(drained.len());
+        let mut dones = Vec::with_capacity(drained.len());
+        for mut slot in drained {
+            let mut mbox = slot.mailbox_tx.clone();
+            closes.push(async move {
+                let _ = mbox.send(SlotMessage::Close).await;
+            });
+            if let Some(rx) = slot.pump_done.take() {
+                dones.push(rx);
+            }
+        }
         let _ = futures::future::join_all(closes).await;
+        let _ = futures::future::join_all(dones).await;
     }
 }
 
@@ -305,20 +415,27 @@ impl FanoutState {
 /// The fanout task.
 ///
 /// One async task per Logger consumes every `PipelineMessage`, applies
-/// per-slot formatting and level filtering, and fans entries into each
-/// transport's `WritableStream` writer concurrently. There is no
-/// per-transport receive task — each transport's only async work is its
-/// stream's pump task.
+/// per-slot formatting and level filtering, and dispatches entries into
+/// each transport's per-slot mailbox. The mailbox is drained by a
+/// per-transport pump task that owns the `WritableStream` writer.
+///
+/// # Pressure model
+///
+/// The fanout itself never blocks on `Entry` dispatch unless a slot is
+/// configured `OverflowPolicy::Block` *and* its mailbox is full. In that
+/// case the fanout awaits `send` on that slot's mailbox, which propagates
+/// pressure back through the bridge → main channel → caller. Slots with
+/// `DropNewest` short-circuit at the mailbox boundary and never gate the
+/// fanout.
 ///
 /// # Flush semantics
 ///
-/// WHATWG streams have no mid-life flush primitive — only `close`. By the
-/// time a `Flush` message reaches us through the pipeline channel, every
-/// prior `writer.write(...).await` has resolved, meaning each transport's
-/// stream has *received* every queued entry. Whether the sink's *internal*
-/// buffer (e.g. `BufWriter`) has hit disk is up to the sink. The flush is
-/// acked eagerly here; durable flush happens at transport teardown, when
-/// `writer.close()` runs `WritableSink::close`.
+/// `Flush` is implemented as a per-slot barrier: a `SlotMessage::Flush`
+/// is sent (via `send().await`) into every mailbox and the fanout awaits
+/// every pump's ack. Each pump acks after `writer.ready().await` — i.e.
+/// once its queue has drained below the high-water mark. Durable flush
+/// (sink-level buffer → disk) happens at transport teardown via
+/// `WritableSink::close`.
 pub async fn run_fanout(
     mut rx: fmpsc::UnboundedReceiver<PipelineMessage>,
     spawn_fn: SpawnFn,
@@ -345,6 +462,7 @@ pub async fn run_fanout(
             PipelineMessage::Entry(entry) => state.process_entry(entry).await,
 
             PipelineMessage::Flush(fc) => {
+                state.flush_all().await;
                 let (lock, cvar) = &*fc;
                 let mut done = lock.lock().unwrap();
                 *done = true;
@@ -358,8 +476,12 @@ pub async fn run_fanout(
 
             PipelineMessage::RemoveTransport(handle) => {
                 if let Some(pos) = state.slots.iter().position(|s| s.handle == handle) {
-                    let slot = state.slots.remove(pos);
-                    let _ = slot.writer.close().await;
+                    let mut slot = state.slots.remove(pos);
+                    let mut mbox = slot.mailbox_tx.clone();
+                    let _ = mbox.send(SlotMessage::Close).await;
+                    if let Some(rx) = slot.pump_done.take() {
+                        let _ = rx.await;
+                    }
                 }
             }
 

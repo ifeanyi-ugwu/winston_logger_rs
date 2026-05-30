@@ -4,7 +4,10 @@ use logform::{Format, LogInfo};
 use parking_lot::Mutex;
 use winston_transport::{DynQueryHandle, Transport};
 
-use crate::pipeline::{make_writer_builder, TransportWriterBuilder};
+use crate::{
+    logger_options::OverflowPolicy,
+    pipeline::{make_writer_builder, TransportWriterBuilder},
+};
 
 /// Configuration the Logger holds about a registered transport.
 ///
@@ -23,6 +26,7 @@ pub struct LoggerTransport {
     query_handle: Option<Arc<dyn DynQueryHandle>>,
     level: Option<String>,
     format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    overflow_policy: OverflowPolicy,
 }
 
 impl LoggerTransport {
@@ -40,6 +44,7 @@ impl LoggerTransport {
             query_handle,
             level: None,
             format: None,
+            overflow_policy: OverflowPolicy::default(),
         }
     }
 
@@ -56,12 +61,21 @@ impl LoggerTransport {
         self
     }
 
+    pub fn with_overflow_policy(mut self, policy: OverflowPolicy) -> Self {
+        self.overflow_policy = policy;
+        self
+    }
+
     pub fn get_level(&self) -> Option<&String> {
         self.level.as_ref()
     }
 
     pub fn get_format(&self) -> Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>> {
         self.format.clone()
+    }
+
+    pub fn overflow_policy(&self) -> OverflowPolicy {
+        self.overflow_policy
     }
 
     pub fn query_handle(&self) -> Option<&Arc<dyn DynQueryHandle>> {
@@ -81,6 +95,7 @@ impl fmt::Debug for LoggerTransport {
             .field("level", &self.level)
             .field("format", &self.format.as_ref().map(|_| "Format<...>"))
             .field("queryable", &self.query_handle.is_some())
+            .field("overflow_policy", &self.overflow_policy)
             .finish()
     }
 }
