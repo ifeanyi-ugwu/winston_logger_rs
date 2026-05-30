@@ -5,6 +5,7 @@ mod logger_builder;
 mod logger_levels;
 mod logger_options;
 mod logger_transport;
+mod mailbox;
 mod pipeline;
 pub mod transports;
 

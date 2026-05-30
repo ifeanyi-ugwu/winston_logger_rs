@@ -9,7 +9,7 @@ use std::{
 };
 
 use futures::channel::{mpsc as fmpsc, oneshot};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use logform::{Format, LogInfo};
 use whatwg_streams::{
     CountQueuingStrategy, StreamResult, WritableSink, WritableStream,
@@ -22,6 +22,7 @@ use crate::{
     logger_levels::LoggerLevels,
     logger_options::{LoggerOptions, OverflowPolicy},
     logger_transport::LoggerTransport,
+    mailbox::{self, MailboxReceiver, MailboxSender, TryPushError},
 };
 
 /// Snapshot of a transport's lifetime counters.
@@ -263,7 +264,7 @@ struct TransportSlot {
     overflow: OverflowPolicy,
     /// Bounded channel into the per-slot pump. Fanout dispatches via
     /// `try_send` here; on full, `overflow` decides what happens next.
-    mailbox_tx: fmpsc::Sender<SlotMessage>,
+    mailbox_tx: MailboxSender<SlotMessage>,
     /// Resolves when the pump task has exited (after `writer.close()`).
     pump_done: Option<oneshot::Receiver<()>>,
     /// Same `Arc` the Logger reads from for `transport_stats(handle)`.
@@ -285,7 +286,7 @@ struct TransportSlot {
 /// pump is policy-agnostic — `OverflowPolicy` only governs the fanout's
 /// dispatch on a full mailbox.
 async fn slot_pump(
-    mut mailbox_rx: fmpsc::Receiver<SlotMessage>,
+    mut mailbox_rx: MailboxReceiver<SlotMessage>,
     writer: Box<dyn ErasedWriter>,
     done: oneshot::Sender<()>,
 ) {
@@ -362,7 +363,7 @@ impl FanoutState {
             .or_insert_with(|| Arc::new(TransportStatsInner::default()))
             .clone();
 
-        let (mailbox_tx, mailbox_rx) = fmpsc::channel::<SlotMessage>(capacity);
+        let (mailbox_tx, mailbox_rx) = mailbox::channel::<SlotMessage>(capacity);
         let (done_tx, done_rx) = oneshot::channel();
         let pump = slot_pump(mailbox_rx, writer, done_tx);
         (self.spawn_fn)(Box::pin(pump));
@@ -421,11 +422,11 @@ impl FanoutState {
             };
             let Some(info) = info_opt else { continue };
 
-            // Phase 2: mutable borrow only on the slot — `mailbox_tx`
-            // stays single-sender so the channel's capacity is exactly
-            // `buffer + 1`, not `buffer + N_dispatches`.
+            // Phase 2: mutable borrow on the slot. The mailbox is a
+            // single-producer custom queue with a fixed capacity — no
+            // per-sender slot inflation; `try_push` honours the cap.
             let slot = &mut self.slots[i];
-            let result = slot.mailbox_tx.try_send(SlotMessage::Entry(info));
+            let result = slot.mailbox_tx.try_push(SlotMessage::Entry(info));
             match result {
                 Ok(()) => {
                     slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
@@ -436,7 +437,7 @@ impl FanoutState {
                         );
                     }
                 }
-                Err(e) if e.is_full() => {
+                Err(TryPushError::Full(msg)) => {
                     if !slot.was_saturated.swap(true, Ordering::Relaxed) {
                         emit_event(
                             &event_senders,
@@ -445,7 +446,7 @@ impl FanoutState {
                     }
                     match overflow {
                         OverflowPolicy::Block => {
-                            if slot.mailbox_tx.send(e.into_inner()).await.is_ok() {
+                            if slot.mailbox_tx.send(msg).await.is_ok() {
                                 slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -454,7 +455,7 @@ impl FanoutState {
                         }
                     }
                 }
-                Err(_) => {} // pump gone — slot is being torn down
+                Err(TryPushError::Closed(_)) => {} // pump gone — slot torn down
             }
         }
     }
@@ -489,16 +490,15 @@ impl FanoutState {
 
     /// Send Flush barriers into every slot and await all acks.
     ///
-    /// `send().await` (not `try_send`) guarantees the barrier reaches the
+    /// `send().await` (not `try_push`) guarantees the barrier reaches the
     /// back of each mailbox even when full — flush is a synchronisation
     /// point, not a drop candidate. Each pump processes the barrier after
     /// all prior `Entry` messages.
     async fn flush_all(&mut self) {
         let mut acks = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
+        for slot in &mut self.slots {
             let (tx, rx) = oneshot::channel();
-            let mut mbox = slot.mailbox_tx.clone();
-            if mbox.send(SlotMessage::Flush(tx)).await.is_ok() {
+            if slot.mailbox_tx.send(SlotMessage::Flush(tx)).await.is_ok() {
                 acks.push(rx);
             }
         }
@@ -514,20 +514,15 @@ impl FanoutState {
     /// pump's close future and skip the sink's flush-and-close lifecycle.
     async fn close_all(&mut self) {
         let drained: Vec<TransportSlot> = self.slots.drain(..).collect();
-        let mut closes = Vec::with_capacity(drained.len());
         let mut dones = Vec::with_capacity(drained.len());
         let mut handles = Vec::with_capacity(drained.len());
         for mut slot in drained {
             handles.push(slot.handle);
-            let mut mbox = slot.mailbox_tx.clone();
-            closes.push(async move {
-                let _ = mbox.send(SlotMessage::Close).await;
-            });
+            let _ = slot.mailbox_tx.send(SlotMessage::Close).await;
             if let Some(rx) = slot.pump_done.take() {
                 dones.push(rx);
             }
         }
-        let _ = futures::future::join_all(closes).await;
         let _ = futures::future::join_all(dones).await;
         let mut map = self.stats_map.write().unwrap();
         for h in handles {
@@ -606,8 +601,7 @@ pub async fn run_fanout(
             PipelineMessage::RemoveTransport(handle) => {
                 if let Some(pos) = state.slots.iter().position(|s| s.handle == handle) {
                     let mut slot = state.slots.remove(pos);
-                    let mut mbox = slot.mailbox_tx.clone();
-                    let _ = mbox.send(SlotMessage::Close).await;
+                    let _ = slot.mailbox_tx.send(SlotMessage::Close).await;
                     if let Some(rx) = slot.pump_done.take() {
                         let _ = rx.await;
                     }
