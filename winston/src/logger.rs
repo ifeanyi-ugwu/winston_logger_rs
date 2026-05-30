@@ -2,7 +2,10 @@ use crate::{
     logger_builder::LoggerBuilder,
     logger_options::{BackpressureStrategy, LoggerOptions, OverflowPolicy},
     logger_transport::{IntoLoggerTransport, LoggerTransport},
-    pipeline::{self, PipelineMessage, TransportStats, TransportStatsInner, TransportStatsMap},
+    pipeline::{
+        self, BackpressureEvent, EventSenders, PipelineMessage, TransportStats,
+        TransportStatsInner, TransportStatsMap,
+    },
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use futures::channel::mpsc as fmpsc;
@@ -115,6 +118,11 @@ pub struct Logger {
     /// side; the fanout inserts entries on admit and removes them on
     /// teardown.
     stats_map: TransportStatsMap,
+
+    /// Live `BackpressureEvent` subscribers, shared with the fanout. The
+    /// fanout writes (emits); `subscribe_backpressure` pushes a new
+    /// sender here for each subscription.
+    event_senders: EventSenders,
 }
 
 impl Logger {
@@ -150,6 +158,7 @@ impl Logger {
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
         let stats_map: TransportStatsMap =
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let event_senders: EventSenders = Arc::new(Mutex::new(Vec::new()));
 
         // Pre-create stats entries for initially-configured transports.
         {
@@ -166,6 +175,7 @@ impl Logger {
             Arc::clone(&buffer),
             spawn_fn_for_pipeline,
             Arc::clone(&stats_map),
+            Arc::clone(&event_senders),
         );
 
         // Bridge thread: crossbeam → pipeline channel.
@@ -195,6 +205,7 @@ impl Logger {
             bridge_thread: Mutex::new(Some(bridge_thread)),
             spawn_fn,
             stats_map,
+            event_senders,
         }
     }
 
@@ -561,6 +572,21 @@ impl Logger {
             .unwrap()
             .get(&handle)
             .map(|s| s.snapshot())
+    }
+
+    /// Subscribe to per-transport backpressure transitions.
+    ///
+    /// Each call returns a fresh receiver. Multiple concurrent subscribers
+    /// are supported — every emitted `BackpressureEvent` is delivered to
+    /// every live receiver. Dropping the receiver unsubscribes (the fanout
+    /// prunes dead senders on its next emit).
+    ///
+    /// Events are edge-triggered (full ↔ has-room transitions), so even
+    /// under sustained pressure the event rate stays bounded.
+    pub fn subscribe_backpressure(&self) -> fmpsc::UnboundedReceiver<BackpressureEvent> {
+        let (tx, rx) = fmpsc::unbounded();
+        self.event_senders.lock().unwrap().push(tx);
+        rx
     }
 
     pub fn remove_transport(&self, handle: TransportHandle) -> bool {
@@ -1291,5 +1317,112 @@ mod tests {
         let logger = Logger::new(None);
         let fake = TransportHandle(99_999);
         assert!(logger.transport_stats(fake).is_none());
+    }
+
+    /// A WritableSink that takes its write-completion permits from a
+    /// channel — sustains backpressure across many writes (not just the
+    /// first), unlike a single-shot oneshot gate. The test drives the
+    /// rate by sending permits.
+    struct PermittedTransport {
+        permits: futures::channel::mpsc::UnboundedReceiver<()>,
+    }
+
+    impl WritableSink<LogInfo> for PermittedTransport {
+        async fn write(
+            &mut self,
+            _info: LogInfo,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            let _ = self.permits.next().await;
+            Ok(())
+        }
+    }
+
+    impl Transport for PermittedTransport {}
+
+    /// RAII: closes the permit channel on drop by sending enough permits
+    /// to drain whatever is in flight, so logger Drop's `close → flush`
+    /// can complete even when an assertion panics mid-test.
+    struct PermitGuard(futures::channel::mpsc::UnboundedSender<()>);
+    impl Drop for PermitGuard {
+        fn drop(&mut self) {
+            for _ in 0..4096 {
+                if self.0.unbounded_send(()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_subscribe_backpressure_emits_saturated_then_recovered() {
+        let (permit_tx, permits) = futures::channel::mpsc::unbounded::<()>();
+        let transport = PermittedTransport { permits };
+
+        let lt = LoggerTransport::new(transport)
+            .with_queue_capacity(4)
+            .with_overflow_policy(OverflowPolicy::Block);
+        let logger = Logger::builder().transport(lt).build();
+        let lt_handle = {
+            let s = logger.shared_state.read();
+            s.options.transports.as_ref().unwrap()[0].0
+        };
+
+        // PermitGuard declared after logger → drops first on panic/exit,
+        // unblocking the sink so logger Drop's close completes.
+        let _permit_guard = PermitGuard(permit_tx.clone());
+
+        let mut events = logger.subscribe_backpressure();
+
+        // Fill phase: with zero permits sent, every write parks. Pump
+        // parks once the WritableStream queue hits HWM, mailbox fills,
+        // and with Block policy the fanout itself parks on send().await
+        // — so Saturated stays emitted (no spurious Recovered) for the
+        // entire observation window.
+        for i in 0..256 {
+            logger.log(LogInfo::new("info", format!("msg {}", i)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut after_fill = Vec::new();
+        while let Ok(Some(ev)) = events.try_next() {
+            after_fill.push(ev);
+        }
+        let stats = logger.transport_stats(lt_handle);
+        assert!(
+            after_fill
+                .iter()
+                .any(|e| matches!(e, BackpressureEvent::Saturated { .. })),
+            "expected Saturated; events={:?} stats={:?}",
+            after_fill,
+            stats
+        );
+
+        // Recovery phase: send enough permits to drain everything, then
+        // give the pipeline time to flush.
+        for _ in 0..512 {
+            let _ = permit_tx.unbounded_send(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut after_recovery = Vec::new();
+        while let Ok(Some(ev)) = events.try_next() {
+            after_recovery.push(ev);
+        }
+        assert!(
+            after_recovery
+                .iter()
+                .any(|e| matches!(e, BackpressureEvent::Recovered { .. })),
+            "expected Recovered; events={:?}",
+            after_recovery
+        );
+    }
+
+    #[test]
+    fn test_subscribe_backpressure_multi_subscriber() {
+        let logger = Logger::new(None);
+        let _r1 = logger.subscribe_backpressure();
+        let _r2 = logger.subscribe_backpressure();
+        assert_eq!(logger.event_senders.lock().unwrap().len(), 2);
     }
 }

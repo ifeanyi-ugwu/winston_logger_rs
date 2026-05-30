@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex, RwLock,
     },
 };
@@ -59,6 +59,33 @@ impl TransportStatsInner {
 /// `TransportStatsInner` without holding the map lock.
 pub(crate) type TransportStatsMap =
     Arc<RwLock<HashMap<TransportHandle, Arc<TransportStatsInner>>>>;
+
+/// Edge-triggered notification of per-transport backpressure transitions.
+///
+/// Subscribe via [`Logger::subscribe_backpressure`](crate::Logger::subscribe_backpressure).
+/// Emitted only when a slot's mailbox crosses the empty↔full boundary —
+/// not per-entry — so the event rate stays bounded even under sustained
+/// pressure. Pair with [`TransportStats`] for steady-state numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackpressureEvent {
+    /// The slot's mailbox transitioned from has-room to full. Subsequent
+    /// dispatches will trigger the slot's [`OverflowPolicy`].
+    Saturated { handle: TransportHandle },
+    /// The slot's mailbox transitioned from full back to has-room.
+    Recovered { handle: TransportHandle },
+}
+
+/// Multi-subscriber broadcast list for `BackpressureEvent`. The fanout
+/// prunes disconnected senders on each emit, so dropping the receiver is
+/// the only "unsubscribe" needed.
+pub(crate) type EventSenders =
+    Arc<Mutex<Vec<fmpsc::UnboundedSender<BackpressureEvent>>>>;
+
+fn emit_event(senders: &EventSenders, event: BackpressureEvent) {
+    let mut s = senders.lock().unwrap();
+    s.retain(|tx| tx.unbounded_send(event.clone()).is_ok());
+}
 
 /// A runtime-agnostic task spawner.  Pass `tokio::runtime::Handle::spawn`,
 /// `smol::spawn`, or any other executor's spawn primitive wrapped in an `Arc`.
@@ -241,6 +268,9 @@ struct TransportSlot {
     pump_done: Option<oneshot::Receiver<()>>,
     /// Same `Arc` the Logger reads from for `transport_stats(handle)`.
     stats: Arc<TransportStatsInner>,
+    /// Edge-trigger state for `BackpressureEvent`. Single-writer (fanout
+    /// task) but stored atomic so the slot can be borrowed `&`.
+    was_saturated: AtomicBool,
 }
 
 /// The per-transport pump task.
@@ -289,6 +319,9 @@ struct FanoutState {
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
     /// Per-transport counter map, shared read-only with the Logger.
     stats_map: TransportStatsMap,
+    /// Active `BackpressureEvent` subscribers. Cloned senders; dead ones
+    /// pruned on emit.
+    event_senders: EventSenders,
 }
 
 impl FanoutState {
@@ -342,6 +375,7 @@ impl FanoutState {
             mailbox_tx,
             pump_done: Some(done_rx),
             stats,
+            was_saturated: AtomicBool::new(false),
         });
     }
 
@@ -362,21 +396,28 @@ impl FanoutState {
     /// fanout, every other slot for the duration), propagating pressure
     /// upstream. `DropNewest` slots drop the entry silently.
     ///
+    /// Emits `Saturated` on the empty→full edge and `Recovered` on the
+    /// next dispatch that sees room after a saturation. The Block path
+    /// intentionally does not emit `Recovered` after `send().await` —
+    /// freeing a single slot mid-pressure isn't recovery, and the next
+    /// dispatch's `try_send` will catch it if it is.
+    ///
     /// Uses `&mut` on the slot's owned sender — must NOT clone, because
     /// `fmpsc::channel`'s capacity is `buffer + num_senders` and every
     /// live clone would inflate the bound, defeating the mailbox cap.
     async fn fan_entry(&mut self, entry: &Arc<LogInfo>) {
+        let event_senders = Arc::clone(&self.event_senders);
         for i in 0..self.slots.len() {
             // Phase 1: level / format checks with immutable borrows on
             // self (passes_level, format_for) and the slot.
-            let (info_opt, overflow) = {
+            let (info_opt, overflow, handle) = {
                 let slot = &self.slots[i];
                 let info = if self.passes_level(&entry.level, slot.level.as_ref()) {
                     self.format_for(slot, entry)
                 } else {
                     None
                 };
-                (info, slot.overflow)
+                (info, slot.overflow, slot.handle)
             };
             let Some(info) = info_opt else { continue };
 
@@ -388,17 +429,31 @@ impl FanoutState {
             match result {
                 Ok(()) => {
                     slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                    if slot.was_saturated.swap(false, Ordering::Relaxed) {
+                        emit_event(
+                            &event_senders,
+                            BackpressureEvent::Recovered { handle },
+                        );
+                    }
                 }
-                Err(e) if e.is_full() => match overflow {
-                    OverflowPolicy::Block => {
-                        if slot.mailbox_tx.send(e.into_inner()).await.is_ok() {
-                            slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                Err(e) if e.is_full() => {
+                    if !slot.was_saturated.swap(true, Ordering::Relaxed) {
+                        emit_event(
+                            &event_senders,
+                            BackpressureEvent::Saturated { handle },
+                        );
+                    }
+                    match overflow {
+                        OverflowPolicy::Block => {
+                            if slot.mailbox_tx.send(e.into_inner()).await.is_ok() {
+                                slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        OverflowPolicy::DropNewest => {
+                            slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    OverflowPolicy::DropNewest => {
-                        slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
-                    }
-                },
+                }
                 Err(_) => {} // pump gone — slot is being torn down
             }
         }
@@ -515,6 +570,7 @@ pub async fn run_fanout(
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
     initial_transports: Vec<(TransportHandle, LoggerTransport)>,
     stats_map: TransportStatsMap,
+    event_senders: EventSenders,
 ) {
     let mut state = FanoutState {
         spawn_fn,
@@ -524,6 +580,7 @@ pub async fn run_fanout(
         levels,
         buffer,
         stats_map,
+        event_senders,
     };
     for (handle, transport) in initial_transports {
         state.admit(handle, transport);
@@ -606,6 +663,7 @@ pub fn build_pipeline(
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
     spawn_fn: SpawnFn,
     stats_map: TransportStatsMap,
+    event_senders: EventSenders,
 ) -> fmpsc::UnboundedSender<PipelineMessage> {
     let (tx, rx) = fmpsc::unbounded::<PipelineMessage>();
 
@@ -624,6 +682,7 @@ pub fn build_pipeline(
         buffer,
         initial_transports,
         stats_map,
+        event_senders,
     )));
 
     tx

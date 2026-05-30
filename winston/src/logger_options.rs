@@ -195,7 +195,11 @@ pub enum BackpressureStrategy {
 /// `Block` propagates pressure end-to-end: a saturated `Block` slot stalls
 /// the fanout, which fills the main channel and trips the caller-side
 /// `BackpressureStrategy`. Pick this for durability sinks (file, daily-rotate)
-/// where dropping is unacceptable.
+/// where dropping is unacceptable. Note that under sustained pressure a
+/// `Block` slot can stall the *whole logger* (fanout is shared) and, via the
+/// caller channel's `BackpressureStrategy`, the application thread itself —
+/// pair with a non-`Block` caller strategy if the application must stay
+/// responsive while a slow sink drains.
 ///
 /// `DropNewest` short-circuits at the mailbox boundary: the slot never
 /// couples the fanout, but loses entries under sustained pressure. Pick this

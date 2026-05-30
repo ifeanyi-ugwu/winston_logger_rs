@@ -18,7 +18,9 @@ pub use logform as format;
 pub use logger::Logger;
 pub use logger_options::{BackpressureStrategy, LoggerOptions, OverflowPolicy};
 pub use logger_transport::LoggerTransport;
-pub use pipeline::{default_spawner, single_threaded_spawner, SpawnFn, TransportStats};
+pub use pipeline::{
+    default_spawner, single_threaded_spawner, BackpressureEvent, SpawnFn, TransportStats,
+};
 pub use winston_transport::{
     BoxedReadableSource, DrainReceipt, DynIngestHandle, DynQueryHandle, DynReadableSource,
     FanOutStats, LogQuery, Transport,
