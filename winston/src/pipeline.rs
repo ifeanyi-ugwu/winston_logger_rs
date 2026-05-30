@@ -453,6 +453,13 @@ impl FanoutState {
                         OverflowPolicy::DropNewest => {
                             slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
                         }
+                        OverflowPolicy::DropOldest => {
+                            // Evict head, push new. The evicted message is
+                            // dropped here; count it as a drop.
+                            let _evicted = slot.mailbox_tx.force_push_dropping_oldest(msg);
+                            slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                            slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 Err(TryPushError::Closed(_)) => {} // pump gone — slot torn down

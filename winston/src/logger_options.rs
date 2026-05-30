@@ -205,10 +205,16 @@ pub enum BackpressureStrategy {
 /// couples the fanout, but loses entries under sustained pressure. Pick this
 /// for telemetry lanes (HTTP, Mongo, console) where freshness matters more
 /// than completeness.
+///
+/// `DropOldest` evicts the head of the mailbox and pushes the new entry —
+/// a sliding window of the most recent N entries. Pick this when freshness
+/// matters more than completeness *and* the most recent entries are the
+/// useful ones (metrics, dashboards, last-known-state telemetry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverflowPolicy {
     Block,
     DropNewest,
+    DropOldest,
 }
 
 impl Default for OverflowPolicy {

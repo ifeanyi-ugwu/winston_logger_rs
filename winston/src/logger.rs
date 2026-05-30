@@ -1425,4 +1425,73 @@ mod tests {
         let _r2 = logger.subscribe_backpressure();
         assert_eq!(logger.event_senders.lock().unwrap().len(), 2);
     }
+
+    #[test]
+    fn test_drop_oldest_evicts_head_and_delivers_newest() {
+        let (permit_tx, permits) = futures::channel::mpsc::unbounded::<()>();
+        let transport = PermittedTransport { permits };
+        let inspect = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        // Wrap PermittedTransport so we can observe what the sink saw.
+        struct Wrapped {
+            inner: PermittedTransport,
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        impl WritableSink<LogInfo> for Wrapped {
+            async fn write(
+                &mut self,
+                info: LogInfo,
+                ctrl: &mut WritableStreamDefaultController,
+            ) -> StreamResult<()> {
+                self.inner.write(info.clone(), ctrl).await?;
+                self.seen.lock().unwrap().push(info.message);
+                Ok(())
+            }
+        }
+        impl Transport for Wrapped {}
+
+        let lt = LoggerTransport::new(Wrapped {
+            inner: transport,
+            seen: Arc::clone(&inspect),
+        })
+        .with_queue_capacity(2)
+        .with_overflow_policy(OverflowPolicy::DropOldest);
+        let logger = Logger::builder().transport(lt).build();
+        let lt_handle = {
+            let s = logger.shared_state.read();
+            s.options.transports.as_ref().unwrap()[0].0
+        };
+        let _permit_guard = PermitGuard(permit_tx.clone());
+
+        // Block the sink so the mailbox saturates and DropOldest evicts.
+        for i in 0..32 {
+            logger.log(LogInfo::new("info", format!("msg-{:02}", i)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let stats = logger
+            .transport_stats(lt_handle)
+            .expect("stats present");
+        // DropOldest counts every eviction as a drop; with cap=2 + 32
+        // entries, we expect many drops as the head is repeatedly evicted.
+        assert!(
+            stats.dropped_total > 0,
+            "expected DropOldest evictions; stats={:?}",
+            stats
+        );
+
+        // Release the gate, drain, and verify the surviving entries are
+        // the *newest* ones (DropOldest semantics, not DropNewest).
+        for _ in 0..512 {
+            let _ = permit_tx.unbounded_send(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        logger.flush().unwrap();
+
+        let seen = inspect.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "sink saw nothing");
+        // The last entry the sink saw must be the latest one we logged —
+        // DropOldest would never evict the newest.
+        assert_eq!(seen.last().unwrap(), "msg-31");
+    }
 }
