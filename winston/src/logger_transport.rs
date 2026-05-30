@@ -6,7 +6,7 @@ use winston_transport::{DynQueryHandle, Transport};
 
 use crate::{
     logger_options::OverflowPolicy,
-    pipeline::{make_writer_builder, TransportWriterBuilder},
+    pipeline::{make_writer_builder, TransportWriterBuilder, DEFAULT_TRANSPORT_QUEUE_CAPACITY},
 };
 
 /// Configuration the Logger holds about a registered transport.
@@ -27,6 +27,7 @@ pub struct LoggerTransport {
     level: Option<String>,
     format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     overflow_policy: OverflowPolicy,
+    queue_capacity: usize,
 }
 
 impl LoggerTransport {
@@ -45,6 +46,7 @@ impl LoggerTransport {
             level: None,
             format: None,
             overflow_policy: OverflowPolicy::default(),
+            queue_capacity: DEFAULT_TRANSPORT_QUEUE_CAPACITY,
         }
     }
 
@@ -66,6 +68,21 @@ impl LoggerTransport {
         self
     }
 
+    /// Set the per-transport queue capacity.
+    ///
+    /// The value is applied to *both* layers between fanout and sink: the
+    /// mailbox the fanout dispatches into, and the WritableStream's
+    /// high-water mark the pump enqueues against. Total in-flight chunks
+    /// for this transport can therefore reach up to ~2× this value before
+    /// the slot's [`OverflowPolicy`] kicks in.
+    ///
+    /// Clamped to a minimum of 1. Defaults to
+    /// [`DEFAULT_TRANSPORT_QUEUE_CAPACITY`].
+    pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
+        self.queue_capacity = capacity.max(1);
+        self
+    }
+
     pub fn get_level(&self) -> Option<&String> {
         self.level.as_ref()
     }
@@ -76,6 +93,10 @@ impl LoggerTransport {
 
     pub fn overflow_policy(&self) -> OverflowPolicy {
         self.overflow_policy
+    }
+
+    pub fn queue_capacity(&self) -> usize {
+        self.queue_capacity
     }
 
     pub fn query_handle(&self) -> Option<&Arc<dyn DynQueryHandle>> {
@@ -96,6 +117,7 @@ impl fmt::Debug for LoggerTransport {
             .field("format", &self.format.as_ref().map(|_| "Format<...>"))
             .field("queryable", &self.query_handle.is_some())
             .field("overflow_policy", &self.overflow_policy)
+            .field("queue_capacity", &self.queue_capacity)
             .finish()
     }
 }

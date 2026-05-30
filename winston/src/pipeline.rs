@@ -143,18 +143,17 @@ where
 
 /// One-shot factory the fanout invokes when admitting a transport.
 ///
-/// Captures the typed transport, spawns its `WritableStream` pump task through
-/// the supplied `SpawnFn`, and returns the sink-erased writer.
+/// Captures the typed transport. The fanout supplies the `SpawnFn` and the
+/// per-transport queue high-water mark at call time (the latter taken from
+/// the `LoggerTransport`'s `queue_capacity`), spawns the `WritableStream`
+/// pump task, and returns the sink-erased writer.
 pub type TransportWriterBuilder =
-    Box<dyn FnOnce(SpawnFn) -> Box<dyn ErasedWriter> + Send>;
+    Box<dyn FnOnce(SpawnFn, usize) -> Box<dyn ErasedWriter> + Send>;
 
-/// Per-transport queue depth applied via `CountQueuingStrategy`.
-///
-/// A slow transport applies backpressure to the fanout task only once its
-/// WritableStream queue fills; until then, `writer.write(...)` resolves
-/// immediately and the fanout moves on. Sizing this is the per-transport
-/// memory bound under sustained slowness.
-pub const TRANSPORT_QUEUE_HIGH_WATER_MARK: usize = 1024;
+/// Default per-transport queue capacity. Applied to both the slot mailbox
+/// and the WritableStream's high-water mark when the transport doesn't
+/// override it via `LoggerTransport::with_queue_capacity`.
+pub const DEFAULT_TRANSPORT_QUEUE_CAPACITY: usize = 1024;
 
 /// Construct the type-erased builder used by `LoggerTransport`.
 ///
@@ -165,9 +164,9 @@ pub(crate) fn make_writer_builder<T>(transport: T) -> TransportWriterBuilder
 where
     T: Transport,
 {
-    Box::new(move |spawn_fn: SpawnFn| {
+    Box::new(move |spawn_fn: SpawnFn, hwm: usize| {
         let stream = WritableStream::builder(transport)
-            .strategy(CountQueuingStrategy::new(TRANSPORT_QUEUE_HIGH_WATER_MARK))
+            .strategy(CountQueuingStrategy::new(hwm))
             .spawn(move |fut| spawn_fn(fut));
 
         // A freshly-built stream is never locked, so this can't fail. We drop
@@ -180,12 +179,6 @@ where
     })
 }
 
-
-/// Mailbox capacity used for every per-transport queue.
-///
-/// Sized to match `TRANSPORT_QUEUE_HIGH_WATER_MARK` so the two layered bounds
-/// (fanout→pump mailbox and pump→WritableStream queue) have the same shape.
-pub const TRANSPORT_MAILBOX_CAPACITY: usize = 1024;
 
 /// Message sent from the fanout to a slot's pump task.
 enum SlotMessage {
@@ -279,12 +272,13 @@ impl FanoutState {
         let level = transport.get_level().cloned();
         let transport_format = transport.get_format();
         let overflow = transport.overflow_policy();
+        let capacity = transport.queue_capacity();
         let Some(builder) = transport.take_builder() else {
             return; // Already consumed (e.g. duplicate add) — ignore silently.
         };
-        let writer = builder(Arc::clone(&self.spawn_fn));
+        let writer = builder(Arc::clone(&self.spawn_fn), capacity);
 
-        let (mailbox_tx, mailbox_rx) = fmpsc::channel::<SlotMessage>(TRANSPORT_MAILBOX_CAPACITY);
+        let (mailbox_tx, mailbox_rx) = fmpsc::channel::<SlotMessage>(capacity);
         let (done_tx, done_rx) = oneshot::channel();
         let pump = slot_pump(mailbox_rx, writer, done_tx);
         (self.spawn_fn)(Box::pin(pump));

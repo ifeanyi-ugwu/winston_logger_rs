@@ -55,6 +55,11 @@ impl<'a> TransportBuilder<'a> {
         self
     }
 
+    pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
+        self.logger_transport = self.logger_transport.with_queue_capacity(capacity);
+        self
+    }
+
     pub fn add(self) -> TransportHandle {
         self.logger.add_transport(self.logger_transport)
     }
