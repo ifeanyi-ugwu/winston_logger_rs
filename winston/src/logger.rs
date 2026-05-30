@@ -2,7 +2,7 @@ use crate::{
     logger_builder::LoggerBuilder,
     logger_options::{BackpressureStrategy, LoggerOptions, OverflowPolicy},
     logger_transport::{IntoLoggerTransport, LoggerTransport},
-    pipeline::{self, PipelineMessage},
+    pipeline::{self, PipelineMessage, TransportStats, TransportStatsInner, TransportStatsMap},
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use futures::channel::mpsc as fmpsc;
@@ -110,6 +110,11 @@ pub struct Logger {
     /// Held so `Logger::query` can spawn the per-call `ReadableStream` it
     /// drains. Same spawner the pipeline uses internally.
     spawn_fn: pipeline::SpawnFn,
+
+    /// Per-transport counters, shared with the fanout. Read-only from this
+    /// side; the fanout inserts entries on admit and removes them on
+    /// teardown.
+    stats_map: TransportStatsMap,
 }
 
 impl Logger {
@@ -143,9 +148,25 @@ impl Logger {
         }));
 
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
+        let stats_map: TransportStatsMap =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        // Pre-create stats entries for initially-configured transports.
+        {
+            let mut map = stats_map.write().unwrap();
+            for (h, _) in options.transports.as_deref().unwrap_or(&[]) {
+                map.entry(*h)
+                    .or_insert_with(|| Arc::new(TransportStatsInner::default()));
+            }
+        }
 
         let spawn_fn_for_pipeline = std::sync::Arc::clone(&spawn_fn);
-        let pipeline_tx = pipeline::build_pipeline(&options, Arc::clone(&buffer), spawn_fn_for_pipeline);
+        let pipeline_tx = pipeline::build_pipeline(
+            &options,
+            Arc::clone(&buffer),
+            spawn_fn_for_pipeline,
+            Arc::clone(&stats_map),
+        );
 
         // Bridge thread: crossbeam → pipeline channel.
         let bridge_pipeline_tx = pipeline_tx.clone();
@@ -173,6 +194,7 @@ impl Logger {
             pipeline_tx,
             bridge_thread: Mutex::new(Some(bridge_thread)),
             spawn_fn,
+            stats_map,
         }
     }
 
@@ -508,6 +530,14 @@ impl Logger {
                 .push((handle, logger_transport.clone()));
         }
 
+        // Pre-create the stats entry so transport_stats(handle) returns
+        // Some immediately, without waiting for the fanout to admit.
+        self.stats_map
+            .write()
+            .unwrap()
+            .entry(handle)
+            .or_insert_with(|| Arc::new(TransportStatsInner::default()));
+
         // Inform the pipeline asynchronously — no round-trip needed.
         let _ = self
             .pipeline_tx
@@ -517,6 +547,20 @@ impl Logger {
             });
 
         handle
+    }
+
+    /// Snapshot of the transport's lifetime counters.
+    ///
+    /// Returns `None` if no transport is registered under `handle`. Map
+    /// cleanup happens asynchronously when the fanout tears the slot down,
+    /// so a snapshot may briefly remain readable after `remove_transport`
+    /// returns; callers shouldn't rely on the timing.
+    pub fn transport_stats(&self, handle: TransportHandle) -> Option<TransportStats> {
+        self.stats_map
+            .read()
+            .unwrap()
+            .get(&handle)
+            .map(|s| s.snapshot())
     }
 
     pub fn remove_transport(&self, handle: TransportHandle) -> bool {
@@ -594,6 +638,16 @@ impl Logger {
                 transports,
             )
         };
+
+        // Pre-create stats for the new transports; stale entries for
+        // dropped handles get cleared by the fanout's close_all.
+        {
+            let mut map = self.stats_map.write().unwrap();
+            for (h, _) in &transports {
+                map.entry(*h)
+                    .or_insert_with(|| Arc::new(TransportStatsInner::default()));
+            }
+        }
 
         let _ = self.pipeline_tx.unbounded_send(PipelineMessage::Configure {
             format,
@@ -1215,5 +1269,27 @@ mod tests {
             futures::executor::block_on(logger.query(&LogQuery::new())).unwrap();
         // Each transport saw both entries; query drains both sources.
         assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn test_transport_stats_counts_dispatched() {
+        let logger = Logger::new(None);
+        let handle = logger.add_transport(TestTransport::new());
+
+        for i in 0..5 {
+            logger.log(LogInfo::new("info", format!("msg {}", i)));
+        }
+        logger.flush().unwrap();
+
+        let stats = logger.transport_stats(handle).expect("stats present");
+        assert_eq!(stats.dispatched_total, 5);
+        assert_eq!(stats.dropped_total, 0);
+    }
+
+    #[test]
+    fn test_transport_stats_for_unknown_handle_is_none() {
+        let logger = Logger::new(None);
+        let fake = TransportHandle(99_999);
+        assert!(logger.transport_stats(fake).is_none());
     }
 }

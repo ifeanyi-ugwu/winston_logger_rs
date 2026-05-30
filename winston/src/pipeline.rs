@@ -1,8 +1,11 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, RwLock,
+    },
 };
 
 use futures::channel::{mpsc as fmpsc, oneshot};
@@ -20,6 +23,42 @@ use crate::{
     logger_options::{LoggerOptions, OverflowPolicy},
     logger_transport::LoggerTransport,
 };
+
+/// Snapshot of a transport's lifetime counters.
+///
+/// Returned by [`Logger::transport_stats`](crate::Logger::transport_stats).
+/// All fields are monotonically non-decreasing — instantaneous queue depth
+/// is not (yet) exposed; derive throughput / drop rate by sampling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportStats {
+    /// Entries the fanout successfully handed to the slot's mailbox.
+    pub dispatched_total: u64,
+    /// Entries dropped at the mailbox boundary because the mailbox was
+    /// full and the slot's [`OverflowPolicy`] selected a drop variant.
+    pub dropped_total: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct TransportStatsInner {
+    dispatched_total: AtomicU64,
+    dropped_total: AtomicU64,
+}
+
+impl TransportStatsInner {
+    pub(crate) fn snapshot(&self) -> TransportStats {
+        TransportStats {
+            dispatched_total: self.dispatched_total.load(Ordering::Relaxed),
+            dropped_total: self.dropped_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Shared map between the Logger (read-only consumer) and the fanout task
+/// (which inserts on admit, removes on tear-down). Cheap reads via
+/// `Arc::clone` on the inner — counter loads happen against the cloned
+/// `TransportStatsInner` without holding the map lock.
+pub(crate) type TransportStatsMap =
+    Arc<RwLock<HashMap<TransportHandle, Arc<TransportStatsInner>>>>;
 
 /// A runtime-agnostic task spawner.  Pass `tokio::runtime::Handle::spawn`,
 /// `smol::spawn`, or any other executor's spawn primitive wrapped in an `Arc`.
@@ -200,6 +239,8 @@ struct TransportSlot {
     mailbox_tx: fmpsc::Sender<SlotMessage>,
     /// Resolves when the pump task has exited (after `writer.close()`).
     pump_done: Option<oneshot::Receiver<()>>,
+    /// Same `Arc` the Logger reads from for `transport_stats(handle)`.
+    stats: Arc<TransportStatsInner>,
 }
 
 /// The per-transport pump task.
@@ -246,6 +287,8 @@ struct FanoutState {
     /// Entries logged before any transport was admitted. Drained into the
     /// slots the moment the first transport arrives.
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+    /// Per-transport counter map, shared read-only with the Logger.
+    stats_map: TransportStatsMap,
 }
 
 impl FanoutState {
@@ -278,6 +321,14 @@ impl FanoutState {
         };
         let writer = builder(Arc::clone(&self.spawn_fn), capacity);
 
+        let stats = self
+            .stats_map
+            .write()
+            .unwrap()
+            .entry(handle)
+            .or_insert_with(|| Arc::new(TransportStatsInner::default()))
+            .clone();
+
         let (mailbox_tx, mailbox_rx) = fmpsc::channel::<SlotMessage>(capacity);
         let (done_tx, done_rx) = oneshot::channel();
         let pump = slot_pump(mailbox_rx, writer, done_tx);
@@ -290,6 +341,7 @@ impl FanoutState {
             overflow,
             mailbox_tx,
             pump_done: Some(done_rx),
+            stats,
         });
     }
 
@@ -317,12 +369,18 @@ impl FanoutState {
 
         let mut tx = slot.mailbox_tx.clone();
         match tx.try_send(SlotMessage::Entry(info)) {
-            Ok(()) => {}
+            Ok(()) => {
+                slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+            }
             Err(e) if e.is_full() => match slot.overflow {
                 OverflowPolicy::Block => {
-                    let _ = tx.send(e.into_inner()).await;
+                    if tx.send(e.into_inner()).await.is_ok() {
+                        slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                OverflowPolicy::DropNewest => {}
+                OverflowPolicy::DropNewest => {
+                    slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
+                }
             },
             Err(_) => {} // pump gone — slot is being torn down
         }
@@ -391,7 +449,9 @@ impl FanoutState {
         let drained: Vec<TransportSlot> = self.slots.drain(..).collect();
         let mut closes = Vec::with_capacity(drained.len());
         let mut dones = Vec::with_capacity(drained.len());
+        let mut handles = Vec::with_capacity(drained.len());
         for mut slot in drained {
+            handles.push(slot.handle);
             let mut mbox = slot.mailbox_tx.clone();
             closes.push(async move {
                 let _ = mbox.send(SlotMessage::Close).await;
@@ -402,6 +462,10 @@ impl FanoutState {
         }
         let _ = futures::future::join_all(closes).await;
         let _ = futures::future::join_all(dones).await;
+        let mut map = self.stats_map.write().unwrap();
+        for h in handles {
+            map.remove(&h);
+        }
     }
 }
 
@@ -438,6 +502,7 @@ pub async fn run_fanout(
     levels: Option<LoggerLevels>,
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
     initial_transports: Vec<(TransportHandle, LoggerTransport)>,
+    stats_map: TransportStatsMap,
 ) {
     let mut state = FanoutState {
         spawn_fn,
@@ -446,6 +511,7 @@ pub async fn run_fanout(
         global_level,
         levels,
         buffer,
+        stats_map,
     };
     for (handle, transport) in initial_transports {
         state.admit(handle, transport);
@@ -476,6 +542,7 @@ pub async fn run_fanout(
                     if let Some(rx) = slot.pump_done.take() {
                         let _ = rx.await;
                     }
+                    state.stats_map.write().unwrap().remove(&handle);
                 }
             }
 
@@ -526,6 +593,7 @@ pub fn build_pipeline(
     options: &LoggerOptions,
     buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
     spawn_fn: SpawnFn,
+    stats_map: TransportStatsMap,
 ) -> fmpsc::UnboundedSender<PipelineMessage> {
     let (tx, rx) = fmpsc::unbounded::<PipelineMessage>();
 
@@ -543,6 +611,7 @@ pub fn build_pipeline(
         levels,
         buffer,
         initial_transports,
+        stats_map,
     )));
 
     tx
