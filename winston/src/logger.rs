@@ -1,24 +1,21 @@
 use crate::{
     logger_builder::LoggerBuilder,
-    logger_options::{BackpressureStrategy, LoggerOptions, OverflowPolicy},
+    logger_options::{LoggerOptions, OverflowPolicy},
     logger_transport::{IntoLoggerTransport, LoggerTransport},
     pipeline::{
-        self, BackpressureEvent, EventSenders, PipelineMessage, TransportStats,
+        self, close_slots_sync, BackpressureEvent, EventSenders, LoggerState, TransportStats,
         TransportStatsInner, TransportStatsMap,
     },
 };
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use futures::channel::mpsc as fmpsc;
-use futures::StreamExt;
 use logform::LogInfo;
 use parking_lot::RwLock;
 use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
     },
-    thread,
 };
 use whatwg_streams::{CountQueuingStrategy, ReadableStream};
 use winston_transport::{BoxedReadableSource, LogQuery, Transport};
@@ -26,7 +23,7 @@ use winston_transport::{BoxedReadableSource, LogQuery, Transport};
 static NEXT_TRANSPORT_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct TransportHandle(usize);
+pub struct TransportHandle(pub(crate) usize);
 
 impl TransportHandle {
     pub(crate) fn new() -> Self {
@@ -68,16 +65,6 @@ impl<'a> TransportBuilder<'a> {
     }
 }
 
-// These flow from the sync caller → bridge thread → pipeline channel.
-
-#[derive(Debug)]
-pub enum LogMessage {
-    Entry(Arc<LogInfo>),
-    Shutdown,
-    Flush,
-}
-
-
 #[derive(Debug)]
 pub(crate) struct SharedState {
     pub(crate) options: LoggerOptions,
@@ -87,42 +74,43 @@ pub(crate) struct SharedState {
     transport_levels: Vec<(TransportHandle, Option<String>)>,
 }
 
-
+/// The Logger.
+///
+/// `log()` dispatches synchronously to per-slot mailboxes — there is no
+/// caller channel, no bridge thread, no fanout task, and no pipeline channel.
+/// The slowest `OverflowPolicy::Block` slot sets the producer's rate; Drop
+/// policies short-circuit at their own mailbox boundary without coupling the
+/// caller to that transport.
+///
+/// See `docs/adr/0002-direct-dispatch-backpressure.md` for the design.
 pub struct Logger {
-    /// Sync caller interface — same as before.
-    sender: Sender<LogMessage>,
-    receiver: Arc<Receiver<LogMessage>>,
-
     pub(crate) shared_state: Arc<RwLock<SharedState>>,
 
-    /// Entries buffered when no transports are present. Shared with the fanout task.
-    buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+    /// Per-slot mailboxes + format/level/levels + spawn_fn. Held behind a
+    /// `RwLock` so `log()` reads a cheap `Arc`-snapshot, drops the lock, and
+    /// dispatches *without* the lock — a `Block`-policy `push_blocking`
+    /// parking the caller doesn't stall admin operations.
+    state: Arc<RwLock<LoggerState>>,
 
-    flush_complete: Arc<(Mutex<bool>, Condvar)>,
+    /// Entries logged before any transport was admitted. Also held by
+    /// `LoggerState` (same `Arc`); kept on the Logger for direct access
+    /// from tests and any future query path.
+    pub(crate) buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+
     is_closed: AtomicBool,
 
-    /// Lock-free pre-filter cache; u8::MAX means "accept everything".
+    /// Lock-free pre-filter cache; `u8::MAX` means "accept everything".
     min_required_severity_cache: AtomicU8,
-    backpressure_cache: AtomicU8,
-
-    /// Sender into the async pipeline (via bridge thread).
-    pipeline_tx: fmpsc::UnboundedSender<PipelineMessage>,
-
-    bridge_thread: Mutex<Option<thread::JoinHandle<()>>>,
 
     /// Held so `Logger::query` can spawn the per-call `ReadableStream` it
-    /// drains. Same spawner the pipeline uses internally.
+    /// drains. Same spawner the per-slot pumps use internally.
     spawn_fn: pipeline::SpawnFn,
 
-    /// Per-transport counters, shared with the fanout. Read-only from this
-    /// side; the fanout inserts entries on admit and removes them on
-    /// teardown.
-    stats_map: TransportStatsMap,
+    /// Per-transport counters, shared with `LoggerState` (same `Arc`).
+    pub(crate) stats_map: TransportStatsMap,
 
-    /// Live `BackpressureEvent` subscribers, shared with the fanout. The
-    /// fanout writes (emits); `subscribe_backpressure` pushes a new
-    /// sender here for each subscription.
-    event_senders: EventSenders,
+    /// Live `BackpressureEvent` subscribers, shared with `LoggerState`.
+    pub(crate) event_senders: EventSenders,
 }
 
 impl Logger {
@@ -132,14 +120,8 @@ impl Logger {
 
     pub fn new_with_spawner(options: Option<LoggerOptions>, spawn_fn: pipeline::SpawnFn) -> Self {
         let options = options.unwrap_or_default();
-        let capacity = options.channel_capacity.unwrap_or(1024);
-        let (sender, receiver) = bounded::<LogMessage>(capacity);
-        let flush_complete = Arc::new((Mutex::new(false), Condvar::new()));
-
-        let shared_receiver = Arc::new(receiver);
 
         let min_required_severity = Self::compute_min_severity(&options);
-        let bp_cache = Self::encode_backpressure(options.backpressure_strategy.as_ref());
 
         let transport_levels: Vec<(TransportHandle, Option<String>)> = options
             .transports
@@ -160,7 +142,8 @@ impl Logger {
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let event_senders: EventSenders = Arc::new(Mutex::new(Vec::new()));
 
-        // Pre-create stats entries for initially-configured transports.
+        // Pre-create stats entries for initially-configured transports so
+        // `transport_stats(handle)` returns `Some` immediately.
         {
             let mut map = stats_map.write().unwrap();
             for (h, _) in options.transports.as_deref().unwrap_or(&[]) {
@@ -169,85 +152,35 @@ impl Logger {
             }
         }
 
-        let spawn_fn_for_pipeline = std::sync::Arc::clone(&spawn_fn);
-        let pipeline_tx = pipeline::build_pipeline(
-            &options,
+        let mut state = LoggerState::new(
+            Arc::clone(&spawn_fn),
+            options.format.clone(),
+            options.level.clone(),
+            options.levels.clone(),
             Arc::clone(&buffer),
-            spawn_fn_for_pipeline,
             Arc::clone(&stats_map),
             Arc::clone(&event_senders),
         );
 
-        // Bridge thread: crossbeam → pipeline channel.
-        let bridge_pipeline_tx = pipeline_tx.clone();
-        let bridge_flush_complete = Arc::clone(&flush_complete);
-        let bridge_receiver = Arc::clone(&shared_receiver);
-
-        let bridge_thread = thread::Builder::new()
-            .name("winston-bridge".into())
-            .spawn(move || {
-                Self::bridge_loop(bridge_receiver, bridge_pipeline_tx, bridge_flush_complete);
-            })
-            .expect("failed to spawn winston bridge thread");
+        // Admit initial transports inline (no message-passing). Each
+        // `admit` spawns the per-slot pump task on `spawn_fn`.
+        for (handle, transport) in options.transports.clone().unwrap_or_default() {
+            state.admit(handle, transport);
+        }
 
         let severity_cache = min_required_severity.unwrap_or(u8::MAX);
 
         Logger {
-            sender,
-            receiver: shared_receiver,
             shared_state,
+            state: Arc::new(RwLock::new(state)),
             buffer,
-            flush_complete,
             is_closed: AtomicBool::new(false),
             min_required_severity_cache: AtomicU8::new(severity_cache),
-            backpressure_cache: AtomicU8::new(bp_cache),
-            pipeline_tx,
-            bridge_thread: Mutex::new(Some(bridge_thread)),
             spawn_fn,
             stats_map,
             event_senders,
         }
     }
-
-
-    fn bridge_loop(
-        receiver: Arc<Receiver<LogMessage>>,
-        pipeline_tx: fmpsc::UnboundedSender<PipelineMessage>,
-        flush_complete: Arc<(Mutex<bool>, Condvar)>,
-    ) {
-        for msg in receiver.iter() {
-            match msg {
-                LogMessage::Entry(entry) => {
-                    if pipeline_tx
-                        .unbounded_send(PipelineMessage::Entry(entry))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                LogMessage::Flush => {
-                    // Send flush into the pipeline and let the fanout task signal
-                    // the condvar once it has processed every prior entry.
-                    let fc = Arc::clone(&flush_complete);
-                    if pipeline_tx
-                        .unbounded_send(PipelineMessage::Flush(fc))
-                        .is_err()
-                    {
-                        // Pipeline gone — signal immediately so caller doesn't hang.
-                        let (lock, cvar) = &*flush_complete;
-                        let mut done = lock.lock().unwrap();
-                        *done = true;
-                        cvar.notify_one();
-                    }
-                }
-                LogMessage::Shutdown => {
-                    let _ = pipeline_tx.unbounded_send(PipelineMessage::Shutdown);
-                    break;
-                }
-            }
-        }
-    }
-
 
     fn compute_min_severity(options: &LoggerOptions) -> Option<u8> {
         let levels = options.levels.as_ref()?;
@@ -272,17 +205,7 @@ impl Logger {
         min_severity
     }
 
-    fn encode_backpressure(strategy: Option<&BackpressureStrategy>) -> u8 {
-        match strategy.unwrap_or(&BackpressureStrategy::Block) {
-            BackpressureStrategy::Block => 0,
-            BackpressureStrategy::DropOldest => 1,
-            BackpressureStrategy::DropCurrent => 2,
-        }
-    }
-
     fn refresh_effective_levels(state: &mut SharedState, severity_cache: &AtomicU8) {
-        // Recompute using transport_levels list (not from options.transports, which
-        // may be stale — the real transports live in the fanout task).
         let levels = match &state.options.levels {
             Some(l) => l,
             None => {
@@ -321,12 +244,8 @@ impl Logger {
         false
     }
 
-
-    /// Lock-free level check for use in the caller's hot path.
-    ///
-    /// Reads the cached min severity with a single atomic load. When no filter
-    /// is configured the sentinel `u8::MAX` means "accept everything" and this
-    /// returns true immediately.
+    /// Lock-free level check for the caller's hot path. `u8::MAX` sentinel
+    /// means "no filter" and short-circuits to true.
     pub fn is_level_enabled_fast(&self, level: &str) -> bool {
         let min = self.min_required_severity_cache.load(Ordering::Relaxed);
         if min == u8::MAX {
@@ -336,145 +255,72 @@ impl Logger {
         Self::is_level_enabled(level, &state)
     }
 
+    /// Sync dispatch to every slot. Under `OverflowPolicy::Block` this
+    /// parks the calling thread on the slot's `Condvar` until room appears
+    /// — the slowest Block slot sets the producer's rate.
     pub fn log(&self, entry: LogInfo) {
         if !self.is_level_enabled_fast(&entry.level) {
             return;
         }
-        let entry = Arc::new(entry);
-        match self.sender.try_send(LogMessage::Entry(entry)) {
-            Ok(_) => {}
-            Err(TrySendError::Full(LogMessage::Entry(entry))) => {
-                self.handle_full_channel(entry);
-            }
-            Err(TrySendError::Full(LogMessage::Shutdown)) => {
-                eprintln!("[winston] Channel is full, forcing shutdown.");
-                let _ = self.sender.send(LogMessage::Shutdown);
-            }
-            Err(TrySendError::Full(LogMessage::Flush)) => {
-                eprintln!("[winston] Channel is full, forcing flush.");
-                let _ = self.sender.send(LogMessage::Flush);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                eprintln!("[winston] Channel is disconnected. Unable to log message.");
-            }
-        }
+        let snapshot = self.state.read().snapshot();
+        snapshot.process_entry(Arc::new(entry));
     }
 
     /// Constructs and logs an entry only if the level passes the filter.
-    ///
-    /// Use this when building the `LogInfo` itself is non-trivial — the closure
-    /// is never called for levels that would be discarded.
+    /// The closure is never called for levels that would be discarded.
     pub fn log_lazy(&self, level: &str, f: impl FnOnce() -> LogInfo) {
         if self.is_level_enabled_fast(level) {
             self.log(f());
         }
     }
 
+    /// Skip the fast-level pre-filter. Useful when the caller has already
+    /// decided the entry is interesting and wants the dispatch path
+    /// without re-checking.
     pub fn logi(&self, entry: LogInfo) {
-        let entry = Arc::new(entry);
-        let _ = self.sender.send(LogMessage::Entry(entry));
+        let snapshot = self.state.read().snapshot();
+        snapshot.process_entry(Arc::new(entry));
     }
 
-    fn handle_full_channel(&self, entry: Arc<LogInfo>) {
-        match self.backpressure_cache.load(Ordering::Relaxed) {
-            1 => self.drop_oldest_and_retry(entry),
-            2 => eprintln!(
-                "[winston] Dropping current log entry due to full channel: {}",
-                entry.message
-            ),
-            _ => {
-                let _ = self.sender.send(LogMessage::Entry(entry));
-            }
-        }
-    }
-
-    fn drop_oldest_and_retry(&self, entry: Arc<LogInfo>) {
-        if let Ok(oldest) = self.receiver.try_recv() {
-            eprintln!(
-                "[winston] Dropped oldest log entry due to full channel: {:?}",
-                oldest
-            );
-        }
-        if let Err(e) = self.sender.try_send(LogMessage::Entry(entry)) {
-            eprintln!(
-                "[winston] Failed to log after dropping oldest. Dropping current message: {:?}",
-                e.into_inner()
-            );
-        }
-    }
-
+    /// Synchronous flush: send a `Flush` barrier into every slot's mailbox
+    /// and block until every per-slot pump acks. Returns `Ok` immediately
+    /// if the Logger is already closed.
     pub fn flush(&self) -> Result<(), String> {
         if self.is_closed.load(Ordering::Acquire) {
             return Ok(());
         }
-
-        let (lock, cvar) = &*self.flush_complete;
-        let mut completed = lock.lock().unwrap();
-        *completed = false;
-
-        if self.sender.send(LogMessage::Flush).is_err() {
-            return Ok(());
-        }
-
-        while !*completed {
-            completed = cvar.wait(completed).unwrap();
-        }
-
+        let snapshot = self.state.read().snapshot();
+        snapshot.flush_all_sync();
         Ok(())
     }
 
+    /// Sync teardown: flush, then close every slot. Each pump runs
+    /// `writer.close()` (which drives `WritableSink::close`, i.e. the
+    /// sink's durable flush) before exiting.
     pub fn close(&self) {
         if self.is_closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Flush first so any in-flight entries hit the sink before close.
+        let snapshot = self.state.read().snapshot();
+        snapshot.flush_all_sync();
+        drop(snapshot);
 
-        // Flush inline: flush() guards against is_closed so we can't call it here.
-        // The Flush message travels through the pipeline; once the fanout task has
-        // consumed every prior entry from the channel (and therefore awaited each
-        // per-transport write into its WritableStream queue), it signals the
-        // condvar. See `run_fanout`'s flush-semantics doc comment for what
-        // "flushed" means in stream terms.
-        {
-            let (lock, cvar) = &*self.flush_complete;
-            let mut completed = lock.lock().unwrap();
-            *completed = false;
-            if self.sender.send(LogMessage::Flush).is_ok() {
-                while !*completed {
-                    completed = cvar.wait(completed).unwrap();
-                }
-            }
-        }
-
-        let _ = self.sender.send(LogMessage::Shutdown);
-
-        // Unblock any other threads that may be waiting on flush_complete.
-        {
-            let (lock, cvar) = &*self.flush_complete;
-            let mut completed = lock.lock().unwrap();
-            *completed = true;
-            cvar.notify_all();
-        }
-
-        if let Ok(mut handle) = self.bridge_thread.lock() {
-            if let Some(h) = handle.take() {
-                let _ = h.join();
-            }
-        }
+        // Take ownership of the slots out of state under the write lock,
+        // drop the lock, then close each in parallel (close_slots_sync
+        // blocks on pump_done — must not hold the state lock across it).
+        let drained = {
+            let mut state = self.state.write();
+            state.drain_slots()
+        };
+        close_slots_sync(drained, &self.stats_map);
     }
 
-    /// Drain past entries matching `options` from every queryable transport
-    /// and collect them into a `Vec`.
-    ///
-    /// Each transport that exposed a `query_handle` at registration time gets
-    /// asked to open a fresh `ReadableSource<LogInfo>`; we wrap it in a
-    /// `ReadableStream` and drain it. Transports without a query handle are
-    /// skipped silently.
-    ///
-    /// Sources are read sequentially — a slow transport blocks subsequent
-    /// ones. Drop in `futures::future::try_join_all` here if cross-transport
-    /// concurrency becomes worth the complexity.
+    /// Drain past entries matching `options` from every queryable transport.
+    /// Each transport that exposed a `query_handle` at registration time
+    /// gets asked to open a fresh `ReadableSource<LogInfo>`; sources are
+    /// read sequentially.
     pub async fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
-        // Snapshot the query handles so we don't hold the RwLock across awaits.
         let handles: Vec<_> = {
             let state = self.shared_state.read();
             state
@@ -511,7 +357,6 @@ impl Logger {
         Ok(results)
     }
 
-
     pub fn transport<T>(&self, transport: T) -> TransportBuilder<'_>
     where
         T: Transport,
@@ -532,8 +377,6 @@ impl Logger {
             let mut state = self.shared_state.write();
             state.transport_levels.push((handle, level));
             Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
-
-            // Keep options.transports in sync for query() support.
             state
                 .options
                 .transports
@@ -541,31 +384,36 @@ impl Logger {
                 .push((handle, logger_transport.clone()));
         }
 
-        // Pre-create the stats entry so transport_stats(handle) returns
-        // Some immediately, without waiting for the fanout to admit.
+        // Pre-create the stats entry so `transport_stats(handle)` returns
+        // `Some` immediately, without racing the pump's first push.
         self.stats_map
             .write()
             .unwrap()
             .entry(handle)
             .or_insert_with(|| Arc::new(TransportStatsInner::default()));
 
-        // Inform the pipeline asynchronously — no round-trip needed.
-        let _ = self
-            .pipeline_tx
-            .unbounded_send(PipelineMessage::AddTransport {
-                handle,
-                transport: logger_transport,
-            });
+        // Admit the slot directly (no message-passing).
+        let was_first = {
+            let mut state = self.state.write();
+            let was_first = state.slots.is_empty();
+            state.admit(handle, logger_transport);
+            was_first
+        };
+
+        // If we just admitted the first slot, drain any pre-transport
+        // buffer through it. Done outside the write lock so a slow Block
+        // sink doesn't stall the admin path.
+        if was_first {
+            let snapshot = self.state.read().snapshot();
+            snapshot.drain_buffer_to_slots();
+        }
 
         handle
     }
 
     /// Snapshot of the transport's lifetime counters.
     ///
-    /// Returns `None` if no transport is registered under `handle`. Map
-    /// cleanup happens asynchronously when the fanout tears the slot down,
-    /// so a snapshot may briefly remain readable after `remove_transport`
-    /// returns; callers shouldn't rely on the timing.
+    /// Returns `None` if no transport is registered under `handle`.
     pub fn transport_stats(&self, handle: TransportHandle) -> Option<TransportStats> {
         self.stats_map
             .read()
@@ -576,13 +424,10 @@ impl Logger {
 
     /// Subscribe to per-transport backpressure transitions.
     ///
-    /// Each call returns a fresh receiver. Multiple concurrent subscribers
-    /// are supported — every emitted `BackpressureEvent` is delivered to
-    /// every live receiver. Dropping the receiver unsubscribes (the fanout
-    /// prunes dead senders on its next emit).
-    ///
-    /// Events are edge-triggered (full ↔ has-room transitions), so even
-    /// under sustained pressure the event rate stays bounded.
+    /// Each call returns a fresh receiver. Dropping the receiver
+    /// unsubscribes (the emit path prunes dead senders on its next emit).
+    /// Events are edge-triggered (full↔has-room transitions); rate stays
+    /// bounded under sustained pressure.
     pub fn subscribe_backpressure(&self) -> fmpsc::UnboundedReceiver<BackpressureEvent> {
         let (tx, rx) = fmpsc::unbounded();
         self.event_senders.lock().unwrap().push(tx);
@@ -592,7 +437,6 @@ impl Logger {
     pub fn remove_transport(&self, handle: TransportHandle) -> bool {
         let removed = {
             let mut state = self.shared_state.write();
-
             let before = state.transport_levels.len();
             state.transport_levels.retain(|(h, _)| *h != handle);
             let removed = state.transport_levels.len() < before;
@@ -606,13 +450,25 @@ impl Logger {
             removed
         };
 
-        if removed {
-            let _ = self
-                .pipeline_tx
-                .unbounded_send(PipelineMessage::RemoveTransport(handle));
+        if !removed {
+            return false;
         }
 
-        removed
+        // Take the matching slot out under the write lock, drop the lock,
+        // then close it (close blocks on pump_done — never hold a lock
+        // across it).
+        let taken = {
+            let mut state = self.state.write();
+            if let Some(pos) = state.slots.iter().position(|s| s.handle == handle) {
+                Some(state.slots.remove(pos))
+            } else {
+                None
+            }
+        };
+        if let Some(slot) = taken {
+            close_slots_sync(vec![slot], &self.stats_map);
+        }
+        true
     }
 
     pub fn configure(&self, new_options: Option<LoggerOptions>) {
@@ -621,7 +477,6 @@ impl Logger {
         let (format, level, levels, transports) = {
             let mut state = self.shared_state.write();
 
-            // Merge options (same logic as before).
             if let Some(options) = new_options {
                 state.options.format = options
                     .format
@@ -644,7 +499,6 @@ impl Logger {
                 state.options.transports = Some(Vec::new());
             }
 
-            // Rebuild transport_levels from the new options.transports.
             state.transport_levels = state
                 .options
                 .transports
@@ -665,8 +519,8 @@ impl Logger {
             )
         };
 
-        // Pre-create stats for the new transports; stale entries for
-        // dropped handles get cleared by the fanout's close_all.
+        // Pre-create stats for the new transports; stale entries get
+        // cleared by close_slots_sync below.
         {
             let mut map = self.stats_map.write().unwrap();
             for (h, _) in &transports {
@@ -675,18 +529,32 @@ impl Logger {
             }
         }
 
-        let _ = self.pipeline_tx.unbounded_send(PipelineMessage::Configure {
-            format,
-            level,
-            levels,
-            transports,
-        });
+        // Drain the old slots out, update the global format/level/levels,
+        // admit the new slots — all under the write lock briefly, then
+        // close the old slots outside the lock.
+        let old_slots = {
+            let mut state = self.state.write();
+            let old = state.drain_slots();
+            state.global_format = format;
+            state.global_level = level;
+            state.levels = levels;
+            for (h, t) in transports {
+                state.admit(h, t);
+            }
+            old
+        };
+        close_slots_sync(old_slots, &self.stats_map);
+
+        // Drain any pre-transport buffer through the new slot list.
+        let snapshot = self.state.read().snapshot();
+        snapshot.drain_buffer_to_slots();
     }
 
     pub fn builder() -> LoggerBuilder {
         LoggerBuilder::new()
     }
 }
+
 impl Default for Logger {
     fn default() -> Self {
         Logger::new(None)
@@ -706,7 +574,6 @@ impl Drop for Logger {
         self.close();
     }
 }
-
 
 #[cfg(feature = "log-backend")]
 use log::{Log, Metadata, Record};
@@ -816,6 +683,7 @@ impl<'kvs> log::kv::Visitor<'kvs> for KeyValueCollector {
 mod tests {
     use super::*;
     use crate::logger_options::LoggerOptions;
+    use futures::StreamExt;
     use std::sync::{Arc, Mutex};
     use whatwg_streams::{
         ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
@@ -1374,21 +1242,23 @@ mod tests {
 
         let mut events = logger.subscribe_backpressure();
 
-        // Fill phase: with zero permits sent, every write parks. Pump
-        // parks once the WritableStream queue hits HWM, mailbox fills,
-        // and with Block policy the fanout itself parks on send().await
-        // — so Saturated stays emitted (no spurious Recovered) for the
-        // entire observation window.
-        for i in 0..256 {
-            logger.log(LogInfo::new("info", format!("msg {}", i)));
-        }
+        // Block-policy with sustained slow sink: producer parks once the
+        // mailbox fills. Run logs in a worker thread so the test can keep
+        // observing.
+        let logger_for_producer = Arc::new(logger);
+        let worker_logger = Arc::clone(&logger_for_producer);
+        let producer = std::thread::spawn(move || {
+            for i in 0..256 {
+                worker_logger.log(LogInfo::new("info", format!("msg {}", i)));
+            }
+        });
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let mut after_fill = Vec::new();
         while let Ok(Some(ev)) = events.try_next() {
             after_fill.push(ev);
         }
-        let stats = logger.transport_stats(lt_handle);
+        let stats = logger_for_producer.transport_stats(lt_handle);
         assert!(
             after_fill
                 .iter()
@@ -1403,6 +1273,7 @@ mod tests {
         for _ in 0..512 {
             let _ = permit_tx.unbounded_send(());
         }
+        let _ = producer.join();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let mut after_recovery = Vec::new();
@@ -1424,6 +1295,65 @@ mod tests {
         let _r1 = logger.subscribe_backpressure();
         let _r2 = logger.subscribe_backpressure();
         assert_eq!(logger.event_senders.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_dispatch_block_slot_does_not_gate_other_slots() {
+        // Two slots: A is Block (slow sink, mailbox cap 1) — it WILL block
+        // the caller once its mailbox is full. B is a fast TestTransport.
+        // The water-flows-to-all-pipes contract: B should keep receiving
+        // entries even while A is causing the caller to wait.
+        let (a_permit_tx, a_permits) = futures::channel::mpsc::unbounded::<()>();
+        let slow = PermittedTransport { permits: a_permits };
+        let fast = TestTransport::new();
+
+        let a_lt = LoggerTransport::new(slow)
+            .with_queue_capacity(1)
+            .with_overflow_policy(OverflowPolicy::Block);
+        let b_lt = LoggerTransport::new(fast.clone())
+            .with_queue_capacity(64)
+            .with_overflow_policy(OverflowPolicy::DropNewest);
+        let logger = Logger::builder()
+            .transport(a_lt)
+            .transport(b_lt)
+            .build();
+        let _permit_guard = PermitGuard(a_permit_tx.clone());
+
+        // Fire log calls from a worker thread; we'll inspect B from main
+        // while A is saturated.
+        let logger_for_producer = Arc::new(logger);
+        let worker_logger = Arc::clone(&logger_for_producer);
+        let producer = std::thread::spawn(move || {
+            for i in 0..8 {
+                worker_logger.log(LogInfo::new("info", format!("msg-{}", i)));
+            }
+        });
+
+        // Give the producer time to run. With sequential dispatch (the
+        // pre-fix behaviour) the producer would block on the very first
+        // entry's push_blocking to slot A and B would see 0 entries.
+        // With two-phase dispatch, B receives every entry the producer
+        // makes it past phase 1 for — at least the first few, before A
+        // saturates and starts blocking phase 2.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Fast slot (B, DropNewest, cap 64) must have seen entries
+        // independent of A's blocking. We require at least 2 to prove the
+        // gating is not happening (any number > 0 would technically prove
+        // it, but >= 2 rules out "saw the very first entry then waited").
+        let seen_b = fast.get_logs();
+        assert!(
+            seen_b.len() >= 2,
+            "fast slot should have received multiple entries while \
+             Block-slot A was saturated; got {} entries",
+            seen_b.len()
+        );
+
+        // Release A's permits so the producer can drain and exit.
+        for _ in 0..32 {
+            let _ = a_permit_tx.unbounded_send(());
+        }
+        let _ = producer.join();
     }
 
     #[test]

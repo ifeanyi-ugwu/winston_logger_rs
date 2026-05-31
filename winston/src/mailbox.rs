@@ -76,7 +76,12 @@ pub(crate) fn channel<T>(capacity: usize) -> (MailboxSender<T>, MailboxReceiver<
 impl<T> MailboxSender<T> {
     /// Non-blocking push. Returns `Full(msg)` if the queue is at capacity,
     /// `Closed(msg)` if the receiver dropped.
-    pub(crate) fn try_push(&mut self, msg: T) -> Result<(), TryPushError<T>> {
+    ///
+    /// `&self` is safe because the internal `Mutex<VecDeque>` serialises
+    /// concurrent callers; the SPSC contract is preserved by not exposing
+    /// `Clone` on `MailboxSender`. Lets callers hold `&MailboxSender`
+    /// through a `RwLock` read lock without escalating to `&mut`.
+    pub(crate) fn try_push(&self, msg: T) -> Result<(), TryPushError<T>> {
         if self.inner.receiver_dropped.load(Ordering::Acquire) {
             return Err(TryPushError::Closed(msg));
         }
@@ -92,7 +97,7 @@ impl<T> MailboxSender<T> {
 
     /// Non-blocking push that overwrites the head when full. Returns the
     /// popped (now-dropped) message if one was evicted to make room.
-    pub(crate) fn force_push_dropping_oldest(&mut self, msg: T) -> Option<T> {
+    pub(crate) fn force_push_dropping_oldest(&self, msg: T) -> Option<T> {
         let mut q = self.inner.queue.lock();
         let dropped = if q.len() >= self.inner.capacity {
             q.pop_front()
@@ -111,7 +116,7 @@ impl<T> MailboxSender<T> {
     ///
     /// Designed for the sync `logger.log()` caller path under
     /// `OverflowPolicy::Block`.
-    pub(crate) fn push_blocking(&mut self, msg: T) -> Result<(), SendError<T>> {
+    pub(crate) fn push_blocking(&self, msg: T) -> Result<(), SendError<T>> {
         let capacity = self.inner.capacity;
         let receiver_dropped = &self.inner.receiver_dropped;
         let mut q = self.inner.queue.lock();
@@ -129,7 +134,7 @@ impl<T> MailboxSender<T> {
 
     /// Async push that awaits room. Errors only if the receiver dropped
     /// while waiting.
-    pub(crate) fn send(&mut self, msg: T) -> Send<'_, T> {
+    pub(crate) fn send(&self, msg: T) -> Send<'_, T> {
         Send {
             sender: self,
             msg: Some(msg),
@@ -149,7 +154,7 @@ impl<T> Drop for MailboxSender<T> {
 }
 
 pub(crate) struct Send<'a, T> {
-    sender: &'a mut MailboxSender<T>,
+    sender: &'a MailboxSender<T>,
     msg: Option<T>,
 }
 

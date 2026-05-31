@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Condvar, Mutex, RwLock,
+        Arc, Mutex, RwLock,
     },
 };
 
@@ -20,7 +20,7 @@ use winston_transport::Transport;
 use crate::{
     logger::TransportHandle,
     logger_levels::LoggerLevels,
-    logger_options::{LoggerOptions, OverflowPolicy},
+    logger_options::OverflowPolicy,
     logger_transport::LoggerTransport,
     mailbox::{self, MailboxReceiver, MailboxSender, TryPushError},
 };
@@ -136,37 +136,6 @@ pub fn single_threaded_spawner() -> SpawnFn {
 }
 
 
-pub enum PipelineMessage {
-    Entry(Arc<LogInfo>),
-    Flush(Arc<(Mutex<bool>, Condvar)>),
-    /// Add a transport at runtime; the fanout task spawns its WritableStream.
-    AddTransport {
-        handle: TransportHandle,
-        transport: LoggerTransport,
-    },
-    /// Remove a transport by handle.
-    RemoveTransport(TransportHandle),
-    /// Replace global format/level/levels without touching transports.
-    Reconfigure {
-        format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-        level: Option<String>,
-        levels: Option<LoggerLevels>,
-    },
-    /// Clear all transports, then optionally install a new set.
-    Configure {
-        format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-        level: Option<String>,
-        levels: Option<LoggerLevels>,
-        transports: Vec<(TransportHandle, LoggerTransport)>,
-    },
-    Shutdown,
-}
-
-// SAFETY: every variant's payload is Send + Sync.
-unsafe impl Send for PipelineMessage {}
-unsafe impl Sync for PipelineMessage {}
-
-
 /// Sink-type-erased view of a `WritableStreamDefaultWriter<LogInfo, _>`.
 ///
 /// Each transport has a different concrete `Sink` type, so the slot pump
@@ -257,21 +226,30 @@ enum SlotMessage {
     Close,
 }
 
-struct TransportSlot {
-    handle: TransportHandle,
-    level: Option<String>,
-    transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    overflow: OverflowPolicy,
-    /// Bounded channel into the per-slot pump. Fanout dispatches via
-    /// `try_send` here; on full, `overflow` decides what happens next.
-    mailbox_tx: MailboxSender<SlotMessage>,
+/// One per registered transport. Lives inside `Vec<Arc<TransportSlot>>` so
+/// the Logger can hand out shared snapshots for sync dispatch without
+/// holding the slot-list lock across a potentially-blocking push.
+pub(crate) struct TransportSlot {
+    pub(crate) handle: TransportHandle,
+    pub(crate) level: Option<String>,
+    pub(crate) transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    pub(crate) overflow: OverflowPolicy,
+    /// Single-producer mailbox into the per-slot pump. `MailboxSender`'s
+    /// `&self` API lets every caller push through an `Arc<TransportSlot>`
+    /// without external locking; the internal `Mutex<VecDeque>` enforces
+    /// ordering.
+    pub(crate) mailbox_tx: MailboxSender<SlotMessage>,
     /// Resolves when the pump task has exited (after `writer.close()`).
-    pump_done: Option<oneshot::Receiver<()>>,
+    /// `Mutex<Option<…>>` so admin paths can `.take()` it via a shared
+    /// reference to the slot.
+    pub(crate) pump_done: parking_lot::Mutex<Option<oneshot::Receiver<()>>>,
     /// Same `Arc` the Logger reads from for `transport_stats(handle)`.
-    stats: Arc<TransportStatsInner>,
-    /// Edge-trigger state for `BackpressureEvent`. Single-writer (fanout
-    /// task) but stored atomic so the slot can be borrowed `&`.
-    was_saturated: AtomicBool,
+    pub(crate) stats: Arc<TransportStatsInner>,
+    /// Edge-trigger state for `BackpressureEvent`. The dispatch path is
+    /// not internally synchronised across concurrent producers, but the
+    /// swap on every push gives "at least one Saturated per transition"
+    /// — duplicates are bounded by concurrent producers, not unbounded.
+    pub(crate) was_saturated: AtomicBool,
 }
 
 /// The per-transport pump task.
@@ -309,23 +287,47 @@ async fn slot_pump(
 }
 
 
-struct FanoutState {
-    spawn_fn: SpawnFn,
-    slots: Vec<TransportSlot>,
-    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    global_level: Option<String>,
-    levels: Option<LoggerLevels>,
+/// The Logger's runtime state. Owned by `Logger` behind a
+/// `parking_lot::RwLock`: `log()` takes a read lock, snapshots the slot
+/// list (cheap `Arc` clones), and dispatches *without* holding the lock,
+/// so a `Block`-policy `push_blocking` parking the producer doesn't
+/// stall admin operations. Admin operations (add/remove/configure/close)
+/// take the write lock.
+pub(crate) struct LoggerState {
+    pub(crate) spawn_fn: SpawnFn,
+    pub(crate) slots: Vec<Arc<TransportSlot>>,
+    pub(crate) global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    pub(crate) global_level: Option<String>,
+    pub(crate) levels: Option<LoggerLevels>,
     /// Entries logged before any transport was admitted. Drained into the
     /// slots the moment the first transport arrives.
-    buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-    /// Per-transport counter map, shared read-only with the Logger.
-    stats_map: TransportStatsMap,
-    /// Active `BackpressureEvent` subscribers. Cloned senders; dead ones
-    /// pruned on emit.
-    event_senders: EventSenders,
+    pub(crate) buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+    pub(crate) stats_map: TransportStatsMap,
+    pub(crate) event_senders: EventSenders,
 }
 
-impl FanoutState {
+impl LoggerState {
+    pub(crate) fn new(
+        spawn_fn: SpawnFn,
+        global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+        global_level: Option<String>,
+        levels: Option<LoggerLevels>,
+        buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+        stats_map: TransportStatsMap,
+        event_senders: EventSenders,
+    ) -> Self {
+        Self {
+            spawn_fn,
+            slots: Vec::new(),
+            global_format,
+            global_level,
+            levels,
+            buffer,
+            stats_map,
+            event_senders,
+        }
+    }
+
     fn passes_level(&self, entry_level: &str, transport_level: Option<&String>) -> bool {
         let levels = match &self.levels {
             Some(l) => l,
@@ -345,7 +347,14 @@ impl FanoutState {
         }
     }
 
-    fn admit(&mut self, handle: TransportHandle, transport: LoggerTransport) {
+    /// Build a slot from a `LoggerTransport` and push it onto the list.
+    /// Caller is responsible for triggering `drain_buffer_locked` after
+    /// admit if this is the first slot (so pre-transport entries land).
+    pub(crate) fn admit(
+        &mut self,
+        handle: TransportHandle,
+        transport: LoggerTransport,
+    ) {
         let level = transport.get_level().cloned();
         let transport_format = transport.get_format();
         let overflow = transport.overflow_policy();
@@ -368,20 +377,18 @@ impl FanoutState {
         let pump = slot_pump(mailbox_rx, writer, done_tx);
         (self.spawn_fn)(Box::pin(pump));
 
-        self.slots.push(TransportSlot {
+        self.slots.push(Arc::new(TransportSlot {
             handle,
             level,
             transport_format,
             overflow,
             mailbox_tx,
-            pump_done: Some(done_rx),
+            pump_done: parking_lot::Mutex::new(Some(done_rx)),
             stats,
             was_saturated: AtomicBool::new(false),
-        });
+        }));
     }
 
-    /// Format an entry for a specific slot, applying transport-level format
-    /// when present and falling back to the global format otherwise.
     fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<LogInfo> {
         match (&slot.transport_format, &self.global_format) {
             (Some(tf), _) => tf.transform(entry.clone()),
@@ -390,94 +397,168 @@ impl FanoutState {
         }
     }
 
-    /// Dispatches an entry into each slot's mailbox according to its policy.
-    ///
-    /// `try_send` is non-blocking. On full, `Block` slots await `send` —
-    /// which couples the fanout to this slot's drain rate (and via the
-    /// fanout, every other slot for the duration), propagating pressure
-    /// upstream. `DropNewest` slots drop the entry silently.
-    ///
-    /// Emits `Saturated` on the empty→full edge and `Recovered` on the
-    /// next dispatch that sees room after a saturation. The Block path
-    /// intentionally does not emit `Recovered` after `send().await` —
-    /// freeing a single slot mid-pressure isn't recovery, and the next
-    /// dispatch's `try_send` will catch it if it is.
-    ///
-    /// Uses `&mut` on the slot's owned sender — must NOT clone, because
-    /// `fmpsc::channel`'s capacity is `buffer + num_senders` and every
-    /// live clone would inflate the bound, defeating the mailbox cap.
-    async fn fan_entry(&mut self, entry: &Arc<LogInfo>) {
-        let event_senders = Arc::clone(&self.event_senders);
-        for i in 0..self.slots.len() {
-            // Phase 1: level / format checks with immutable borrows on
-            // self (passes_level, format_for) and the slot.
-            let (info_opt, overflow, handle) = {
-                let slot = &self.slots[i];
-                let info = if self.passes_level(&entry.level, slot.level.as_ref()) {
-                    self.format_for(slot, entry)
-                } else {
-                    None
-                };
-                (info, slot.overflow, slot.handle)
-            };
-            let Some(info) = info_opt else { continue };
+    /// Snapshot the slot list and global format/level/levels. Cheap (Arc
+    /// clones); held *only* during the snapshot itself, then released so
+    /// dispatch happens lock-free.
+    pub(crate) fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            slots: self.slots.clone(),
+            global_format: self.global_format.clone(),
+            global_level: self.global_level.clone(),
+            levels: self.levels.clone(),
+            buffer: Arc::clone(&self.buffer),
+            event_senders: Arc::clone(&self.event_senders),
+        }
+    }
 
-            // Phase 2: mutable borrow on the slot. The mailbox is a
-            // single-producer custom queue with a fixed capacity — no
-            // per-sender slot inflation; `try_push` honours the cap.
-            let slot = &mut self.slots[i];
-            let result = slot.mailbox_tx.try_push(SlotMessage::Entry(info));
-            match result {
-                Ok(()) => {
-                    slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
-                    if slot.was_saturated.swap(false, Ordering::Relaxed) {
-                        emit_event(
-                            &event_senders,
-                            BackpressureEvent::Recovered { handle },
-                        );
-                    }
-                }
-                Err(TryPushError::Full(msg)) => {
-                    if !slot.was_saturated.swap(true, Ordering::Relaxed) {
-                        emit_event(
-                            &event_senders,
-                            BackpressureEvent::Saturated { handle },
-                        );
-                    }
-                    match overflow {
-                        OverflowPolicy::Block => {
-                            if slot.mailbox_tx.send(msg).await.is_ok() {
-                                slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        OverflowPolicy::DropNewest => {
-                            slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
-                        }
-                        OverflowPolicy::DropOldest => {
-                            // Evict head, push new. The evicted message is
-                            // dropped here; count it as a drop.
-                            let _evicted = slot.mailbox_tx.force_push_dropping_oldest(msg);
-                            slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
-                            slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                Err(TryPushError::Closed(_)) => {} // pump gone — slot torn down
+    /// Take Close-receivers for the current slots so `Drop` can join them
+    /// without holding the state lock. Used during shutdown when the
+    /// caller already owns `&mut self`.
+    pub(crate) fn drain_slots(&mut self) -> Vec<Arc<TransportSlot>> {
+        std::mem::take(&mut self.slots)
+    }
+}
+
+/// Read-only snapshot of `LoggerState` taken under a brief lock. All
+/// dispatch and admin-blocking operations work against the snapshot, so
+/// the actual `LoggerState` lock isn't held across `push_blocking` or
+/// other potentially-parking primitives.
+pub(crate) struct StateSnapshot {
+    pub(crate) slots: Vec<Arc<TransportSlot>>,
+    pub(crate) global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    pub(crate) global_level: Option<String>,
+    pub(crate) levels: Option<LoggerLevels>,
+    pub(crate) buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
+    pub(crate) event_senders: EventSenders,
+}
+
+impl StateSnapshot {
+    fn passes_level(&self, entry_level: &str, transport_level: Option<&String>) -> bool {
+        let levels = match &self.levels {
+            Some(l) => l,
+            None => return true,
+        };
+        let effective = transport_level.or(self.global_level.as_ref());
+        let effective = match effective {
+            Some(l) => l,
+            None => return true,
+        };
+        match (
+            levels.get_severity(entry_level),
+            levels.get_severity(effective),
+        ) {
+            (Some(entry_sev), Some(req_sev)) => entry_sev <= req_sev,
+            _ => false,
+        }
+    }
+
+    fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<LogInfo> {
+        match (&slot.transport_format, &self.global_format) {
+            (Some(tf), _) => tf.transform(entry.clone()),
+            (None, Some(gf)) => gf.transform(entry.clone()),
+            (None, None) => Some(entry.clone()),
+        }
+    }
+
+    /// Synchronously dispatch one entry across every slot. Two phases:
+    ///
+    /// 1. Non-blocking `try_push` to every slot whose level admits the
+    ///    entry. Slots with room get it immediately. Drop policies
+    ///    (`DropNewest` / `DropOldest`) resolve in this phase too. Only
+    ///    `Block`-policy slots whose mailbox is full are deferred.
+    ///
+    /// 2. For each deferred `Block` slot, `push_blocking` parks the
+    ///    calling thread until that slot has room. Other transports are
+    ///    *not* gated on this wait — they've already received the entry
+    ///    in phase 1. This is the "water flows to every pipe; only the
+    ///    blocked pipe ripples upstream" model from ADR 0002.
+    ///
+    /// Multiple deferred Block slots wait serially within one `log()`
+    /// call (each `push_blocking` runs after the previous returns).
+    /// Spawning a future per Block slot for true parallel waiting is
+    /// cheap to add later if it matters; the common case is one Block
+    /// slot.
+    pub(crate) fn dispatch_entry(&self, entry: &Arc<LogInfo>) {
+        let mut deferred_blocks: Vec<(usize, SlotMessage)> =
+            Vec::with_capacity(self.slots.len());
+
+        // Phase 1: try-push to every eligible slot.
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if !self.passes_level(&entry.level, slot.level.as_ref()) {
+                continue;
+            }
+            let Some(info) = self.format_for(slot, entry) else { continue };
+            if let Some(deferred) = self.try_push_to_slot(slot, info) {
+                deferred_blocks.push((idx, deferred));
+            }
+        }
+
+        // Phase 2: block the caller for each Block-saturated slot.
+        for (idx, msg) in deferred_blocks {
+            let slot = &self.slots[idx];
+            if slot.mailbox_tx.push_blocking(msg).is_ok() {
+                slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
-    async fn drain_buffer(&mut self) {
+    /// Non-blocking push to a single slot. Returns `Some(msg)` only when
+    /// the slot is `Block`-policy and the mailbox is full — caller must
+    /// then call `push_blocking` in phase 2. Returns `None` on any other
+    /// outcome (success, drop policy, slot torn down) — all of which the
+    /// caller treats as "done" for this slot.
+    fn try_push_to_slot(&self, slot: &TransportSlot, info: LogInfo) -> Option<SlotMessage> {
+        match slot.mailbox_tx.try_push(SlotMessage::Entry(info)) {
+            Ok(()) => {
+                slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                if slot.was_saturated.swap(false, Ordering::Relaxed) {
+                    emit_event(
+                        &self.event_senders,
+                        BackpressureEvent::Recovered { handle: slot.handle },
+                    );
+                }
+                None
+            }
+            Err(TryPushError::Full(msg)) => {
+                if !slot.was_saturated.swap(true, Ordering::Relaxed) {
+                    emit_event(
+                        &self.event_senders,
+                        BackpressureEvent::Saturated { handle: slot.handle },
+                    );
+                }
+                match slot.overflow {
+                    OverflowPolicy::Block => Some(msg),
+                    OverflowPolicy::DropNewest => {
+                        slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                    OverflowPolicy::DropOldest => {
+                        let _evicted = slot.mailbox_tx.force_push_dropping_oldest(msg);
+                        slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                        slot.stats.dropped_total.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                }
+            }
+            Err(TryPushError::Closed(_)) => None, // pump gone — slot torn down
+        }
+    }
+
+    /// Drain entries that were logged before any transport was admitted.
+    /// Called from the admin path after `admit` lands the first slot.
+    pub(crate) fn drain_buffer_to_slots(&self) {
         let buffered: Vec<Arc<LogInfo>> = {
             let mut buf = self.buffer.lock().unwrap();
             buf.drain(..).collect()
         };
         for entry in &buffered {
-            self.fan_entry(entry).await;
+            self.dispatch_entry(entry);
         }
     }
 
-    async fn process_entry(&mut self, entry: Arc<LogInfo>) {
+    /// Empty-message gate, no-transport buffering, dispatch. The full
+    /// `Logger::log` happy-path runs through here.
+    pub(crate) fn process_entry(&self, entry: Arc<LogInfo>) {
         if entry.message.is_empty() && entry.meta.is_empty() {
             return;
         }
@@ -491,213 +572,61 @@ impl FanoutState {
             return;
         }
 
-        self.drain_buffer().await;
-        self.fan_entry(&entry).await;
+        self.dispatch_entry(&entry);
     }
 
-    /// Send Flush barriers into every slot and await all acks.
-    ///
-    /// `send().await` (not `try_push`) guarantees the barrier reaches the
-    /// back of each mailbox even when full — flush is a synchronisation
-    /// point, not a drop candidate. Each pump processes the barrier after
-    /// all prior `Entry` messages.
-    async fn flush_all(&mut self) {
+    /// Send `Flush` barriers into every slot, then block the calling
+    /// thread on every pump's ack. Uses `push_blocking` (not `try_push`)
+    /// so the barrier always lands, even when the mailbox is full.
+    pub(crate) fn flush_all_sync(&self) {
         let mut acks = Vec::with_capacity(self.slots.len());
-        for slot in &mut self.slots {
+        for slot in &self.slots {
             let (tx, rx) = oneshot::channel();
-            if slot.mailbox_tx.send(SlotMessage::Flush(tx)).await.is_ok() {
+            if slot.mailbox_tx.push_blocking(SlotMessage::Flush(tx)).is_ok() {
                 acks.push(rx);
             }
         }
-        for rx in acks {
-            let _ = rx.await;
+        if acks.is_empty() {
+            return;
         }
-    }
-
-    /// Tear down every slot: send `Close`, then join each pump.
-    ///
-    /// Both the `Close` sends and the pump-done waits run in parallel.
-    /// Serial sends would compound under multi-slow-sink shutdown — each
-    /// `send.await` waits for that slot's mailbox to drain, so serial is
-    /// O(N · slow-sink-latency) while parallel is O(max). Pump-done was
-    /// already parallel; this brings the send half in line.
-    ///
-    /// The pump runs `writer.close()` (which drives `WritableSink::close`)
-    /// before exiting. Without joining, dropping the mailbox would race the
-    /// pump's close future and skip the sink's flush-and-close lifecycle.
-    async fn close_all(&mut self) {
-        let drained: Vec<TransportSlot> = self.slots.drain(..).collect();
-        let mut closes = Vec::with_capacity(drained.len());
-        let mut dones = Vec::with_capacity(drained.len());
-        let mut handles = Vec::with_capacity(drained.len());
-        for mut slot in drained {
-            handles.push(slot.handle);
-            if let Some(rx) = slot.pump_done.take() {
-                dones.push(rx);
+        futures::executor::block_on(async move {
+            for rx in acks {
+                let _ = rx.await;
             }
-            // Partial-move: own mailbox_tx into the close future so each
-            // send can race against its own pump independently.
-            let mut tx = slot.mailbox_tx;
-            closes.push(async move {
-                let _ = tx.send(SlotMessage::Close).await;
-            });
-        }
-        let _ = futures::future::join_all(closes).await;
-        let _ = futures::future::join_all(dones).await;
-        let mut map = self.stats_map.write().unwrap();
-        for h in handles {
-            map.remove(&h);
-        }
+        });
     }
 }
 
-
-/// The fanout task.
+/// Tear down every slot: send `Close`, then join every pump in parallel.
 ///
-/// One async task per Logger consumes every `PipelineMessage`, applies
-/// per-slot formatting and level filtering, and dispatches entries into
-/// each transport's per-slot mailbox. The mailbox is drained by a
-/// per-transport pump task that owns the `WritableStream` writer.
-///
-/// # Pressure model
-///
-/// The fanout itself never blocks on `Entry` dispatch unless a slot is
-/// configured `OverflowPolicy::Block` *and* its mailbox is full. In that
-/// case the fanout awaits `send` on that slot's mailbox, which propagates
-/// pressure back through the bridge → main channel → caller. Slots with
-/// `DropNewest` short-circuit at the mailbox boundary and never gate the
-/// fanout.
-///
-/// # Flush semantics
-///
-/// `Flush` is implemented as a per-slot barrier: a `SlotMessage::Flush`
-/// is sent (via `send().await`) into every mailbox and the fanout awaits
-/// every pump's ack. Each pump acks after `writer.ready().await` — i.e.
-/// once its queue has drained below the high-water mark. Durable flush
-/// (sink-level buffer → disk) happens at transport teardown via
-/// `WritableSink::close`.
-pub async fn run_fanout(
-    mut rx: fmpsc::UnboundedReceiver<PipelineMessage>,
-    spawn_fn: SpawnFn,
-    global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
-    global_level: Option<String>,
-    levels: Option<LoggerLevels>,
-    buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-    initial_transports: Vec<(TransportHandle, LoggerTransport)>,
-    stats_map: TransportStatsMap,
-    event_senders: EventSenders,
+/// Sends are serialised (sync `push_blocking`), but each `push_blocking`
+/// is brief — the mailbox is bounded and Close is one message. The
+/// parallel piece that matters is awaiting `pump_done`: each pump runs
+/// `writer.close()` (which drives `WritableSink::close`), and one slow
+/// transport shouldn't compound shutdown latency for the others.
+pub(crate) fn close_slots_sync(
+    slots: Vec<Arc<TransportSlot>>,
+    stats_map: &TransportStatsMap,
 ) {
-    let mut state = FanoutState {
-        spawn_fn,
-        slots: Vec::new(),
-        global_format,
-        global_level,
-        levels,
-        buffer,
-        stats_map,
-        event_senders,
-    };
-    for (handle, transport) in initial_transports {
-        state.admit(handle, transport);
+    if slots.is_empty() {
+        return;
     }
-
-    while let Some(msg) = rx.next().await {
-        match msg {
-            PipelineMessage::Entry(entry) => state.process_entry(entry).await,
-
-            PipelineMessage::Flush(fc) => {
-                state.flush_all().await;
-                let (lock, cvar) = &*fc;
-                let mut done = lock.lock().unwrap();
-                *done = true;
-                cvar.notify_one();
-            }
-
-            PipelineMessage::AddTransport { handle, transport } => {
-                state.admit(handle, transport);
-                state.drain_buffer().await;
-            }
-
-            PipelineMessage::RemoveTransport(handle) => {
-                if let Some(pos) = state.slots.iter().position(|s| s.handle == handle) {
-                    let mut slot = state.slots.remove(pos);
-                    let _ = slot.mailbox_tx.send(SlotMessage::Close).await;
-                    if let Some(rx) = slot.pump_done.take() {
-                        let _ = rx.await;
-                    }
-                    state.stats_map.write().unwrap().remove(&handle);
-                }
-            }
-
-            PipelineMessage::Reconfigure {
-                format,
-                level,
-                levels,
-            } => {
-                state.global_format = format;
-                state.global_level = level;
-                state.levels = levels;
-            }
-
-            PipelineMessage::Configure {
-                format,
-                level,
-                levels,
-                transports,
-            } => {
-                state.close_all().await;
-                state.global_format = format;
-                state.global_level = level;
-                state.levels = levels;
-                for (handle, transport) in transports {
-                    state.admit(handle, transport);
-                }
-                state.drain_buffer().await;
-            }
-
-            PipelineMessage::Shutdown => {
-                state.close_all().await;
-            }
+    let mut handles = Vec::with_capacity(slots.len());
+    let mut dones = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        handles.push(slot.handle);
+        let _ = slot.mailbox_tx.push_blocking(SlotMessage::Close);
+        if let Some(rx) = slot.pump_done.lock().take() {
+            dones.push(rx);
         }
     }
-
-    // Pipeline channel closed: ensure every transport drains and closes its
-    // sink before this task exits.
-    state.close_all().await;
-}
-
-
-/// Builds and returns the pipeline channel sender.
-///
-/// Spawns exactly one fanout task. All other tasks are spawned indirectly,
-/// one per transport, when a `WritableStream` is built inside the fanout —
-/// no extra plumbing tasks.
-pub fn build_pipeline(
-    options: &LoggerOptions,
-    buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-    spawn_fn: SpawnFn,
-    stats_map: TransportStatsMap,
-    event_senders: EventSenders,
-) -> fmpsc::UnboundedSender<PipelineMessage> {
-    let (tx, rx) = fmpsc::unbounded::<PipelineMessage>();
-
-    let global_format = options.format.clone();
-    let global_level = options.level.clone();
-    let levels = options.levels.clone();
-    let initial_transports = options.transports.clone().unwrap_or_default();
-
-    let fanout_spawn = Arc::clone(&spawn_fn);
-    spawn_fn(Box::pin(run_fanout(
-        rx,
-        fanout_spawn,
-        global_format,
-        global_level,
-        levels,
-        buffer,
-        initial_transports,
-        stats_map,
-        event_senders,
-    )));
-
-    tx
+    if !dones.is_empty() {
+        futures::executor::block_on(async move {
+            let _ = futures::future::join_all(dones).await;
+        });
+    }
+    let mut map = stats_map.write().unwrap();
+    for h in handles {
+        map.remove(&h);
+    }
 }
