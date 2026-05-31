@@ -484,8 +484,6 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
 
 fn bench_winston(target: OutputTarget) -> BenchmarkResult {
     let builder = winston::Logger::builder()
-        .channel_capacity(50_000)
-        .backpressure_strategy(winston::BackpressureStrategy::Block)
         .format(
             winston::format::timestamp().chain(winston::format::printf(|info| {
                 format!(
@@ -500,22 +498,38 @@ fn bench_winston(target: OutputTarget) -> BenchmarkResult {
             })),
         );
 
+    // Per-transport queue capacity — was caller-side channel_capacity in
+    // the pre-direct-dispatch model. Sized large so the bench measures
+    // dispatch + sink throughput, not push_blocking parking.
+    let queue_capacity = 50_000;
+
     let init_start = Instant::now();
     let logger = match target {
         OutputTarget::Sink => builder
-            .transport(winston::transports::WriterTransport::new(std::io::sink()))
+            .transport(
+                winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                    std::io::sink(),
+                ))
+                .with_queue_capacity(queue_capacity),
+            )
             .build(),
         OutputTarget::Stdout => builder
-            .transport(winston::transports::WriterTransport::new(BufWriter::new(
-                std::io::stdout(),
-            )))
+            .transport(
+                winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                    BufWriter::new(std::io::stdout()),
+                ))
+                .with_queue_capacity(queue_capacity),
+            )
             .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(BufWriter::new(
-                    log_file,
-                )))
+                .transport(
+                    winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                        BufWriter::new(log_file),
+                    ))
+                    .with_queue_capacity(queue_capacity),
+                )
                 .build()
         }
     };
@@ -710,8 +724,6 @@ fn bench_tracing_async_concurrent(target: OutputTarget) -> (f64, u64) {
 
 fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
-        .channel_capacity(200_000)
-        .backpressure_strategy(winston::BackpressureStrategy::Block)
         .format(
             winston::format::timestamp().chain(winston::format::printf(|info| {
                 format!(
@@ -725,21 +737,36 @@ fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
                 )
             })),
         );
+    // Concurrent bench: more producers, bigger queue. Was 200_000 on the
+    // pre-direct-dispatch caller channel.
+    let queue_capacity = 200_000;
+
     let logger = match target {
         OutputTarget::Sink => builder
-            .transport(winston::transports::WriterTransport::new(std::io::sink()))
+            .transport(
+                winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                    std::io::sink(),
+                ))
+                .with_queue_capacity(queue_capacity),
+            )
             .build(),
         OutputTarget::Stdout => builder
-            .transport(winston::transports::WriterTransport::new(BufWriter::new(
-                std::io::stdout(),
-            )))
+            .transport(
+                winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                    BufWriter::new(std::io::stdout()),
+                ))
+                .with_queue_capacity(queue_capacity),
+            )
             .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston_conc.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(BufWriter::new(
-                    log_file,
-                )))
+                .transport(
+                    winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                        BufWriter::new(log_file),
+                    ))
+                    .with_queue_capacity(queue_capacity),
+                )
                 .build()
         }
     };
@@ -810,8 +837,6 @@ fn bench_tracing_async_saturate(target: OutputTarget) -> (f64, u64) {
 
 fn bench_winston_saturate(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
-        .channel_capacity(SATURATION_CHANNEL_SIZE)
-        .backpressure_strategy(winston::BackpressureStrategy::Block)
         .format(
             winston::format::timestamp().chain(winston::format::printf(|info| {
                 format!(
@@ -825,21 +850,37 @@ fn bench_winston_saturate(target: OutputTarget) -> (f64, u64) {
                 )
             })),
         );
+    // Saturation bench: deliberately match the SATURATION_CHANNEL_SIZE
+    // the other loggers use, so per-engine queues are sized equivalently
+    // and the bench compares dispatch behaviour under matched buffers.
+    let queue_capacity = SATURATION_CHANNEL_SIZE;
+
     let logger = match target {
         OutputTarget::Sink => builder
-            .transport(winston::transports::WriterTransport::new(std::io::sink()))
+            .transport(
+                winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                    std::io::sink(),
+                ))
+                .with_queue_capacity(queue_capacity),
+            )
             .build(),
         OutputTarget::Stdout => builder
-            .transport(winston::transports::WriterTransport::new(BufWriter::new(
-                std::io::stdout(),
-            )))
+            .transport(
+                winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                    BufWriter::new(std::io::stdout()),
+                ))
+                .with_queue_capacity(queue_capacity),
+            )
             .build(),
         OutputTarget::File => {
             let log_file = std::fs::File::create("logs/winston_sat.log").unwrap();
             builder
-                .transport(winston::transports::WriterTransport::new(BufWriter::new(
-                    log_file,
-                )))
+                .transport(
+                    winston::LoggerTransport::new(winston::transports::WriterTransport::new(
+                        BufWriter::new(log_file),
+                    ))
+                    .with_queue_capacity(queue_capacity),
+                )
                 .build()
         }
     };

@@ -2,7 +2,7 @@ mod common;
 
 use common::{wait_for_logs, MockTransport};
 use logform::LogInfo;
-use winston::{log, BackpressureStrategy, Logger, LoggerOptions};
+use winston::{log, Logger, LoggerOptions};
 
 #[test]
 fn test_logger_builder_api() {
@@ -10,8 +10,6 @@ fn test_logger_builder_api() {
 
     let logger = Logger::builder()
         .level("info")
-        .channel_capacity(512)
-        .backpressure_strategy(BackpressureStrategy::Block)
         .transport(transport.clone())
         .build();
 

@@ -12,8 +12,6 @@ pub struct LoggerOptions {
     pub format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
     pub level: Option<String>,
     pub transports: Option<Vec<(TransportHandle, LoggerTransport)>>,
-    pub channel_capacity: Option<usize>,
-    pub backpressure_strategy: Option<BackpressureStrategy>,
 }
 
 impl LoggerOptions {
@@ -126,45 +124,20 @@ impl LoggerOptions {
         self
     }
 
-    /// Sets the channel capacity for the logger.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - An `usize` that defines the capacity of the channel.
-    pub fn channel_capacity(mut self, capacity: usize) -> Self {
-        self.channel_capacity = Some(capacity);
-        self
-    }
-
-    /// Sets the backpressure strategy for the logger.
-    ///
-    /// # Arguments
-    ///
-    /// * `strategy` - The backpressure strategy to apply when the channel is full.
-    pub fn backpressure_strategy(mut self, strategy: BackpressureStrategy) -> Self {
-        self.backpressure_strategy = Some(strategy);
-        self
-    }
 }
 
 impl Default for LoggerOptions {
-    /// Provides the default configuration for `LoggerOptions`.
-    ///
-    /// The default configuration includes:
-    /// - A default set of logging levels.
-    /// - The logging level set to "info".
-    /// - No default transports.
-    /// - The JSON format for log entries.
-    /// - A channel capacity of 1024.
-    /// - A backpressure strategy set to `BackpressureStrategy::Block`, meaning the logger will block on overflow until space is available.
+    /// Default: info-level filter, empty transport list, JSON format,
+    /// standard level table. There is no caller-side backpressure knob:
+    /// pressure is configured per transport via [`OverflowPolicy`] and
+    /// [`LoggerTransport::with_queue_capacity`]
+    /// (see `docs/adr/0002-direct-dispatch-backpressure.md`).
     fn default() -> Self {
         LoggerOptions {
             levels: Some(LoggerLevels::default()),
             level: Some("info".to_string()),
             transports: Some(Vec::new()),
             format: Some(Arc::new(json())),
-            channel_capacity: Some(1024),
-            backpressure_strategy: Some(BackpressureStrategy::Block),
         }
     }
 }
@@ -175,36 +148,25 @@ impl std::fmt::Debug for LoggerOptions {
             .field("levels", &self.levels)
             .field("level", &self.level)
             .field("transports", &self.transports)
-            .field("channel_capacity", &self.channel_capacity)
-            .field("backpressure_strategy", &self.backpressure_strategy)
-            // For the format field, just print a placeholder because it can't be debugged:
             .field("format", &"<Format trait object>")
             .finish()
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum BackpressureStrategy {
-    DropOldest,
-    Block,
-    DropCurrent,
-}
-
 /// Per-transport policy applied when the slot's mailbox is full.
 ///
-/// `Block` propagates pressure end-to-end: a saturated `Block` slot stalls
-/// the fanout, which fills the main channel and trips the caller-side
-/// `BackpressureStrategy`. Pick this for durability sinks (file, daily-rotate)
-/// where dropping is unacceptable. Note that under sustained pressure a
-/// `Block` slot can stall the *whole logger* (fanout is shared) and, via the
-/// caller channel's `BackpressureStrategy`, the application thread itself —
-/// pair with a non-`Block` caller strategy if the application must stay
-/// responsive while a slow sink drains.
+/// `Block` propagates pressure end-to-end: a saturated `Block` slot parks
+/// the calling thread on the slot's mailbox `Condvar` until room appears.
+/// Pick this for durability sinks (file, daily-rotate) where dropping is
+/// unacceptable. Under sustained pressure a `Block` slot will slow the
+/// producer to the sink's rate — that's the design ("slowest pipe sets
+/// the pace"); pick a Drop policy on a transport where you don't want
+/// that to happen.
 ///
-/// `DropNewest` short-circuits at the mailbox boundary: the slot never
-/// couples the fanout, but loses entries under sustained pressure. Pick this
-/// for telemetry lanes (HTTP, Mongo, console) where freshness matters more
-/// than completeness.
+/// `DropNewest` short-circuits at the mailbox boundary: the new entry is
+/// dropped, the slot never parks the caller. Pick this for telemetry
+/// lanes (HTTP, Mongo, console) where freshness matters more than
+/// completeness.
 ///
 /// `DropOldest` evicts the head of the mailbox and pushes the new entry —
 /// a sliding window of the most recent N entries. Pick this when freshness

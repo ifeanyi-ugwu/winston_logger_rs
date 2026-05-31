@@ -1,5 +1,5 @@
 use crate::{
-    logger_options::{BackpressureStrategy, LoggerOptions},
+    logger_options::LoggerOptions,
     logger_transport::IntoLoggerTransport,
     pipeline::{self, SpawnFn},
     Logger,
@@ -63,16 +63,6 @@ impl LoggerBuilder {
         self
     }
 
-    pub fn channel_capacity(mut self, capacity: usize) -> Self {
-        self.options = self.options.channel_capacity(capacity);
-        self
-    }
-
-    pub fn backpressure_strategy(mut self, strategy: BackpressureStrategy) -> Self {
-        self.options = self.options.backpressure_strategy(strategy);
-        self
-    }
-
     pub fn build(self) -> Logger {
         let spawn_fn = self
             .spawn_fn
@@ -84,7 +74,6 @@ impl LoggerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BackpressureStrategy;
     use std::collections::HashMap;
 
     #[test]
@@ -106,27 +95,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_with_channel_capacity() {
-        let logger = LoggerBuilder::new().channel_capacity(2048).build();
-
-        let state = logger.shared_state.read();
-        assert_eq!(state.options.channel_capacity, Some(2048));
-    }
-
-    #[test]
-    fn test_builder_with_backpressure_strategy() {
-        let logger = LoggerBuilder::new()
-            .backpressure_strategy(BackpressureStrategy::DropOldest)
-            .build();
-
-        let state = logger.shared_state.read();
-        assert!(matches!(
-            state.options.backpressure_strategy,
-            Some(BackpressureStrategy::DropOldest)
-        ));
-    }
-
-    #[test]
     fn test_builder_with_custom_levels() {
         let mut custom_levels = HashMap::new();
         custom_levels.insert("critical".to_string(), 0);
@@ -142,18 +110,9 @@ mod tests {
 
     #[test]
     fn test_builder_chaining() {
-        let logger = LoggerBuilder::new()
-            .level("warn")
-            .channel_capacity(512)
-            .backpressure_strategy(BackpressureStrategy::Block)
-            .build();
+        let logger = LoggerBuilder::new().level("warn").build();
 
         let state = logger.shared_state.read();
         assert_eq!(state.options.level.as_deref(), Some("warn"));
-        assert_eq!(state.options.channel_capacity, Some(512));
-        assert!(matches!(
-            state.options.backpressure_strategy,
-            Some(BackpressureStrategy::Block)
-        ));
     }
 }

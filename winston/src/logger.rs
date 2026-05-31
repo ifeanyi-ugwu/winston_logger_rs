@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_logger_creation_with_custom_options() {
-        let options = LoggerOptions::new().level("debug").channel_capacity(512);
+        let options = LoggerOptions::new().level("debug");
         let logger = Logger::new(Some(options));
         let state = logger.shared_state.read();
         assert_eq!(state.options.level.as_deref(), Some("debug"));
