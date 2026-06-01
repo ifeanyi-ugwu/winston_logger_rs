@@ -1,8 +1,40 @@
 # ADR 0003 — Parallel deferred-Block dispatch
 
-**Status:** Accepted
+**Status:** Rejected (the gap it set out to close turned out to be illusory).
 
-## Context
+## Why rejected — the analysis error
+
+The framing in the original Context below assumed serial phase 2 would
+cause the caller to wait `sum(slot_drain_times)`. On closer trace this
+isn't true: **the per-slot pumps run independently and are not gated by
+phase 2's iteration order**. Each pump is an autonomous task that has
+been processing its current entry since long before phase 2 started.
+
+Walking through it with A draining at `t_A = 100ms` and B at
+`t_B = 150ms`:
+
+- **Serial**: worker `push_blocking`s A at T=0, parks. A's pump frees
+  room at T=100. Worker wakes, moves to B's `push_blocking`. *B's pump
+  has been working since T=0, finishes at T=150.* Worker reaches B at
+  T=100, parks 50ms more, wakes at T=150. **Total = 150ms = max.**
+- **Parallel**: both futures awaited concurrently. `join_all` completes
+  at `max(t_A, t_B) = 150ms`. **Total = 150ms.**
+
+Equivalent. The serial chain does not compound because B's pump isn't
+waiting for A's pump — it's running in parallel anyway. The serial
+visit just *observes* each pump's drain in turn; the slowest one bounds
+the total because the slowest is what the worker is still waiting on
+when faster ones have long since finished.
+
+The proposal below (add `block_on(join_all(...))` to phase 2 for N > 1)
+would have added executor cost on the saturated path with zero
+performance benefit. We are keeping the existing serial loop.
+
+This ADR stays in the tree as the record of why we considered the
+optimization and why it doesn't apply, so the same intuition doesn't
+get re-raised in six months.
+
+## Context (the originally assumed gap)
 
 ADR 0002 commits to "slowest pipe sets the pace" — the calling thread waits
 for the slowest `OverflowPolicy::Block` slot whose mailbox is full, and that
@@ -16,24 +48,14 @@ implements that with:
 - **Phase 2** — for each deferred Block slot, `push_blocking` parks the
   calling thread on that slot's `Condvar` until the slot has room.
 
-Phase 2 currently iterates the deferred list **serially**: `push_blocking`
-on slot A → wait → `push_blocking` on slot B → wait. If A takes 100ms to
-free a spot and B takes 150ms, the caller waits **250ms**, not `max(100,
-150) = 150ms`. Under "slowest sets the pace" the contract should give the
-caller `max`, not the sum.
+Phase 2 iterates the deferred list **serially**: `push_blocking` on slot A
+→ wait → `push_blocking` on slot B → wait. **The original framing of this
+ADR claimed** the caller therefore waits `sum(drain_times)`, citing a
+"100ms plus 150ms equals 250ms" example. That framing is wrong — see
+*Why rejected* above. What follows preserves the proposal that was
+considered on the basis of the flawed framing.
 
-This is a real but bounded gap:
-
-- It only shows up when **two or more** slots are simultaneously `Block`-policy
-  AND simultaneously saturated.
-- The common config has at most one Block slot (e.g. file = Block; http +
-  console = DropNewest), so the existing serial form is already O(slowest)
-  in practice.
-- The case it does affect — multiple durable lanes (file + daily-rotate +
-  remote-mirror) all backed up at once — is the precise scenario where
-  latency matters most for the calling thread.
-
-## Decision
+## Proposal (not implemented — see *Why rejected*)
 
 When phase 2 has more than one deferred Block slot, await the per-slot
 sends concurrently from the calling thread using
@@ -136,46 +158,39 @@ inside an unavoidable sink wait.
   parker-bound wait. The Parker is the floor; everything else is window
   dressing.
 
-## Consequences
+## What we would have got — and why we didn't take it
 
-- **Tail latency improves under multi-Block-saturation** — caller waits
-  `max(slot_drain_times)` instead of `sum(slot_drain_times)` when phase 2
-  has 2+ deferred entries.
-- **Fast path unchanged.** Logs that don't trigger phase 2 (the dominant
-  case) pay exactly nothing for this. The branch on
-  `deferred.is_empty()` keeps the hot path free of any executor cost.
-- **Single-slot phase 2 unchanged.** Single-deferred case still uses the
-  zero-alloc `push_blocking` path — `block_on` only enters when N > 1.
-- **No new dependency.** `futures::executor::block_on` and
-  `futures::future::join_all` are already in the crate's dependency tree.
-- **No new threads.** The calling thread parks on its own Parker; the
-  per-slot pumps are the same async tasks already running. The mailbox
-  `send` future borrows the producer (already supported in mailbox.rs).
-- **The semantic gap in ADR 0002 closes.** "Slowest pipe sets the pace"
-  becomes true for any N, not just N ≤ 1.
+If the framing had been correct, the proposal would have given:
 
-- **Cost scales with saturation frequency, not with throughput, slot
-  count, or concurrency.** Concurrent `log()` callers don't contend
-  (each has its own thread-local Parker). Slots per Logger contribute
-  O(N) to the polling cost in phase 2, which for realistic N (≤ 5) is
-  in the tens of nanoseconds. The only thing that meaningfully scales
-  the parallel-wait cost is *how often phase 2 fires* — which is
-  bounded by how often Block slots saturate. Healthy sinks → never
-  enters phase 2 → zero cost from this machinery.
+- **Tail latency improvement under multi-Block-saturation** — caller
+  waiting `max(slot_drain_times)` instead of `sum(slot_drain_times)`.
+  As traced in *Why rejected*, the serial form already gives `max`
+  because the pumps run in parallel regardless of phase 2 ordering, so
+  there is no improvement to be had.
+- **No fast-path regression.** Logs that don't trigger phase 2 still
+  pay nothing — but since we're not changing phase 2, this point is
+  moot.
+- **No new dependency, no new threads.** Same — moot for a non-change.
 
-- **The primitive only spends cycles when there is nothing better to do.**
-  Phase 2 fires when the caller is going to wait on a slow sink anyway;
-  `block_on(join_all)` adds microseconds of polling on top of a wait
-  measured in milliseconds. This is what makes it the right choice for a
-  logger: efficiency on the hot path comes from not running it at all,
-  not from making it incrementally cheaper.
+What we would have *paid* for nothing in return:
+
+- One `Vec` allocation + N future pinnings per `log()` call that hits
+  phase 2 with N > 1 — microseconds, but non-zero, on the saturated path
+  that's already paying the actual sink wait. Adding executor cost
+  without a corresponding semantic improvement is strictly worse than
+  the existing loop.
+
+The serial loop is kept. The proposal's analysis is preserved here
+because the same intuition (sum vs max) is the kind of thing that gets
+re-raised; recording the trace prevents a re-implementation attempt.
 
 ## References
 
-- ADR 0002 — Direct-dispatch backpressure (this ADR closes the
-  multi-Block semantic gap left as a TODO at the bottom of 0002's
-  dispatch description).
-- `winston/src/mailbox.rs` — `MailboxSender::send` is the async send
-  future this commit's phase 2 awaits.
-- `winston/src/pipeline.rs::StateSnapshot::dispatch_entry` — the two-
-  phase dispatch site that gains the N > 1 branch.
+- ADR 0002 — Direct-dispatch backpressure (this ADR was originally
+  framed as closing a multi-Block semantic gap in 0002's two-phase
+  dispatch; on analysis the gap doesn't exist).
+- `winston/src/mailbox.rs::MailboxSender::push_blocking` — the
+  primitive the serial loop already uses, which gives `max(drain_times)`
+  for free because pumps are independent.
+- `winston/src/pipeline.rs::StateSnapshot::dispatch_entry` — the
+  two-phase dispatch site that stays serial in phase 2.
