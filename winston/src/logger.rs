@@ -11,7 +11,7 @@ use futures::channel::mpsc as fmpsc;
 use logform::LogInfo;
 use parking_lot::RwLock;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -102,6 +102,11 @@ pub struct Logger {
     /// Lock-free pre-filter cache; `u8::MAX` means "accept everything".
     min_required_severity_cache: AtomicU8,
 
+    /// Snapshot of the active levels map (name → severity). Read by
+    /// `is_level_enabled_fast` to resolve an entry's severity without
+    /// touching `shared_state`. Updated whenever levels change.
+    levels_snapshot: RwLock<HashMap<String, u8>>,
+
     /// Held so `Logger::query` can spawn the per-call `ReadableStream` it
     /// drains. Same spawner the per-slot pumps use internally.
     spawn_fn: pipeline::SpawnFn,
@@ -170,12 +175,19 @@ impl Logger {
 
         let severity_cache = min_required_severity.unwrap_or(u8::MAX);
 
+        let levels_snapshot = options
+            .levels
+            .as_ref()
+            .map(|l| l.into_iter().map(|(k, &v)| (k.clone(), v)).collect())
+            .unwrap_or_default();
+
         Logger {
             shared_state,
             state: Arc::new(RwLock::new(state)),
             buffer,
             is_closed: AtomicBool::new(false),
             min_required_severity_cache: AtomicU8::new(severity_cache),
+            levels_snapshot: RwLock::new(levels_snapshot),
             spawn_fn,
             stats_map,
             event_senders,
@@ -205,12 +217,17 @@ impl Logger {
         min_severity
     }
 
-    fn refresh_effective_levels(state: &mut SharedState, severity_cache: &AtomicU8) {
+    fn refresh_effective_levels(
+        state: &mut SharedState,
+        severity_cache: &AtomicU8,
+        levels_snapshot: &RwLock<HashMap<String, u8>>,
+    ) {
         let levels = match &state.options.levels {
             Some(l) => l,
             None => {
                 state.min_required_severity = None;
                 severity_cache.store(u8::MAX, Ordering::Relaxed);
+                *levels_snapshot.write() = HashMap::new();
                 return;
             }
         };
@@ -231,28 +248,20 @@ impl Logger {
 
         state.min_required_severity = min_sev;
         severity_cache.store(min_sev.unwrap_or(u8::MAX), Ordering::Relaxed);
+        *levels_snapshot.write() = levels.into_iter().map(|(k, &v)| (k.clone(), v)).collect();
     }
 
-    fn is_level_enabled(entry_level: &str, state: &SharedState) -> bool {
-        if let Some(min_required) = state.min_required_severity {
-            if let Some(levels) = &state.options.levels {
-                if let Some(entry_severity) = levels.get_severity(entry_level) {
-                    return min_required >= entry_severity;
-                }
-            }
-        }
-        false
-    }
-
-    /// Lock-free level check for the caller's hot path. `u8::MAX` sentinel
-    /// means "no filter" and short-circuits to true.
+    /// Level check for the caller's hot path. `u8::MAX` sentinel means "no
+    /// filter" and short-circuits to true without any lock. Otherwise checks
+    /// the levels snapshot — a `parking_lot::RwLock` held only for the
+    /// duration of one HashMap lookup on a small fixed-size map.
     pub fn is_level_enabled_fast(&self, level: &str) -> bool {
         let min = self.min_required_severity_cache.load(Ordering::Relaxed);
         if min == u8::MAX {
             return true;
         }
-        let state = self.shared_state.read();
-        Self::is_level_enabled(level, &state)
+        let snapshot = self.levels_snapshot.read();
+        matches!(snapshot.get(level), Some(&sev) if sev <= min)
     }
 
     /// Sync dispatch to every slot. Under `OverflowPolicy::Block` this
@@ -335,6 +344,12 @@ impl Logger {
 
         let mut results = Vec::new();
         for handle in handles {
+            // Fast path: in-memory sources skip stream task/channel overhead.
+            if let Some(entries) = handle.query_sync(options) {
+                results.extend(entries);
+                continue;
+            }
+            // Slow path: real I/O sources (file, network) use ReadableStream.
             let Some(source) = handle.query(options) else {
                 continue;
             };
@@ -376,7 +391,11 @@ impl Logger {
         {
             let mut state = self.shared_state.write();
             state.transport_levels.push((handle, level));
-            Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
+            Self::refresh_effective_levels(
+                &mut state,
+                &self.min_required_severity_cache,
+                &self.levels_snapshot,
+            );
             state
                 .options
                 .transports
@@ -445,7 +464,11 @@ impl Logger {
                 if let Some(transports) = &mut state.options.transports {
                     transports.retain(|(h, _)| *h != handle);
                 }
-                Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
+                Self::refresh_effective_levels(
+                    &mut state,
+                    &self.min_required_severity_cache,
+                    &self.levels_snapshot,
+                );
             }
             removed
         };
@@ -474,80 +497,100 @@ impl Logger {
     pub fn configure(&self, new_options: Option<LoggerOptions>) {
         let default_options = LoggerOptions::default();
 
-        let (format, level, levels, transports) = {
+        // `replace_transports`: `Some(vec)` = replace slots with these; `None` = keep live slots.
+        let (format, level, levels, replace_transports) = {
             let mut state = self.shared_state.write();
 
-            if let Some(options) = new_options {
-                state.options.format = options
-                    .format
-                    .or_else(|| state.options.format.take().or(default_options.format));
+            match new_options {
+                Some(options) => {
+                    state.options.format = options
+                        .format
+                        .or_else(|| state.options.format.take().or(default_options.format));
+                    state.options.levels = options
+                        .levels
+                        .or_else(|| state.options.levels.take().or(default_options.levels));
+                    state.options.level = options
+                        .level
+                        .or_else(|| state.options.level.take().or(default_options.level));
 
-                state.options.levels = options
-                    .levels
-                    .or_else(|| state.options.levels.take().or(default_options.levels));
+                    // `None` means "leave transports alone"; `Some` (including empty) replaces.
+                    let replace = options.transports.map(|new_transports| {
+                        state.options.transports = Some(new_transports.clone());
+                        state.transport_levels = new_transports
+                            .iter()
+                            .map(|(h, t)| (*h, t.get_level().cloned()))
+                            .collect();
+                        new_transports
+                    });
 
-                state.options.level = options
-                    .level
-                    .or_else(|| state.options.level.take().or(default_options.level));
+                    Self::refresh_effective_levels(
+                        &mut state,
+                        &self.min_required_severity_cache,
+                        &self.levels_snapshot,
+                    );
 
-                if let Some(new_transports) = options.transports {
-                    state.options.transports = Some(new_transports);
-                } else {
-                    state.options.transports = Some(Vec::new());
+                    (
+                        state.options.format.clone(),
+                        state.options.level.clone(),
+                        state.options.levels.clone(),
+                        replace,
+                    )
                 }
-            } else {
-                state.options.transports = Some(Vec::new());
+                None => {
+                    // configure(None) = clear transports, preserve everything else.
+                    state.options.transports = Some(Vec::new());
+                    state.transport_levels = vec![];
+                    Self::refresh_effective_levels(
+                        &mut state,
+                        &self.min_required_severity_cache,
+                        &self.levels_snapshot,
+                    );
+                    (
+                        state.options.format.clone(),
+                        state.options.level.clone(),
+                        state.options.levels.clone(),
+                        Some(Vec::new()),
+                    )
+                }
             }
-
-            state.transport_levels = state
-                .options
-                .transports
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|(h, t)| (*h, t.get_level().cloned()))
-                .collect();
-
-            Self::refresh_effective_levels(&mut state, &self.min_required_severity_cache);
-
-            let transports = state.options.transports.clone().unwrap_or_default();
-            (
-                state.options.format.clone(),
-                state.options.level.clone(),
-                state.options.levels.clone(),
-                transports,
-            )
         };
 
-        // Pre-create stats for the new transports; stale entries get
-        // cleared by close_slots_sync below.
-        {
-            let mut map = self.stats_map.write().unwrap();
-            for (h, _) in &transports {
-                map.entry(*h)
-                    .or_insert_with(|| Arc::new(TransportStatsInner::default()));
+        if let Some(new_transports) = replace_transports {
+            // Pre-create stats for the new transports; stale entries get
+            // cleared by close_slots_sync below.
+            {
+                let mut map = self.stats_map.write().unwrap();
+                for (h, _) in &new_transports {
+                    map.entry(*h)
+                        .or_insert_with(|| Arc::new(TransportStatsInner::default()));
+                }
             }
-        }
 
-        // Drain the old slots out, update the global format/level/levels,
-        // admit the new slots — all under the write lock briefly, then
-        // close the old slots outside the lock.
-        let old_slots = {
+            // Drain old slots, update routing, admit new slots — all under the
+            // write lock, then close old slots outside it.
+            let old_slots = {
+                let mut state = self.state.write();
+                let old = state.drain_slots();
+                state.global_format = format;
+                state.global_level = level;
+                state.levels = levels;
+                for (h, t) in new_transports {
+                    state.admit(h, t);
+                }
+                old
+            };
+            close_slots_sync(old_slots, &self.stats_map);
+
+            // Drain any pre-transport buffer through the new slot list.
+            let snapshot = self.state.read().snapshot();
+            snapshot.drain_buffer_to_slots();
+        } else {
+            // Transports unchanged: propagate routing changes without touching slots.
             let mut state = self.state.write();
-            let old = state.drain_slots();
             state.global_format = format;
             state.global_level = level;
             state.levels = levels;
-            for (h, t) in transports {
-                state.admit(h, t);
-            }
-            old
-        };
-        close_slots_sync(old_slots, &self.stats_map);
-
-        // Drain any pre-transport buffer through the new slot list.
-        let snapshot = self.state.read().snapshot();
-        snapshot.drain_buffer_to_slots();
+        }
     }
 
     pub fn builder() -> LoggerBuilder {
@@ -579,13 +622,28 @@ impl Drop for Logger {
 use log::{Log, Metadata, Record};
 
 #[cfg(feature = "log-backend")]
+fn log_level_str(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Error => "error",
+        log::Level::Warn => "warn",
+        log::Level::Info => "info",
+        log::Level::Debug => "debug",
+        log::Level::Trace => "trace",
+    }
+}
+
+#[cfg(feature = "log-backend")]
 impl Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        let state = self.shared_state.read();
-        Self::is_level_enabled(&metadata.level().as_str().to_lowercase(), &state)
+        self.is_level_enabled_fast(log_level_str(metadata.level()))
     }
 
     fn log(&self, record: &Record) {
+        let level_str = log_level_str(record.level());
+        if !self.is_level_enabled_fast(level_str) {
+            return;
+        }
+
         let mut meta = std::collections::HashMap::new();
         meta.insert(
             "timestamp".to_string(),
@@ -625,13 +683,8 @@ impl Log for Logger {
             }
         }
 
-        let log_info = LogInfo::from_parts(
-            record.level().as_str().to_lowercase(),
-            record.args().to_string(),
-            meta,
-        );
-
-        self.log(log_info);
+        let log_info = LogInfo::from_parts(level_str.to_string(), record.args().to_string(), meta);
+        self.logi(log_info);
     }
 
     fn flush(&self) {
@@ -741,6 +794,10 @@ mod tests {
             Some(Box::new(VecSource {
                 entries: snapshot.into_iter(),
             }))
+        }
+
+        fn query_sync(&self, _options: &LogQuery) -> Option<Vec<LogInfo>> {
+            Some(self.logs.lock().unwrap().clone())
         }
     }
 
@@ -955,6 +1012,34 @@ mod tests {
 
         let state = logger.shared_state.read();
         assert!(state.options.transports.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_configure_transports_none_preserves_live_slots() {
+        let logger = Logger::new(Some(LoggerOptions::new().level("info")));
+        let transport = TestTransport::new();
+        logger.add_transport(transport.clone());
+
+        logger.log(LogInfo::new("info", "before configure"));
+        logger.flush().unwrap();
+        assert_eq!(transport.get_logs().len(), 1);
+
+        // transports: None → preserve existing transport, only change the level.
+        logger.configure(Some(LoggerOptions {
+            level: Some("warn".to_string()),
+            transports: None,
+            format: None,
+            levels: None,
+        }));
+
+        // "info" should now be filtered by the new level.
+        logger.log(LogInfo::new("info", "filtered after configure"));
+        logger.log(LogInfo::new("warn", "passes after configure"));
+        logger.flush().unwrap();
+
+        let logs = transport.get_logs();
+        assert_eq!(logs.len(), 2, "transport should still be live and received warn");
+        assert_eq!(logs[1].level, "warn");
     }
 
     #[test]

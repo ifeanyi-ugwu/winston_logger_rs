@@ -58,6 +58,14 @@ pub trait Transport: WritableSink<LogInfo> + Send + Sync + 'static {
 /// streaming source over the underlying store.
 pub trait DynQueryHandle: Send + Sync + 'static {
     fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>>;
+
+    /// Synchronous collect for in-memory transports. Returns all matching
+    /// entries directly, bypassing `ReadableStream` task/channel overhead.
+    /// Network and file transports leave this as `None`; the caller falls
+    /// back to the stream path via [`DynQueryHandle::query`].
+    fn query_sync(&self, _options: &LogQuery) -> Option<Vec<LogInfo>> {
+        None
+    }
 }
 
 /// Handle for out-of-band batch ingestion into a transport. Holds clonable

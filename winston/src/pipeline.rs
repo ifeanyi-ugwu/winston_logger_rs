@@ -328,25 +328,6 @@ impl LoggerState {
         }
     }
 
-    fn passes_level(&self, entry_level: &str, transport_level: Option<&String>) -> bool {
-        let levels = match &self.levels {
-            Some(l) => l,
-            None => return true,
-        };
-        let effective = transport_level.or(self.global_level.as_ref());
-        let effective = match effective {
-            Some(l) => l,
-            None => return true,
-        };
-        match (
-            levels.get_severity(entry_level),
-            levels.get_severity(effective),
-        ) {
-            (Some(entry_sev), Some(req_sev)) => entry_sev <= req_sev,
-            _ => false,
-        }
-    }
-
     /// Build a slot from a `LoggerTransport` and push it onto the list.
     /// Caller is responsible for triggering `drain_buffer_locked` after
     /// admit if this is the first slot (so pre-transport entries land).
@@ -387,14 +368,6 @@ impl LoggerState {
             stats,
             was_saturated: AtomicBool::new(false),
         }));
-    }
-
-    fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<LogInfo> {
-        match (&slot.transport_format, &self.global_format) {
-            (Some(tf), _) => tf.transform(entry.clone()),
-            (None, Some(gf)) => gf.transform(entry.clone()),
-            (None, None) => Some(entry.clone()),
-        }
     }
 
     /// Snapshot the slot list and global format/level/levels. Cheap (Arc
