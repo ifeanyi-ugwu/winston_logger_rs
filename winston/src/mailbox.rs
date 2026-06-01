@@ -112,7 +112,7 @@ impl<T> MailboxSender<T> {
 
     /// Synchronous push that parks the calling thread on a `Condvar` when
     /// the queue is full. Returns `Err(SendError(msg))` if the receiver
-    /// drops while we're waiting (no point completing the push).
+    /// drops while the push is waiting (no point completing it).
     ///
     /// Designed for the sync `logger.log()` caller path under
     /// `OverflowPolicy::Block`.
@@ -175,7 +175,7 @@ impl<'a, T: Unpin> Future for Send<'a, T> {
         drop(q);
         this.sender.inner.producer_waker.register(cx.waker());
         // Re-check to avoid a race with a consumer that popped between
-        // our length check and waker registration.
+        // the length check and waker registration.
         let mut q = this.sender.inner.queue.lock();
         if q.len() < this.sender.inner.capacity {
             q.push_back(this.msg.take().expect("polled after Ready"));

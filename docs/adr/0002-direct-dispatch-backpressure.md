@@ -60,7 +60,7 @@ and is well-known for its tuning headaches.
 
 ## Design principle
 
-The model we want is **water through pipes**: each transport is its own pipe;
+The model is **water through pipes**: each transport is its own pipe;
 each pipe has a fixed capacity; the slowest pipe sets the rate the producer
 can flow at; if you don't want a particular pipe to gate the producer, you
 put a "drop overflow" valve on *that* pipe. Configuring this should not be
@@ -141,12 +141,12 @@ queue (that would re-create the architectural lie this ADR rejects); they
 differ only in how the per-slot mailbox itself is implemented:
 
 - **`crossbeam::queue::ArrayQueue` + `Parker`/`Unparker`** — lock-free push, but
-  doesn't natively support `force_push_dropping_oldest` (we'd fake it with
-  try_push + try_pop + try_push, race-tolerant only because we're SPSC at the
-  producer side). More moving parts.
+  doesn't natively support `force_push_dropping_oldest` (would have to be
+  faked with try_push + try_pop + try_push, race-tolerant only because the
+  producer side is SPSC). More moving parts.
 - **`flume::bounded`** — gives sync `send` + async `recv` on the same channel,
-  no glue code needed. But adds a dep, and we'd still wrap drop-oldest
-  ourselves. Reasonable if the contention argument below ever bites.
+  no glue code needed. But adds a dep, and drop-oldest would still need a
+  thin wrapper. Reasonable if the contention argument below ever bites.
 - **Our custom mailbox** — already built, already correct shape, already
   supports `force_push_dropping_oldest` natively, zero deps.
 
@@ -177,7 +177,7 @@ existing public interface without touching the Logger.
 
 4. **One bounded buffer per transport, period.** No global front-end buffer.
    Memory is exactly `Σ(queue_capacity[i])` plus the WritableStream queue per
-   slot (also bounded by HWM, which we set to `queue_capacity`).
+   slot (also bounded by HWM, set to `queue_capacity`).
 
 5. **Flush is per-slot, joined.** `logger.flush()` sends a `SlotMessage::Flush`
    barrier through each slot's mailbox (sync `push_blocking` to guarantee
@@ -201,10 +201,10 @@ existing public interface without touching the Logger.
 
 - **Keep `BackpressureStrategy` as a vestigial knob.** Quiet API erosion is
   worse than a clean break. Users who configured it deserve to know that
-  what they configured doesn't fire, not to have us pretend forever.
+  what they configured doesn't fire, not for the library to pretend forever.
 
 - **Unbounded crossbeam queue between `log()` and dispatch.** Re-introduces
-  the exact lie we just identified: producer never blocks, buffer grows
+  the exact lie this ADR rejects: producer never blocks, buffer grows
   without bound, "Block" means nothing.
 
 - **Async `log()` API (`async fn log`).** Makes the sync-async impedance
@@ -222,8 +222,8 @@ existing public interface without touching the Logger.
   ever bites.
 
 - **`crossbeam::queue::ArrayQueue` per slot today.** Same reasoning as
-  `flume`. The lock-free push is nice but we'd still need to layer
-  drop-oldest and parking on top.
+  `flume`. The lock-free push is nice but drop-oldest and parking would
+  still need to be layered on top.
 
 - **Keep the fanout task; let it own the slot list.** The fanout task only
   existed to be the async-side counterpart of the bridge. With the bridge

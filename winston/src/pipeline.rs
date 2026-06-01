@@ -473,11 +473,14 @@ impl StateSnapshot {
     ///    in phase 1. This is the "water flows to every pipe; only the
     ///    blocked pipe ripples upstream" model from ADR 0002.
     ///
-    /// Multiple deferred Block slots wait serially within one `log()`
-    /// call (each `push_blocking` runs after the previous returns).
-    /// Spawning a future per Block slot for true parallel waiting is
-    /// cheap to add later if it matters; the common case is one Block
-    /// slot.
+    /// The worker visits deferred slots in order, but the per-slot
+    /// pumps run on independent tasks — by the time the worker parks
+    /// on slot B, slot B's pump has been draining concurrently with
+    /// A's pump the whole time. Total caller wait is `max(drain_times)`,
+    /// not `sum`. ADR 0003 walks the trace and records why the
+    /// `block_on(join_all(...))` "parallel waiting" alternative was
+    /// considered and rejected (adds executor cost without a
+    /// corresponding semantic improvement).
     pub(crate) fn dispatch_entry(&self, entry: &Arc<LogInfo>) {
         let mut deferred_blocks: Vec<(usize, SlotMessage)> =
             Vec::with_capacity(self.slots.len());

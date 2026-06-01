@@ -400,9 +400,9 @@ impl Logger {
             was_first
         };
 
-        // If we just admitted the first slot, drain any pre-transport
-        // buffer through it. Done outside the write lock so a slow Block
-        // sink doesn't stall the admin path.
+        // First-slot admit: drain any pre-transport buffer through it.
+        // Done outside the write lock so a slow Block sink doesn't stall
+        // the admin path.
         if was_first {
             let snapshot = self.state.read().snapshot();
             snapshot.drain_buffer_to_slots();
@@ -1319,7 +1319,7 @@ mod tests {
             .build();
         let _permit_guard = PermitGuard(a_permit_tx.clone());
 
-        // Fire log calls from a worker thread; we'll inspect B from main
+        // Fire log calls from a worker thread; B gets inspected from main
         // while A is saturated.
         let logger_for_producer = Arc::new(logger);
         let worker_logger = Arc::clone(&logger_for_producer);
@@ -1362,7 +1362,7 @@ mod tests {
         let transport = PermittedTransport { permits };
         let inspect = Arc::new(Mutex::new(Vec::<String>::new()));
 
-        // Wrap PermittedTransport so we can observe what the sink saw.
+        // Wrap PermittedTransport so the sink writes are observable.
         struct Wrapped {
             inner: PermittedTransport,
             seen: Arc<Mutex<Vec<String>>>,
@@ -1403,7 +1403,7 @@ mod tests {
             .transport_stats(lt_handle)
             .expect("stats present");
         // DropOldest counts every eviction as a drop; with cap=2 + 32
-        // entries, we expect many drops as the head is repeatedly evicted.
+        // entries, expect many drops as the head is repeatedly evicted.
         assert!(
             stats.dropped_total > 0,
             "expected DropOldest evictions; stats={:?}",
@@ -1420,7 +1420,7 @@ mod tests {
 
         let seen = inspect.lock().unwrap().clone();
         assert!(!seen.is_empty(), "sink saw nothing");
-        // The last entry the sink saw must be the latest one we logged —
+        // The last entry the sink saw must be the latest one logged —
         // DropOldest would never evict the newest.
         assert_eq!(seen.last().unwrap(), "msg-31");
     }

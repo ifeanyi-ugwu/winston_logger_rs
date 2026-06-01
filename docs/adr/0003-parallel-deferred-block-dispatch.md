@@ -30,9 +30,9 @@ The proposal below (add `block_on(join_all(...))` to phase 2 for N > 1)
 would have added executor cost on the saturated path with zero
 performance benefit. We are keeping the existing serial loop.
 
-This ADR stays in the tree as the record of why we considered the
-optimization and why it doesn't apply, so the same intuition doesn't
-get re-raised in six months.
+This ADR stays in the tree as the record of why the optimization was
+considered and why it doesn't apply, so the same intuition doesn't get
+re-raised in six months.
 
 ## Context (the originally assumed gap)
 
@@ -86,7 +86,7 @@ with no allocation — strictly cheaper than spinning up `block_on(join_all
 `Parker` (Condvar + Mutex underneath) plus a poll loop. For N awaiting
 futures it adds: one `Vec` allocation for the pinned futures, N polls per
 wake, one Parker park. **Microseconds.** The Condvar wait inside it is
-exactly the wait we'd be doing anyway; the dispatch primitive's overhead
+exactly the wait the caller would be doing anyway; the dispatch primitive's overhead
 is rounding error against the sink-drain time it's waiting for.
 
 This is what makes it the right tool here: the *added* cost of the parallel
@@ -111,8 +111,8 @@ inside an unavoidable sink wait.
 4. **No async runtime is introduced.** `futures::executor::block_on` is
    not tokio/async-std; it is std-only primitives in a poll loop. No
    threadpool, no work-stealing, no executor pinning. The mailbox `send`
-   future is a small `Future` over the existing `MailboxSender` we
-   already have.
+   future is a small `Future` over the existing `MailboxSender` that
+   already ships in `mailbox.rs`.
 
 5. **Drop policies are the architectural opt-out.** Phase 2 only ever runs
    for `Block`-policy slots. The way to keep a transport off the wait
@@ -158,7 +158,7 @@ inside an unavoidable sink wait.
   parker-bound wait. The Parker is the floor; everything else is window
   dressing.
 
-## What we would have got — and why we didn't take it
+## What the proposal would have got — and why it was not taken
 
 If the framing had been correct, the proposal would have given:
 
@@ -168,11 +168,10 @@ If the framing had been correct, the proposal would have given:
   because the pumps run in parallel regardless of phase 2 ordering, so
   there is no improvement to be had.
 - **No fast-path regression.** Logs that don't trigger phase 2 still
-  pay nothing — but since we're not changing phase 2, this point is
-  moot.
+  pay nothing — but phase 2 is not changing, so this point is moot.
 - **No new dependency, no new threads.** Same — moot for a non-change.
 
-What we would have *paid* for nothing in return:
+What the proposal would have *paid* for nothing in return:
 
 - One `Vec` allocation + N future pinnings per `log()` call that hits
   phase 2 with N > 1 — microseconds, but non-zero, on the saturated path
