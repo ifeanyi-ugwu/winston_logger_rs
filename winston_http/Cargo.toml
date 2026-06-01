@@ -1,6 +1,6 @@
 [package]
 name = "winston_http"
-version = "0.4.0"
+version = "0.4.1-dev"
 edition = "2021"
 description = "winston-http for rust"
 license = "MIT"

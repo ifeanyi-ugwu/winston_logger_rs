@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "logmark"
-version = "0.1.0"
+version = "0.1.1-dev"
 dependencies = [
  "chrono",
  "env_logger",
@@ -3481,7 +3481,7 @@ dependencies = [
 
 [[package]]
 name = "winston_http"
-version = "0.4.0"
+version = "0.4.1-dev"
 dependencies = [
  "logform",
  "reqwest",
