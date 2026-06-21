@@ -49,7 +49,7 @@ mod tests {
                 "{} - {}: {}",
                 info.level,
                 info.message,
-                serde_json::to_string(&info.meta).unwrap_or_default()
+                serde_json::Value::Object(info.meta.to_json_object())
             )
         });
 

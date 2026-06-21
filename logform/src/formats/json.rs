@@ -14,7 +14,7 @@ impl Format for JsonFormat {
         log_object.insert("message".to_string(), Value::String(info.message.clone()));
 
         for (key, value) in &info.meta {
-            log_object.insert(key.clone(), value.clone());
+            log_object.insert(key.to_string(), value.clone());
         }
 
         let json_message = Value::Object(log_object).to_string();

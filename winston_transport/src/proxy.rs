@@ -126,7 +126,7 @@ pub fn content_id(info: &LogInfo) -> String {
     obj.insert("level".to_string(), Value::String(info.level.clone()));
     obj.insert("message".to_string(), Value::String(info.message.clone()));
     for (k, v) in &info.meta {
-        obj.insert(k.clone(), v.clone());
+        obj.insert(k.to_string(), v.clone());
     }
     let canonical = canonicalize(&Value::Object(obj));
     // `serde_json::to_string` on a value we built in sorted order preserves

@@ -30,7 +30,7 @@ impl PrettyPrinter {
         json_output.insert("message".to_string(), Value::String(info.message.clone()));
 
         for (key, value) in &info.meta {
-            json_output.insert(key.clone(), value.clone());
+            json_output.insert(key.to_string(), value.clone());
         }
 
         let json_value = Value::Object(json_output);

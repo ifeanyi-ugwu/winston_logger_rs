@@ -644,31 +644,30 @@ impl Log for Logger {
             return;
         }
 
-        let mut meta = std::collections::HashMap::new();
+        // Static keys stay borrowed (zero key allocation); the four common
+        // fields fit inline in `Meta` without a heap spill.
+        let mut meta = logform::Meta::with_capacity(4);
         meta.insert(
-            "timestamp".to_string(),
+            "timestamp",
             serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
         );
         meta.insert(
-            "target".to_string(),
+            "target",
             serde_json::Value::String(record.target().to_string()),
         );
         if let Some(file) = record.file() {
-            meta.insert(
-                "file".to_string(),
-                serde_json::Value::String(file.to_string()),
-            );
+            meta.insert("file", serde_json::Value::String(file.to_string()));
         }
         if let Some(line) = record.line() {
             meta.insert(
-                "line".to_string(),
+                "line",
                 serde_json::Value::Number(serde_json::Number::from(line)),
             );
         }
         if let Some(module_path) = record.module_path() {
             if module_path != record.target() {
                 meta.insert(
-                    "module_path".to_string(),
+                    "module_path",
                     serde_json::Value::String(module_path.to_string()),
                 );
             }

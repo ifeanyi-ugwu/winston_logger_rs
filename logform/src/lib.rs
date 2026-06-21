@@ -1,6 +1,7 @@
 pub mod config;
 mod formats;
 mod log_info;
+mod meta;
 mod utils;
 
 pub use formats::{
@@ -10,3 +11,4 @@ pub use formats::{
     uncolorize::uncolorize, Format,
 };
 pub use log_info::LogInfo;
+pub use meta::{Meta, MetaKey};

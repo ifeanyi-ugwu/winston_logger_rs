@@ -16,6 +16,7 @@ colored = "2.1.0"
 regex = "1.10.6"
 serde = { version = "1.0.217", features = ["derive"], optional = true }
 serde_json = "1.0.125"
+smallvec = "1.13"
 
 [features]
 serde = ["dep:serde"]

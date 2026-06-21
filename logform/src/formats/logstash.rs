@@ -44,7 +44,7 @@ impl Format for LogstashFormat {
         fields.insert("level".to_string(), json!(info.level.clone()));
 
         for (key, value) in info.meta.iter() {
-            fields.insert(key.clone(), value.clone());
+            fields.insert(key.to_string(), value.clone());
         }
 
         logstash_object["@fields"] = json!(fields);

@@ -556,7 +556,7 @@ fn project_fields(entry: LogInfo, fields: &[String]) -> LogInfo {
             .meta
             .into_iter()
             .filter(|(k, _)| normalized.iter().any(|f| f == &k.to_lowercase()))
-            .collect(),
+            .collect::<logform::Meta>(),
     )
 }
 

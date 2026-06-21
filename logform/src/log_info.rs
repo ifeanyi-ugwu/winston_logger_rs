@@ -1,8 +1,9 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::meta::{Meta, MetaKey};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, str::FromStr};
+use std::{fmt, str::FromStr};
 
 #[cfg(feature = "serde")]
 use std::io::Result as IoResult;
@@ -13,7 +14,7 @@ use std::io::Result as IoResult;
 pub struct LogInfo {
     pub level: String,
     pub message: String,
-    pub meta: HashMap<String, Value>,
+    pub meta: Meta,
     /// The terminal output string produced by a finalizer format.
     /// Transports read this field (via Display) instead of `message`.
     /// Set only by finalizers; transforms never touch it.
@@ -26,12 +27,12 @@ impl LogInfo {
         Self {
             level: level.into(),
             message: message.into(),
-            meta: HashMap::new(),
+            meta: Meta::new(),
             formatted: None,
         }
     }
 
-    pub fn from_parts<L, M>(level: L, message: M, meta: HashMap<String, Value>) -> Self
+    pub fn from_parts<L, M>(level: L, message: M, meta: impl Into<Meta>) -> Self
     where
         L: Into<String>,
         M: Into<String>,
@@ -39,22 +40,22 @@ impl LogInfo {
         Self {
             level: level.into(),
             message: message.into(),
-            meta,
+            meta: meta.into(),
             formatted: None,
         }
     }
 
     pub fn with_meta<K, V>(mut self, key: K, value: V) -> Self
     where
-        K: Into<String>,
+        K: Into<MetaKey>,
         V: Into<Value>,
     {
-        self.meta.insert(key.into(), value.into());
+        self.meta.insert(key, value.into());
         self
     }
 
-    pub fn without_meta<K: Into<String>>(mut self, key: K) -> Self {
-        self.meta.remove(&key.into());
+    pub fn without_meta<K: AsRef<str>>(mut self, key: K) -> Self {
+        self.meta.remove(key.as_ref());
         self
     }
 
@@ -87,7 +88,7 @@ impl LogInfo {
                 .ok_or("Missing or invalid 'message' field")?
                 .to_string();
 
-            let mut meta = HashMap::new();
+            let mut meta = Meta::new();
             if let Some(meta_value) = map.get("meta") {
                 if let Value::Object(meta_map) = meta_value.clone() {
                     for (key, value) in meta_map {
@@ -108,11 +109,11 @@ impl LogInfo {
     }
 
     pub fn to_value(&self) -> Value {
-        serde_json::json!({
-            "level": self.level,
-            "message": self.message,
-            "meta": self.meta,
-        })
+        let mut obj = serde_json::Map::new();
+        obj.insert("level".to_string(), Value::String(self.level.clone()));
+        obj.insert("message".to_string(), Value::String(self.message.clone()));
+        obj.insert("meta".to_string(), Value::Object(self.meta.to_json_object()));
+        Value::Object(obj)
     }
 
     /// Returns a flattened JSON representation where metadata fields are at the root level.
@@ -125,7 +126,7 @@ impl LogInfo {
 
         // Merge all metadata fields at root level
         for (key, value) in &self.meta {
-            flat.insert(key.clone(), value.clone());
+            flat.insert(key.to_string(), value.clone());
         }
 
         Value::Object(flat)
@@ -163,7 +164,7 @@ impl fmt::Display for LogInfo {
                 "{} {} {}",
                 self.level,
                 self.message,
-                serde_json::to_string(&self.meta).unwrap_or_default()
+                Value::Object(self.meta.to_json_object())
             )
         }
     }
@@ -197,7 +198,7 @@ impl FromStr for LogInfo {
             let meta_str = &rest[meta_start..];
 
             // Parse metadata (simple key: value parsing)
-            let mut meta = HashMap::new();
+            let mut meta = Meta::new();
             if let Some(meta_end) = meta_str.rfind('}') {
                 let meta_content = &meta_str[1..meta_end];
                 for pair in meta_content.split(',') {
@@ -226,7 +227,7 @@ impl FromStr for LogInfo {
             Ok(LogInfo {
                 level,
                 message: rest.to_string(),
-                meta: HashMap::new(),
+                meta: Meta::new(),
                 formatted: None,
             })
         }

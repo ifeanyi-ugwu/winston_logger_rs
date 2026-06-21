@@ -23,7 +23,7 @@ impl Format for SimpleFormat {
         rest.remove("padding");
 
         if !rest.is_empty() {
-            let rest_string = serde_json::to_string(&rest).unwrap_or_default();
+            let rest_string = serde_json::Value::Object(rest.to_json_object()).to_string();
             message.push_str(&format!(" {}", rest_string));
         }
 

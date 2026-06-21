@@ -45,6 +45,13 @@ struct LogDocument {
     meta: HashMap<String, serde_json::Value>,
 }
 
+/// Materialize `Meta` into the owned `String`-keyed map the BSON document
+/// flattens. Keys are owned here because the persisted document holds owned
+/// strings.
+fn meta_to_doc_map(meta: logform::Meta) -> HashMap<String, serde_json::Value> {
+    meta.into_iter().map(|(k, v)| (k.into_owned(), v)).collect()
+}
+
 /// Like [`LogDocument`] but with an explicit string `_id` — used by the
 /// idempotent ingest path, where `_id` is the entry's `content_id`. Inserting
 /// the same logical entry twice then collides on `_id` and is a no-op.
@@ -140,7 +147,7 @@ impl WritableSink<LogInfo> for MongoDBTransport {
             timestamp: Utc::now(),
             level: info.level,
             message: info.message,
-            meta: info.meta,
+            meta: meta_to_doc_map(info.meta),
         };
         collection
             .insert_one(doc)
@@ -223,7 +230,7 @@ impl DynIngestHandle for MongoDBIngestHandle {
                         timestamp: Utc::now(),
                         level: info.level,
                         message: info.message,
-                        meta: info.meta,
+                        meta: meta_to_doc_map(info.meta),
                     })
                     .collect();
                 match collection
@@ -254,7 +261,7 @@ impl DynIngestHandle for MongoDBIngestHandle {
                         timestamp: Utc::now(),
                         level: info.level,
                         message: info.message,
-                        meta: info.meta,
+                        meta: meta_to_doc_map(info.meta),
                     })
                     .collect();
                 collection
@@ -593,7 +600,7 @@ fn apply_field_projection(log_info: &mut LogInfo, fields: &[String]) {
     if !normalized.contains(&"message".to_string()) {
         log_info.message.clear();
     }
-    log_info.meta.retain(|k, _| normalized.contains(k));
+    log_info.meta.retain(|k, _| normalized.iter().any(|f| f.as_str() == k));
 }
 
 fn document_to_loginfo(doc: LogDocument) -> LogInfo {

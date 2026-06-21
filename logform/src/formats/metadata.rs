@@ -63,7 +63,7 @@ impl Format for MetadataFormat {
                 .meta
                 .keys()
                 .filter(|key| !self.fill_except.contains(*key))
-                .cloned()
+                .map(|key| key.to_string())
                 .collect();
             for key in keys_to_move {
                 if let Some(value) = info.meta.remove(&key) {
