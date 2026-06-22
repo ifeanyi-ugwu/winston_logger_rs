@@ -12,7 +12,7 @@ use std::time::Instant;
 use std::{env, fs, thread};
 use tabled::{builder::Builder, settings::Style};
 use tracing::{event, Level};
-use winston::format::Format as _;
+use winston::format::FinalizeExt as _;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -485,7 +485,7 @@ fn bench_tracing_async(target: OutputTarget) -> BenchmarkResult {
 fn bench_winston(target: OutputTarget) -> BenchmarkResult {
     let builder = winston::Logger::builder()
         .format(
-            winston::format::timestamp().chain(winston::format::printf(|info| {
+            winston::format::timestamp().finalize(winston::format::printf(|info| {
                 format!(
                     r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
                     info.meta
@@ -725,7 +725,7 @@ fn bench_tracing_async_concurrent(target: OutputTarget) -> (f64, u64) {
 fn bench_winston_concurrent(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
         .format(
-            winston::format::timestamp().chain(winston::format::printf(|info| {
+            winston::format::timestamp().finalize(winston::format::printf(|info| {
                 format!(
                     r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
                     info.meta
@@ -838,7 +838,7 @@ fn bench_tracing_async_saturate(target: OutputTarget) -> (f64, u64) {
 fn bench_winston_saturate(target: OutputTarget) -> (f64, u64) {
     let builder = winston::Logger::builder()
         .format(
-            winston::format::timestamp().chain(winston::format::printf(|info| {
+            winston::format::timestamp().finalize(winston::format::printf(|info| {
                 format!(
                     r#"{{"timestamp":"{}","level":"{}","target":"logmark","message":"{}"}}"#,
                     info.meta

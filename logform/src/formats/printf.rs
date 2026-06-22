@@ -1,7 +1,5 @@
-use crate::LogInfo;
+use crate::{Finalizer, LogInfo};
 use std::sync::Arc;
-
-use super::Format;
 
 #[derive(Clone)]
 pub struct Printf {
@@ -19,15 +17,9 @@ impl Printf {
     }
 }
 
-impl Format for Printf {
-    type Input = LogInfo;
-
-    fn transform(&self, info: LogInfo) -> Option<Self::Input> {
-        let output = (self.template)(&info);
-        Some(LogInfo {
-            formatted: Some(output),
-            ..info
-        })
+impl Finalizer for Printf {
+    fn finalize(&self, info: &LogInfo) -> Option<String> {
+        Some((self.template)(info))
     }
 }
 
@@ -55,9 +47,9 @@ mod tests {
 
         let info = LogInfo::new("info", "This is a message").with_meta("key", "value");
 
-        let result = formatter.transform(info).unwrap();
+        let result = formatter.finalize(&info).unwrap();
 
         let expected = "info - This is a message: {\"key\":\"value\"}".to_string();
-        assert_eq!(result.formatted.as_deref().unwrap(), expected);
+        assert_eq!(result, expected);
     }
 }

@@ -3,6 +3,7 @@
 mod common;
 
 use common::MockTransport;
+use logform::FinalizeExt;
 use serial_test::serial;
 use winston::Logger;
 
@@ -14,7 +15,7 @@ fn test_log_backend_basic_integration() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough())
+            .format(logform::passthrough().into_pipeline())
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register with log crate");
@@ -22,7 +23,7 @@ fn test_log_backend_basic_integration() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough()),
+                .format(logform::passthrough().into_pipeline()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -48,7 +49,7 @@ fn test_log_backend_level_filtering() {
         let logger = Logger::builder()
             .level("warn")
             .transport(transport.clone())
-            .format(logform::passthrough())
+            .format(logform::passthrough().into_pipeline())
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -56,7 +57,7 @@ fn test_log_backend_level_filtering() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("warn")
-                .format(logform::passthrough()),
+                .format(logform::passthrough().into_pipeline()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -83,7 +84,7 @@ fn test_log_backend_metadata_capture() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough()) // Use passthrough to preserve metadata
+            .format(logform::passthrough().into_pipeline()) // Use passthrough to preserve metadata
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -91,7 +92,7 @@ fn test_log_backend_metadata_capture() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough()), // Use passthrough to preserve metadata
+                .format(logform::passthrough().into_pipeline()), // Use passthrough to preserve metadata
         ));
         winston::add_transport(transport.clone());
     }
@@ -145,7 +146,7 @@ fn test_log_backend_enabled_check() {
         let logger = Logger::builder()
             .level("error")
             .transport(transport.clone())
-            .format(logform::passthrough())
+            .format(logform::passthrough().into_pipeline())
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -153,7 +154,7 @@ fn test_log_backend_enabled_check() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("error")
-                .format(logform::passthrough()),
+                .format(logform::passthrough().into_pipeline()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -181,7 +182,7 @@ fn test_log_backend_concurrent_logging() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough())
+            .format(logform::passthrough().into_pipeline())
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -189,7 +190,7 @@ fn test_log_backend_concurrent_logging() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough()),
+                .format(logform::passthrough().into_pipeline()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -221,7 +222,7 @@ fn test_log_backend_mixed_with_winston() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough())
+            .format(logform::passthrough().into_pipeline())
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -229,7 +230,7 @@ fn test_log_backend_mixed_with_winston() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough()),
+                .format(logform::passthrough().into_pipeline()),
         ));
         winston::add_transport(transport.clone());
     }
@@ -252,7 +253,7 @@ fn test_log_backend_with_key_values() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough()) // Use passthrough to preserve metadata
+            .format(logform::passthrough().into_pipeline()) // Use passthrough to preserve metadata
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -260,7 +261,7 @@ fn test_log_backend_with_key_values() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough()), // Use passthrough to preserve metadata
+                .format(logform::passthrough().into_pipeline()), // Use passthrough to preserve metadata
         ));
         winston::add_transport(transport.clone());
     }
@@ -284,7 +285,7 @@ fn test_log_backend_flush() {
     if !winston::is_initialized() {
         let logger = Logger::builder()
             .transport(transport.clone())
-            .format(logform::passthrough())
+            .format(logform::passthrough().into_pipeline())
             .build();
         winston::init(logger);
         winston::register_with_log().expect("Failed to register");
@@ -292,7 +293,7 @@ fn test_log_backend_flush() {
         winston::configure(Some(
             winston::LoggerOptions::new()
                 .level("info")
-                .format(logform::passthrough()),
+                .format(logform::passthrough().into_pipeline()),
         ));
         winston::add_transport(transport.clone());
     }

@@ -215,9 +215,9 @@ impl DirectLayerBuilder {
     /// reaching transports. A format that returns `None` silently drops the entry.
     pub fn format<F>(mut self, format: F) -> Self
     where
-        F: Format<Input = LogInfo> + Send + Sync + 'static,
+        F: logform::IntoFormatPipeline,
     {
-        self.format = Some(Arc::new(format));
+        self.format = Some(Arc::new(format.into_format_pipeline()));
         self
     }
 
@@ -594,6 +594,7 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logform::FinalizeExt;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::prelude::*;
     use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
@@ -682,7 +683,7 @@ mod tests {
         let _guard = tracing_subscriber::registry()
             .with(
                 DirectLayer::builder(default_spawner())
-                    .format(DropAll)
+                    .format(DropAll.into_pipeline())
                     .transport(transport)
                     .build(),
             )
@@ -710,7 +711,7 @@ mod tests {
         let _guard = tracing_subscriber::registry()
             .with(
                 DirectLayer::builder(default_spawner())
-                    .format(AddField)
+                    .format(AddField.into_pipeline())
                     .transport(transport)
                     .build(),
             )
@@ -776,7 +777,7 @@ mod tests {
         let logger = Arc::new(
             Logger::builder()
                 .level("trace")
-                .format(logform::passthrough())
+                .format(logform::passthrough().into_pipeline())
                 .transport(transport)
                 .build(),
         );

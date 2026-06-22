@@ -1,12 +1,9 @@
-use super::Format;
-use crate::LogInfo;
+use crate::{Finalizer, LogInfo};
 
 pub struct SimpleFormat;
 
-impl Format for SimpleFormat {
-    type Input = LogInfo;
-
-    fn transform(&self, info: LogInfo) -> Option<Self::Input> {
+impl Finalizer for SimpleFormat {
+    fn finalize(&self, info: &LogInfo) -> Option<String> {
         let padding = info
             .meta
             .get("padding")
@@ -27,10 +24,7 @@ impl Format for SimpleFormat {
             message.push_str(&format!(" {}", rest_string));
         }
 
-        Some(LogInfo {
-            formatted: Some(message),
-            ..info
-        })
+        Some(message)
     }
 }
 
@@ -48,23 +42,14 @@ mod tests {
             .with_meta("user_id", Value::Number(12345.into()))
             .with_meta("session_id", Value::String("abcde12345".to_string()));
 
-        let result = simple_formatter.transform(info).unwrap();
+        let result = simple_formatter.finalize(&info).unwrap();
 
         // Should start with 'info: User logged in '
         let expected_prefix = "info: User logged in ";
-        assert!(result
-            .formatted
-            .as_deref()
-            .unwrap()
-            .starts_with(expected_prefix));
+        assert!(result.starts_with(expected_prefix));
 
         // Extract and parse the JSON part
-        let json_part = result
-            .formatted
-            .as_deref()
-            .unwrap()
-            .strip_prefix(expected_prefix)
-            .unwrap();
+        let json_part = result.strip_prefix(expected_prefix).unwrap();
         let actual_json: Value = serde_json::from_str(json_part).unwrap();
 
         let expected_json = json!({
@@ -80,11 +65,11 @@ mod tests {
 
         let info = LogInfo::new("info", "User logged in");
 
-        let result = simple_formatter.transform(info).unwrap();
+        let result = simple_formatter.finalize(&info).unwrap();
 
         // Should match exactly since no metadata remains
         let expected_message = "info: User logged in";
-        assert_eq!(result.formatted.as_deref().unwrap(), expected_message);
+        assert_eq!(result, expected_message);
     }
     use super::*;
     use serde_json::{json, Value};
@@ -98,23 +83,14 @@ mod tests {
             .with_meta("session_id", Value::String("abcde12345".to_string()))
             .with_meta("padding", json!({"info": "    "}));
 
-        let result = simple_formatter.transform(info).unwrap();
+        let result = simple_formatter.finalize(&info).unwrap();
 
         // Split the expected message and metadata for separate assertions
         let expected_prefix = "info:     User logged in ";
-        assert!(result
-            .formatted
-            .as_deref()
-            .unwrap()
-            .starts_with(expected_prefix));
+        assert!(result.starts_with(expected_prefix));
 
         // Extract and parse the JSON part
-        let json_part = result
-            .formatted
-            .as_deref()
-            .unwrap()
-            .strip_prefix(expected_prefix)
-            .unwrap();
+        let json_part = result.strip_prefix(expected_prefix).unwrap();
         let actual_json: Value = serde_json::from_str(json_part).unwrap();
 
         // Expected JSON object

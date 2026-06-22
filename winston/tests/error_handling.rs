@@ -1,7 +1,7 @@
 mod common;
 
 use common::{MockConfig, MockTransport};
-use logform::LogInfo;
+use logform::{FinalizeExt, LogInfo};
 use winston::Logger;
 
 #[test]
@@ -47,7 +47,7 @@ fn test_transport_flush_failure() {
 
 #[test]
 fn test_logging_without_transports_then_adding() {
-    let logger = Logger::builder().format(logform::passthrough()).build();
+    let logger = Logger::builder().format(logform::passthrough().into_pipeline()).build();
 
     // Log without transports - should buffer
     logger.log(LogInfo::new("info", "Buffered message 1"));

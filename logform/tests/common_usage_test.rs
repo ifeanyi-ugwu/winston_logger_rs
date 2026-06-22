@@ -1,4 +1,4 @@
-use logform::{chain, colorize, json, printf, simple, timestamp, Format, LogInfo};
+use logform::{colorize, json, printf, simple, timestamp, FinalizeExt, Finalizer, Format, LogInfo};
 
 #[test]
 pub fn initialize_and_test_formats() {
@@ -9,10 +9,9 @@ pub fn initialize_and_test_formats() {
         ("error".to_string(), serde_json::json!(["red", "bold"])),
     ]);
 
-    let format = chain!(
-        timestamp(),
-        colorize().with_colors(colors).with_all(true),
-        printf(|info| {
+    let format = timestamp()
+        .chain(colorize().with_colors(colors).with_all(true))
+        .finalize(printf(|info| {
             let timestamp = info
                 .meta
                 .get("timestamp")
@@ -20,33 +19,27 @@ pub fn initialize_and_test_formats() {
                 .unwrap_or("");
 
             format!("{} - {}: {}", timestamp, info.level, info.message)
-        }),
-    );
+        }));
 
     let log_info = format
         .transform(log_info)
         .expect("Format chain transform failed");
-    println!("{}", log_info.message);
+    println!("{}", log_info.formatted.as_deref().unwrap_or(""));
 }
 
 #[test]
 fn test_json() {
     let log_info = LogInfo::new("info", "This is a test message");
 
-    // Apply the simple format
-    let simple_format = simple();
-    let log_info = simple_format
-        .transform(log_info)
-        .expect("Simple format transform failed");
-    println!("Simple format: {}", log_info.message);
+    let rendered = simple()
+        .finalize(&log_info)
+        .expect("Simple format finalize failed");
+    println!("Simple format: {}", rendered);
 
-    // Reset log_info for JSON format
     let log_info = LogInfo::new("info", "This is a test message");
 
-    // Apply the JSON format
-    let json_format = json();
-    let log_info = json_format
-        .transform(log_info)
-        .expect("JSON format transform failed");
-    println!("JSON format: {}", log_info.message);
+    let rendered = json()
+        .finalize(&log_info)
+        .expect("JSON format finalize failed");
+    println!("JSON format: {}", rendered);
 }

@@ -4,7 +4,7 @@ use crate::{
     pipeline::{self, SpawnFn},
     Logger,
 };
-use logform::{Format, LogInfo};
+use logform::IntoFormatPipeline;
 use std::collections::HashMap;
 
 pub struct LoggerBuilder {
@@ -38,7 +38,7 @@ impl LoggerBuilder {
 
     pub fn format<F>(mut self, format: F) -> Self
     where
-        F: Format<Input = LogInfo> + Send + Sync + 'static,
+        F: IntoFormatPipeline,
     {
         self.options = self.options.format(format);
         self

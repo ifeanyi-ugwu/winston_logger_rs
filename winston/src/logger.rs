@@ -44,7 +44,7 @@ impl<'a> TransportBuilder<'a> {
 
     pub fn with_format<F>(mut self, format: F) -> Self
     where
-        F: logform::Format<Input = LogInfo> + Send + Sync + 'static,
+        F: logform::IntoFormatPipeline,
     {
         self.logger_transport = self.logger_transport.with_format(format);
         self
@@ -734,6 +734,7 @@ impl<'kvs> log::kv::Visitor<'kvs> for KeyValueCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logform::FinalizeExt;
     use crate::logger_options::LoggerOptions;
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
@@ -948,7 +949,7 @@ mod tests {
         let logger = Logger::new(Some(
             LoggerOptions::new()
                 .level("trace")
-                .format(logform::passthrough()),
+                .format(logform::passthrough().into_pipeline()),
         ));
 
         let transport = TestTransport::new();
@@ -1084,7 +1085,7 @@ mod tests {
 
     #[test]
     fn test_buffer_processed_when_transport_added() {
-        let logger = Logger::builder().format(logform::passthrough()).build();
+        let logger = Logger::builder().format(logform::passthrough().into_pipeline()).build();
 
         logger.log(LogInfo::new("info", "Buffered"));
         logger.flush().unwrap();
@@ -1168,7 +1169,7 @@ mod tests {
 
         let configured = LoggerTransport::new(transport.clone())
             .with_level("error".to_owned())
-            .with_format(logform::passthrough());
+            .with_format(logform::passthrough().into_pipeline());
 
         let logger = Logger::builder().transport(configured).build();
 
@@ -1333,7 +1334,7 @@ mod tests {
         let worker_logger = Arc::clone(&logger_for_producer);
         let producer = std::thread::spawn(move || {
             for i in 0..256 {
-                worker_logger.log(LogInfo::new("info", format!("msg {}", i)));
+                worker_logger.as_ref().log(LogInfo::new("info", format!("msg {}", i)));
             }
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1409,7 +1410,7 @@ mod tests {
         let worker_logger = Arc::clone(&logger_for_producer);
         let producer = std::thread::spawn(move || {
             for i in 0..8 {
-                worker_logger.log(LogInfo::new("info", format!("msg-{}", i)));
+                worker_logger.as_ref().log(LogInfo::new("info", format!("msg-{}", i)));
             }
         });
 

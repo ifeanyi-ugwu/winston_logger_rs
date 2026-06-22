@@ -1,6 +1,7 @@
 mod common;
 
 use common::MockTransport;
+use logform::FinalizeExt;
 use serial_test::serial;
 use winston::{log, meta, Logger};
 
@@ -22,7 +23,7 @@ fn test_log_macro_with_logger_simple_message() {
 fn test_log_macro_with_logger_and_metadata() {
     let transport = MockTransport::new();
     let logger = Logger::builder()
-        .format(logform::passthrough())
+        .format(logform::passthrough().into_pipeline())
         .transport(transport.clone())
         .build();
 
@@ -40,7 +41,7 @@ fn test_log_macro_with_logger_and_metadata() {
 fn test_log_macro_with_logger_and_meta_macro() {
     let transport = MockTransport::new();
     let logger = Logger::builder()
-        .format(logform::passthrough())
+        .format(logform::passthrough().into_pipeline())
         .transport(transport.clone())
         .build();
 
@@ -134,7 +135,7 @@ fn test_log_macro_with_trailing_comma() {
 fn test_log_macro_with_complex_metadata_values() {
     let transport = MockTransport::new();
     let logger = Logger::builder()
-        .format(logform::passthrough())
+        .format(logform::passthrough().into_pipeline())
         .transport(transport.clone())
         .build();
 
@@ -176,11 +177,11 @@ fn test_log_macro_with_global_and_metadata() {
     let transport = MockTransport::new();
 
     if !winston::is_initialized() {
-        winston::init(Logger::builder().format(logform::passthrough()).build());
+        winston::init(Logger::builder().format(logform::passthrough().into_pipeline()).build());
     } else {
         // Reconfigure to ensure passthrough format is present
         winston::configure(Some(
-            winston::LoggerOptions::new().format(logform::passthrough()),
+            winston::LoggerOptions::new().format(logform::passthrough().into_pipeline()),
         ));
     }
     winston::add_transport(transport.clone());
@@ -202,11 +203,11 @@ fn test_log_macro_with_global_and_meta_macro() {
     let transport = MockTransport::new();
 
     if !winston::is_initialized() {
-        winston::init(Logger::builder().format(logform::passthrough()).build());
+        winston::init(Logger::builder().format(logform::passthrough().into_pipeline()).build());
     } else {
         // Reconfigure to ensure passthrough format is present
         winston::configure(Some(
-            winston::LoggerOptions::new().format(logform::passthrough()),
+            winston::LoggerOptions::new().format(logform::passthrough().into_pipeline()),
         ));
     }
     winston::add_transport(transport.clone());

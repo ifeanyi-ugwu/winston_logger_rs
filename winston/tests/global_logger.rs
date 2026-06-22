@@ -1,7 +1,7 @@
 mod common;
 
 use common::MockTransport;
-use logform::LogInfo;
+use logform::{FinalizeExt, LogInfo};
 use serial_test::serial;
 use winston::Logger;
 
@@ -135,11 +135,11 @@ fn test_global_flush() {
 #[serial]
 fn test_global_query() {
     if !winston::is_initialized() {
-        winston::init(Logger::builder().format(logform::timestamp()).build());
+        winston::init(Logger::builder().format(logform::timestamp().into_pipeline()).build());
     } else {
         // Reconfigure to ensure timestamp format is present
         winston::configure(Some(
-            winston::LoggerOptions::new().format(logform::timestamp()),
+            winston::LoggerOptions::new().format(logform::timestamp().into_pipeline()),
         ));
     }
 

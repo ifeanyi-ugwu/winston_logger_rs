@@ -1,7 +1,5 @@
-use crate::{utils::format_json::format_json, LogInfo};
+use crate::{utils::format_json::format_json, Finalizer, LogInfo};
 use serde_json::{Map, Value};
-
-use super::Format;
 
 #[derive(Clone)]
 pub struct PrettyPrinter {
@@ -24,7 +22,7 @@ impl PrettyPrinter {
         self
     }
 
-    fn format_log(&self, info: LogInfo) -> LogInfo {
+    fn render(&self, info: &LogInfo) -> String {
         let mut json_output = Map::new();
         json_output.insert("level".to_string(), Value::String(info.level.clone()));
         json_output.insert("message".to_string(), Value::String(info.message.clone()));
@@ -34,20 +32,13 @@ impl PrettyPrinter {
         }
 
         let json_value = Value::Object(json_output);
-        let pretty_message = format_json(&json_value, self.colorize);
-
-        LogInfo {
-            formatted: Some(pretty_message),
-            ..info
-        }
+        format_json(&json_value, self.colorize)
     }
 }
 
-impl Format for PrettyPrinter {
-    type Input = LogInfo;
-
-    fn transform(&self, info: LogInfo) -> Option<Self::Input> {
-        Some(self.format_log(info))
+impl Finalizer for PrettyPrinter {
+    fn finalize(&self, info: &LogInfo) -> Option<String> {
+        Some(self.render(info))
     }
 }
 
@@ -84,10 +75,10 @@ mod tests {
             .with_meta("empty object", json!({}))
             .with_meta("empty array", json!([]));
 
-        let result = formatter.transform(info).unwrap();
+        let result = formatter.finalize(&info).unwrap();
 
         // Check for overall structure
-        let message = result.formatted.as_deref().unwrap();
+        let message = result.as_str();
 
         // Check for proper JSON-like structure
         assert!(message.starts_with("{"), "Message should start with '{{'");
@@ -163,8 +154,8 @@ mod tests {
             .with_meta("bool_value", true)
             .with_meta("null_value", Value::Null);
 
-        let result = formatter.transform(info).unwrap();
-        let message = result.formatted.as_deref().unwrap();
+        let result = formatter.finalize(&info).unwrap();
+        let message = result.as_str();
 
         let re_info = Regex::new(r"level: '\x1b\[32minfo\x1b\[0m'").unwrap();
         let re_message = Regex::new(r"message: '\x1b\[32mTest message\x1b\[0m'").unwrap();

@@ -564,7 +564,7 @@ fn project_fields(entry: LogInfo, fields: &[String]) -> LogInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logform::{json, timestamp, Format};
+    use logform::{json, timestamp, FinalizeExt, Format};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use whatwg_streams::{CountQueuingStrategy, ReadableStream, WritableStream};
     use winston_transport::BoxedReadableSource;
@@ -581,8 +581,7 @@ mod tests {
 
     fn json_log(level: &str, msg: &str) -> LogInfo {
         let log = LogInfo::new(level, msg);
-        let log = timestamp().transform(log).unwrap();
-        json().transform(log).unwrap()
+        timestamp().finalize(json()).transform(log).unwrap()
     }
 
     fn thread_spawner<F>(fut: F) -> std::thread::JoinHandle<()>

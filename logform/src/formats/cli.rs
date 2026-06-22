@@ -1,5 +1,5 @@
 use super::{colorize::Colorizer, pad_levels::Padder, Format};
-use crate::{config, LogInfo};
+use crate::{config, Finalizer, LogInfo};
 use std::collections::HashSet;
 
 #[derive(Clone)]
@@ -61,22 +61,16 @@ impl CliFormat {
         self
     }
 
-    fn transform(&self, info: LogInfo) -> Option<LogInfo> {
-        let mut transformed_info = self.padder.transform(info)?;
-        transformed_info = self.colorizer.transform(transformed_info)?;
-
-        transformed_info.message =
-            format!("{}:{}", transformed_info.level, transformed_info.message);
-
-        Some(transformed_info)
-    }
 }
 
-impl Format for CliFormat {
-    type Input = LogInfo;
-
-    fn transform(&self, info: LogInfo) -> Option<Self::Input> {
-        self.transform(info)
+impl Finalizer for CliFormat {
+    fn finalize(&self, info: &LogInfo) -> Option<String> {
+        // Pad and colorize a working copy so the rendered terminal line carries
+        // the filler + ANSI codes while the structured `level`/`message` a
+        // structured sink reads stay clean.
+        let mut work = self.padder.transform(info.clone())?;
+        work = self.colorizer.transform(work)?;
+        Some(format!("{}:{}", work.level, work.message))
     }
 }
 
@@ -102,12 +96,9 @@ mod tests {
         let cli_format = CliFormat::new().with_levels(levels.keys());
 
         let log_info = LogInfo::new("error", "Test message");
-        let transformed = cli_format.transform(log_info).unwrap();
+        let transformed = cli_format.finalize(&log_info).unwrap();
 
-        assert_eq!(
-            transformed.message,
-            format!("\x1b[31merror\x1b[0m: Test message")
-        );
+        assert_eq!(transformed, format!("\x1b[31merror\x1b[0m: Test message"));
     }
 
     #[test]
@@ -134,16 +125,16 @@ mod tests {
             .with_colors(colors);
 
         let log_info = LogInfo::new("error", "Test message");
-        let transformed = cli_format.transform(log_info).unwrap();
+        let transformed = cli_format.finalize(&log_info).unwrap();
         assert_eq!(
-            transformed.message,
+            transformed,
             format!("\x1b[1;31merror\x1b[0m:\x1b[1;31m*Test message\x1b[0m")
         );
 
         let log_info = LogInfo::new("info", "Another test message");
-        let transformed = cli_format.transform(log_info).unwrap();
+        let transformed = cli_format.finalize(&log_info).unwrap();
         assert_eq!(
-            transformed.message,
+            transformed,
             format!("\x1b[34minfo\x1b[0m:\x1b[34m**Another test message\x1b[0m")
         );
     }

@@ -181,7 +181,7 @@ pub fn list_rotated_for_test(rotation: &DailyRotateRotationHandle) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logform::{json, timestamp, Format, LogInfo};
+    use logform::{json, timestamp, FinalizeExt, Format, LogInfo};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use whatwg_streams::{CountQueuingStrategy, StreamResult, WritableStream};
@@ -207,8 +207,9 @@ mod tests {
     }
 
     fn json_log(level: &str, msg: &str) -> LogInfo {
-        json()
-            .transform(timestamp().transform(LogInfo::new(level, msg)).unwrap())
+        timestamp()
+            .finalize(json())
+            .transform(LogInfo::new(level, msg))
             .unwrap()
     }
 

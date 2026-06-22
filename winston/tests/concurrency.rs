@@ -1,7 +1,7 @@
 mod common;
 
 use common::MockTransport;
-use logform::LogInfo;
+use logform::{FinalizeExt, LogInfo};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use winston::Logger;
@@ -191,7 +191,7 @@ fn test_concurrent_query() {
     let transport = MockTransport::new();
     let logger = Arc::new(
         Logger::builder()
-            .format(logform::timestamp())
+            .format(logform::timestamp().into_pipeline())
             .transport(transport)
             .build(),
     );

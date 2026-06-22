@@ -1,7 +1,7 @@
 mod common;
 
 use common::{wait_for_logs, MockTransport};
-use logform::LogInfo;
+use logform::{FinalizeExt, LogInfo};
 use winston::{log, Logger, LoggerOptions};
 
 #[test]
@@ -150,7 +150,7 @@ fn test_configure_updates_logger() {
 fn test_query_with_level_filter() {
     let transport = MockTransport::new();
     let logger = Logger::builder()
-        .format(logform::timestamp())
+        .format(logform::timestamp().into_pipeline())
         .transport(transport.clone())
         .build();
 
@@ -228,7 +228,7 @@ fn test_level_hierarchy() {
 fn test_metadata_preservation() {
     let transport = MockTransport::new();
     let logger = Logger::builder()
-        .format(logform::passthrough())
+        .format(logform::passthrough().into_pipeline())
         .transport(transport.clone())
         .build();
 

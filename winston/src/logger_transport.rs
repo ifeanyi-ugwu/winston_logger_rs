@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use logform::{Format, LogInfo};
+use logform::{Format, IntoFormatPipeline, LogInfo};
 use parking_lot::Mutex;
 use winston_transport::{DynQueryHandle, Transport};
 
@@ -57,9 +57,9 @@ impl LoggerTransport {
 
     pub fn with_format<F>(mut self, format: F) -> Self
     where
-        F: Format<Input = LogInfo> + Send + Sync + 'static,
+        F: IntoFormatPipeline,
     {
-        self.format = Some(Arc::new(format));
+        self.format = Some(Arc::new(format.into_format_pipeline()));
         self
     }
 

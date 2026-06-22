@@ -3,7 +3,7 @@ use crate::{
     logger_levels::LoggerLevels,
     logger_transport::{IntoLoggerTransport, LoggerTransport},
 };
-use logform::{json, Format, LogInfo};
+use logform::{json, Format, IntoFormatPipeline, LogInfo};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone)]
@@ -37,9 +37,9 @@ impl LoggerOptions {
     /// * `format` - The log format to be used.
     pub fn format<F>(mut self, format: F) -> Self
     where
-        F: Format<Input = LogInfo> + Send + Sync + 'static,
+        F: IntoFormatPipeline,
     {
-        self.format = Some(Arc::new(format));
+        self.format = Some(Arc::new(format.into_format_pipeline()));
         self
     }
 
@@ -137,7 +137,7 @@ impl Default for LoggerOptions {
             levels: Some(LoggerLevels::default()),
             level: Some("info".to_string()),
             transports: Some(Vec::new()),
-            format: Some(Arc::new(json())),
+            format: Some(Arc::new(json().into_format_pipeline())),
         }
     }
 }

@@ -4,21 +4,18 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::LogInfo;
-
-use super::Format;
+use crate::{Finalizer, LogInfo};
 
 pub struct LogstashFormat;
 
-impl Format for LogstashFormat {
-    type Input = LogInfo;
-
-    fn transform(&self, mut info: LogInfo) -> Option<Self::Input> {
+impl Finalizer for LogstashFormat {
+    fn finalize(&self, info: &LogInfo) -> Option<String> {
         let mut logstash_object = json!({"@message": info.message});
 
-        // The timestamp is expected to be a String in the meta map.
-        let ts = match info.meta.remove("timestamp") {
-            Some(Value::String(s)) => s,
+        // The timestamp is expected to be a String in the meta map. It lands in
+        // `@timestamp` and is excluded from `@fields` below.
+        let ts = match info.meta.get("timestamp") {
+            Some(Value::String(s)) => s.clone(),
             Some(Value::Number(num)) => {
                 if let Some(epoch_secs) = num.as_i64() {
                     DateTime::<Utc>::from_timestamp(epoch_secs, 0)
@@ -44,6 +41,9 @@ impl Format for LogstashFormat {
         fields.insert("level".to_string(), json!(info.level.clone()));
 
         for (key, value) in info.meta.iter() {
+            if key == "timestamp" {
+                continue;
+            }
             fields.insert(key.to_string(), value.clone());
         }
 
@@ -51,10 +51,7 @@ impl Format for LogstashFormat {
 
         // Handle serialization errors gracefully
         match serde_json::to_string(&logstash_object) {
-            Ok(serialized) => Some(LogInfo {
-                formatted: Some(serialized),
-                ..info
-            }),
+            Ok(serialized) => Some(serialized),
             Err(e) => {
                 eprintln!("LogstashFormat: failed to serialize logstash object: {}", e);
                 None
@@ -77,8 +74,8 @@ mod tests {
         info.meta
             .insert("timestamp".to_string(), json!(timestamp_value));
 
-        let result = logstash_format.transform(info).unwrap();
-        let parsed: Value = serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
+        let result = logstash_format.finalize(&info).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["@timestamp"], timestamp_value);
         assert_eq!(parsed["@message"], "Test message");
@@ -92,9 +89,9 @@ mod tests {
         let logstash_format = LogstashFormat;
 
         let info = LogInfo::new("info", "Test message");
-        let result = logstash_format.transform(info).unwrap();
+        let result = logstash_format.finalize(&info).unwrap();
 
-        let parsed: Value = serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.get("@message").is_some());
         assert!(parsed.get("@fields").is_some());
         assert_eq!(parsed["@message"], "Test message");
@@ -109,8 +106,8 @@ mod tests {
         info.meta
             .insert("transaction_id".to_string(), json!("abcd1234"));
 
-        let result = logstash_format.transform(info).unwrap();
-        let parsed: Value = serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
+        let result = logstash_format.finalize(&info).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(parsed["@fields"]["user_id"], "1234");
         assert_eq!(parsed["@fields"]["transaction_id"], "abcd1234");
@@ -123,8 +120,8 @@ mod tests {
         let mut info = LogInfo::new("info", "Test message");
         info.meta.insert("user_id".to_string(), json!("1234"));
 
-        let result = logstash_format.transform(info).unwrap();
-        let parsed: Value = serde_json::from_str(result.formatted.as_deref().unwrap()).unwrap();
+        let result = logstash_format.finalize(&info).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
 
         // @timestamp should exist and be a valid ISO8601 string
         assert!(parsed.get("@timestamp").is_some());
