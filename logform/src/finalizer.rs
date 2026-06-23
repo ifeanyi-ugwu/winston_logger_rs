@@ -1,5 +1,32 @@
 use crate::{Format, LogInfo};
+use std::fmt;
 use std::sync::Arc;
+
+/// What a transport's `write` receives. Carries the finalized [`LogInfo`] and,
+/// for string sinks, the rendered terminal string. A structured sink reads
+/// `info` and ignores `rendered`; a string sink uses [`Display`](fmt::Display),
+/// which yields `rendered` when present and otherwise the structured rendering
+/// of `info`.
+#[derive(Debug, Clone)]
+pub struct FormattedEntry {
+    pub info: LogInfo,
+    pub rendered: Option<String>,
+}
+
+impl FormattedEntry {
+    pub fn new(info: LogInfo, rendered: Option<String>) -> Self {
+        Self { info, rendered }
+    }
+}
+
+impl fmt::Display for FormattedEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.rendered {
+            Some(rendered) => f.write_str(rendered),
+            None => write!(f, "{}", self.info),
+        }
+    }
+}
 
 /// Terminal stage of a format: renders a [`LogInfo`] to the string a string
 /// sink writes. Distinct from [`Format`] (a transform, `LogInfo -> LogInfo`)
@@ -29,23 +56,18 @@ impl FormatPipeline {
             finalizer: Some(finalizer),
         }
     }
-}
 
-// Transitional: while `LogInfo::formatted` still exists, a stored pipeline runs
-// as a `Format` that writes its rendered string into `formatted`. Removed when
-// the `FormattedEntry` boundary lands (ADR 0005, commit 3).
-impl Format for FormatPipeline {
-    type Input = LogInfo;
-
-    fn transform(&self, info: LogInfo) -> Option<LogInfo> {
-        let mut info = match &self.transforms {
+    /// Run the transform chain (if any), then the finalizer (if any), yielding
+    /// the [`FormattedEntry`] a slot delivers to its transport. Returns `None`
+    /// only when a transform drops the entry. With no finalizer, `rendered` is
+    /// `None` and no string is produced — a structured sink pays nothing.
+    pub fn apply(&self, info: LogInfo) -> Option<FormattedEntry> {
+        let info = match &self.transforms {
             Some(transforms) => transforms.transform(info)?,
             None => info,
         };
-        if let Some(finalizer) = &self.finalizer {
-            info.formatted = finalizer.finalize(&info);
-        }
-        Some(info)
+        let rendered = self.finalizer.as_ref().and_then(|f| f.finalize(&info));
+        Some(FormattedEntry { info, rendered })
     }
 }
 

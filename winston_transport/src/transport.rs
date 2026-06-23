@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use logform::LogInfo;
+use logform::{FormattedEntry, LogInfo};
 use whatwg_streams::{
     ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
 };
@@ -9,9 +9,11 @@ use crate::log_query::LogQuery;
 
 /// The transport contract.
 ///
-/// A transport is a `WritableSink<LogInfo>` that the pipeline drives through a
-/// `WritableStream` — writes are serialized into the sink and backpressure is
-/// applied by the stream's queuing strategy. Optionally a transport exposes a
+/// A transport is a `WritableSink<FormattedEntry>` that the pipeline drives
+/// through a `WritableStream` — writes are serialized into the sink and
+/// backpressure is applied by the stream's queuing strategy. A string sink
+/// writes `entry.to_string()` (the rendered line); a structured sink reads
+/// `entry.info`. Optionally a transport exposes a
 /// streaming query through [`Transport::query_handle`] and an out-of-band
 /// ingestion endpoint through [`Transport::ingest_handle`].
 ///
@@ -34,7 +36,7 @@ use crate::log_query::LogQuery;
 /// path, a DB connection string, an HTTP client + URL) and open whatever
 /// per-call resources they need (a fresh cursor, a fresh append-mode file
 /// handle, a single batched POST). Default both return `None`.
-pub trait Transport: WritableSink<LogInfo> + Send + Sync + 'static {
+pub trait Transport: WritableSink<FormattedEntry> + Send + Sync + 'static {
     fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
         None
     }

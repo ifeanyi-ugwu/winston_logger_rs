@@ -54,7 +54,7 @@ where
     }
 }
 
-impl<W> Transport for WriterTransport<W, LogInfo>
+impl<W> Transport for WriterTransport<W, FormattedEntry>
 where
     W: Write + Send + Sync + 'static,
 {
@@ -62,11 +62,11 @@ where
 }
 
 /// Convenience: `WriterTransport` that writes to standard output.
-pub fn stdout() -> WriterTransport<io::Stdout, LogInfo> {
+pub fn stdout() -> WriterTransport<io::Stdout, FormattedEntry> {
     WriterTransport::new(io::stdout())
 }
 
 /// Convenience: `WriterTransport` that writes to standard error.
-pub fn stderr() -> WriterTransport<io::Stderr, LogInfo> {
+pub fn stderr() -> WriterTransport<io::Stderr, FormattedEntry> {
     WriterTransport::new(io::stderr())
 }

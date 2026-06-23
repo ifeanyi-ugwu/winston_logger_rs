@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use logform::LogInfo;
+use logform::{FormattedEntry, LogInfo};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -93,10 +93,10 @@ impl MockTransport {
     }
 }
 
-impl WritableSink<LogInfo> for MockTransport {
+impl WritableSink<FormattedEntry> for MockTransport {
     async fn write(
         &mut self,
-        info: LogInfo,
+        entry: FormattedEntry,
         _controller: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
         if self.config.should_fail_log {
@@ -105,7 +105,7 @@ impl WritableSink<LogInfo> for MockTransport {
         if self.config.delay > Duration::from_millis(0) {
             thread::sleep(self.config.delay);
         }
-        self.logs.lock().unwrap().push(info);
+        self.logs.lock().unwrap().push(entry.info);
         Ok(())
     }
 }

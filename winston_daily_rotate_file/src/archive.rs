@@ -181,7 +181,7 @@ pub fn list_rotated_for_test(rotation: &DailyRotateRotationHandle) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logform::{json, timestamp, FinalizeExt, Format, LogInfo};
+    use logform::{json, timestamp, FinalizeExt, Format, FormattedEntry, LogInfo};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use whatwg_streams::{CountQueuingStrategy, StreamResult, WritableStream};
@@ -206,10 +206,10 @@ mod tests {
         }
     }
 
-    fn json_log(level: &str, msg: &str) -> LogInfo {
+    fn json_log(level: &str, msg: &str) -> FormattedEntry {
         timestamp()
             .finalize(json())
-            .transform(LogInfo::new(level, msg))
+            .apply(LogInfo::new(level, msg))
             .unwrap()
     }
 
@@ -222,7 +222,7 @@ mod tests {
     fn drive<F, Fut>(transport: DailyRotateFile, body: F)
     where
         F: FnOnce(
-            whatwg_streams::WritableStreamDefaultWriter<LogInfo, DailyRotateFile>,
+            whatwg_streams::WritableStreamDefaultWriter<FormattedEntry, DailyRotateFile>,
         ) -> Fut,
         Fut: Future<Output = ()>,
     {

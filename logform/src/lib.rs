@@ -5,7 +5,7 @@ mod log_info;
 mod meta;
 mod utils;
 
-pub use finalizer::{FinalizeExt, Finalizer, FormatPipeline, IntoFormatPipeline};
+pub use finalizer::{FinalizeExt, Finalizer, FormatPipeline, FormattedEntry, IntoFormatPipeline};
 pub use formats::{
     align::align, cli::cli, colorize::colorize, json::json, label::label, logstash::logstash,
     metadata::metadata, ms::ms, pad_levels::pad_levels, passthrough::passthrough,

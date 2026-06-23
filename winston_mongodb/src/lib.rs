@@ -19,7 +19,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use logform::LogInfo;
+use logform::{FormattedEntry, LogInfo};
 use mongodb::{
     bson::{self, doc, Document},
     options::{FindOptions, IndexOptions},
@@ -119,7 +119,7 @@ impl MongoDBTransportBuilder {
     }
 }
 
-impl WritableSink<LogInfo> for MongoDBTransport {
+impl WritableSink<FormattedEntry> for MongoDBTransport {
     async fn start(
         &mut self,
         _controller: &mut WritableStreamDefaultController,
@@ -136,13 +136,14 @@ impl WritableSink<LogInfo> for MongoDBTransport {
 
     async fn write(
         &mut self,
-        info: LogInfo,
+        entry: FormattedEntry,
         _controller: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
         let collection = self
             .collection
             .as_ref()
             .ok_or_else(|| StreamError::from("MongoDBTransport not started"))?;
+        let info = entry.info;
         let doc = LogDocument {
             timestamp: Utc::now(),
             level: info.level,
@@ -658,6 +659,10 @@ mod tests {
     use whatwg_streams::{CountQueuingStrategy, ReadableStream, WritableStream};
     use winston_transport::BoxedReadableSource;
 
+    fn fe(level: &str, msg: impl Into<String>) -> FormattedEntry {
+        FormattedEntry::new(LogInfo::new(level, msg), None)
+    }
+
     fn require_uri() -> Option<String> {
         dotenv::dotenv().ok();
         match env::var("MONGODB_URI") {
@@ -688,7 +693,7 @@ mod tests {
 
         let (_locked, writer) = stream.get_writer().expect("get_writer");
         writer
-            .write(LogInfo::new("info", "writes_through_writable_stream"))
+            .write(fe("info", "writes_through_writable_stream"))
             .await
             .expect("write");
         writer.close().await.expect("close");
@@ -733,7 +738,7 @@ mod tests {
         let (_locked, writer) = stream.get_writer().expect("get_writer");
         for i in 0..3 {
             writer
-                .write(LogInfo::new("info", &format!("query_streams_results {i}")))
+                .write(fe("info", &format!("query_streams_results {i}")))
                 .await
                 .expect("write");
         }

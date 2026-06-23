@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local, Utc};
 use flate2::{write::GzEncoder, Compression};
-use logform::LogInfo;
+use logform::{FormattedEntry, LogInfo};
 use std::fs::{create_dir_all, read_dir, File, OpenOptions};
 use std::future::Future;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -358,16 +358,16 @@ impl DailyRotateFile {
     }
 }
 
-impl WritableSink<LogInfo> for DailyRotateFile {
+impl WritableSink<FormattedEntry> for DailyRotateFile {
     async fn write(
         &mut self,
-        info: LogInfo,
+        entry: FormattedEntry,
         _controller: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
         // Use the full Display so any logform finalizer (json, printf, etc.)
         // gets honored. This matches `winston_file::FileTransport` and lets
         // rotated files round-trip through `FileSource` for `ship_rotated_files`.
-        let line = info.to_string();
+        let line = entry.to_string();
         let entry_size = line.len() + 1; // +1 for the trailing newline
         if self.should_rotate(entry_size) {
             self.rotate()?;
@@ -606,6 +606,10 @@ mod tests {
     use tempfile::TempDir;
     use whatwg_streams::{CountQueuingStrategy, WritableStream};
 
+    fn fe(level: &str, msg: impl Into<String>) -> FormattedEntry {
+        FormattedEntry::new(LogInfo::new(level, msg), None)
+    }
+
     fn setup_temp_dir() -> TempDir {
         let project_root = std::env::current_dir().expect("Failed to get current directory");
         TempDir::new_in(&project_root).expect("Failed to create temp directory in project folder")
@@ -624,7 +628,7 @@ mod tests {
     fn drive<F, Fut>(transport: DailyRotateFile, body: F)
     where
         F: FnOnce(
-            whatwg_streams::WritableStreamDefaultWriter<LogInfo, DailyRotateFile>,
+            whatwg_streams::WritableStreamDefaultWriter<FormattedEntry, DailyRotateFile>,
         ) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
@@ -651,7 +655,7 @@ mod tests {
 
         drive(transport, |writer| async move {
             writer
-                .write(LogInfo::new("info", "Test message"))
+                .write(fe("info", "Test message"))
                 .await
                 .expect("write");
             writer.close().await.expect("close");
@@ -675,7 +679,7 @@ mod tests {
 
         drive(transport, |writer| async move {
             writer
-                .write(LogInfo::new("info", "log entry 1"))
+                .write(fe("info", "log entry 1"))
                 .await
                 .expect("write");
             // Simulate date change — `should_rotate` looks at the formatted
@@ -683,7 +687,7 @@ mod tests {
             // pattern is enough to trigger.
             std::thread::sleep(std::time::Duration::from_secs(1));
             writer
-                .write(LogInfo::new("info", "log entry 2"))
+                .write(fe("info", "log entry 2"))
                 .await
                 .expect("write");
             writer.close().await.expect("close");
@@ -709,7 +713,7 @@ mod tests {
             let log_message = "This is a test log message that should exceed the max file size.";
             for _ in 0..10 {
                 writer
-                    .write(LogInfo::new("info", log_message))
+                    .write(fe("info", log_message))
                     .await
                     .expect("write");
             }
@@ -741,13 +745,13 @@ mod tests {
         drive(transport, |writer| async move {
             for i in 0..5 {
                 writer
-                    .write(LogInfo::new("info", format!("Test message {}", i)))
+                    .write(fe("info", format!("Test message {}", i)))
                     .await
                     .expect("write");
             }
             for i in 0..5 {
                 writer
-                    .write(LogInfo::new("info", format!("Test message final {}", i)))
+                    .write(fe("info", format!("Test message final {}", i)))
                     .await
                     .expect("write");
             }
@@ -788,7 +792,7 @@ mod tests {
         drive(transport, |writer| async move {
             for i in 0..5 {
                 writer
-                    .write(LogInfo::new("info", format!("Message {}", i)))
+                    .write(fe("info", format!("Message {}", i)))
                     .await
                     .expect("write");
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -865,17 +869,17 @@ mod tests {
         // Force three rotations by writing across one-second boundaries.
         drive(transport, |writer| async move {
             writer
-                .write(LogInfo::new("info", "first"))
+                .write(fe("info", "first"))
                 .await
                 .expect("write");
             std::thread::sleep(std::time::Duration::from_secs(1));
             writer
-                .write(LogInfo::new("info", "second"))
+                .write(fe("info", "second"))
                 .await
                 .expect("write");
             std::thread::sleep(std::time::Duration::from_secs(1));
             writer
-                .write(LogInfo::new("info", "third"))
+                .write(fe("info", "third"))
                 .await
                 .expect("write");
             writer.close().await.expect("close");

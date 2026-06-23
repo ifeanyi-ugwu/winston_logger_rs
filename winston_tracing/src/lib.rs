@@ -1,4 +1,4 @@
-use logform::{Format, LogInfo};
+use logform::{FormatPipeline, FormattedEntry, LogInfo};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
@@ -9,7 +9,7 @@ use winston_transport::Transport;
 /// Type-erased per-transport enqueue closure used by [`DirectLayer`]. Captures
 /// a typed `WritableStreamDefaultWriter` so each `Transport` impl can have its
 /// own concrete sink type while still living together in a `Vec`.
-type EnqueueFn = Box<dyn Fn(LogInfo) + Send + Sync>;
+type EnqueueFn = Box<dyn Fn(FormattedEntry) + Send + Sync>;
 
 struct SpanFields(HashMap<String, serde_json::Value>);
 
@@ -187,7 +187,7 @@ impl tracing::field::Visit for FieldVisitor<'_> {
 /// tracing::info!(user_id = 42, "user logged in");
 /// ```
 pub struct DirectLayer {
-    format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    format: Option<Arc<FormatPipeline>>,
     transports: Vec<EnqueueFn>,
     min_level: Option<LevelFilter>,
 }
@@ -205,7 +205,7 @@ impl DirectLayer {
 
 pub struct DirectLayerBuilder {
     spawn_fn: SpawnFn,
-    format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    format: Option<Arc<FormatPipeline>>,
     transports: Vec<EnqueueFn>,
     min_level: Option<LevelFilter>,
 }
@@ -239,10 +239,10 @@ impl DirectLayerBuilder {
         // Move `locked` and `writer` into the closure together — `_locked`
         // keeps the writer's exclusivity for as long as the closure (and
         // therefore the DirectLayer) is alive.
-        let enqueue: EnqueueFn = Box::new(move |info: LogInfo| {
+        let enqueue: EnqueueFn = Box::new(move |entry: FormattedEntry| {
             // Held only to keep the lock alive.
             let _ = &locked;
-            let _ = writer.enqueue(info);
+            let _ = writer.enqueue(entry);
         });
         self.transports.push(enqueue);
         self
@@ -329,18 +329,18 @@ where
 
         let info = build_log_info(event, &ctx);
 
-        let info = match &self.format {
-            Some(fmt) => match fmt.transform(info) {
-                Some(i) => i,
+        let entry = match &self.format {
+            Some(fmt) => match fmt.apply(info) {
+                Some(e) => e,
                 None => return,
             },
-            None => info,
+            None => FormattedEntry::new(info, None),
         };
 
         // Fire-and-forget enqueue per transport. Backpressure is per-stream;
         // a slow transport doesn't block the others.
         for enqueue in &self.transports {
-            enqueue(info.clone());
+            enqueue(entry.clone());
         }
     }
 }
@@ -594,7 +594,7 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logform::FinalizeExt;
+    use logform::{FinalizeExt, Format};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::prelude::*;
     use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
@@ -607,13 +607,13 @@ mod tests {
     #[derive(Clone)]
     struct CaptureTransport(Arc<Mutex<Vec<LogInfo>>>);
 
-    impl WritableSink<LogInfo> for CaptureTransport {
+    impl WritableSink<FormattedEntry> for CaptureTransport {
         async fn write(
             &mut self,
-            info: LogInfo,
+            entry: FormattedEntry,
             _controller: &mut WritableStreamDefaultController,
         ) -> StreamResult<()> {
-            self.0.lock().unwrap().push(info);
+            self.0.lock().unwrap().push(entry.info);
             Ok(())
         }
     }

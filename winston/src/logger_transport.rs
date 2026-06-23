@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use logform::{Format, IntoFormatPipeline, LogInfo};
+use logform::{FormatPipeline, IntoFormatPipeline};
 use parking_lot::Mutex;
 use winston_transport::{DynQueryHandle, Transport};
 
@@ -25,7 +25,7 @@ pub struct LoggerTransport {
     /// writer side has been consumed.
     query_handle: Option<Arc<dyn DynQueryHandle>>,
     level: Option<String>,
-    format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    format: Option<Arc<FormatPipeline>>,
     overflow_policy: OverflowPolicy,
     queue_capacity: usize,
 }
@@ -87,7 +87,7 @@ impl LoggerTransport {
         self.level.as_ref()
     }
 
-    pub fn get_format(&self) -> Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>> {
+    pub fn get_format(&self) -> Option<Arc<FormatPipeline>> {
         self.format.clone()
     }
 

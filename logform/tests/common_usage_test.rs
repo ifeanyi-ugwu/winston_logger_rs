@@ -21,10 +21,8 @@ pub fn initialize_and_test_formats() {
             format!("{} - {}: {}", timestamp, info.level, info.message)
         }));
 
-    let log_info = format
-        .transform(log_info)
-        .expect("Format chain transform failed");
-    println!("{}", log_info.formatted.as_deref().unwrap_or(""));
+    let entry = format.apply(log_info).expect("Format pipeline failed");
+    println!("{}", entry);
 }
 
 #[test]

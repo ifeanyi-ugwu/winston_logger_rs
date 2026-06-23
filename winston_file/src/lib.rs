@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use dateparser::parse;
-use logform::LogInfo;
+use logform::{FormattedEntry, LogInfo};
 use serde_json::Value;
 use whatwg_streams::{
     ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
@@ -108,14 +108,14 @@ impl FileTransport {
     }
 }
 
-impl WritableSink<LogInfo> for FileTransport {
+impl WritableSink<FormattedEntry> for FileTransport {
     async fn write(
         &mut self,
-        info: LogInfo,
+        entry: FormattedEntry,
         _controller: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
         let mut inner = self.inner.lock();
-        writeln!(&mut inner.writer, "{}", info)?;
+        writeln!(&mut inner.writer, "{}", entry)?;
         Ok(())
     }
 
@@ -363,7 +363,10 @@ impl DynIngestHandle for FileIngestHandle {
                 .map_err(StreamError::other)?;
             let mut writer = BufWriter::new(file);
             for entry in logs {
-                writeln!(&mut writer, "{}", entry).map_err(StreamError::other)?;
+                // Ingested entries are structured `LogInfo`; write them as the
+                // JSON line `parse_log_entry` reads back, so File -> File proxy
+                // round-trips through the queryable on-disk format.
+                writeln!(&mut writer, "{}", entry.to_flat_value()).map_err(StreamError::other)?;
             }
             writer.flush().map_err(StreamError::other)?;
             Ok(())
@@ -493,14 +496,7 @@ fn parse_log_entry(line: &str) -> Option<LogInfo> {
             }
         })
         .collect::<HashMap<_, _>>();
-    // Preserve the original line as the finalized form, so an entry read
-    // from a JSON-lines file and written back out (e.g. proxied File → File)
-    // round-trips byte-for-byte instead of degrading to the `level message`
-    // Display fallback. Consumers that want the parts still read `.level` /
-    // `.message` / `.meta`; a re-applied formatter overwrites `.formatted`.
-    let mut info = LogInfo::from_parts(level, message, meta);
-    info.formatted = Some(line.to_string());
-    Some(info)
+    Some(LogInfo::from_parts(level, message, meta))
 }
 
 fn extract_timestamp(entry: &LogInfo) -> Option<DateTime<Utc>> {
@@ -579,9 +575,9 @@ mod tests {
         ))
     }
 
-    fn json_log(level: &str, msg: &str) -> LogInfo {
+    fn json_log(level: &str, msg: &str) -> FormattedEntry {
         let log = LogInfo::new(level, msg);
-        timestamp().finalize(json()).transform(log).unwrap()
+        timestamp().finalize(json()).apply(log).unwrap()
     }
 
     fn thread_spawner<F>(fut: F) -> std::thread::JoinHandle<()>
@@ -789,8 +785,8 @@ mod tests {
         futures::executor::block_on(async {
             handle
                 .ingest(vec![
-                    json_log("info", "first"),
-                    json_log("warn", "second"),
+                    json_log("info", "first").info,
+                    json_log("warn", "second").info,
                 ])
                 .await
                 .expect("ingest");

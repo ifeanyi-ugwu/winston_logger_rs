@@ -15,7 +15,7 @@
 //! logger.add_transport(HttpTransport::builder().url("https://...").build());
 //! ```
 
-use logform::LogInfo;
+use logform::{FormattedEntry, LogInfo};
 use reqwest::Client;
 use serde_json::Value;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
@@ -105,12 +105,14 @@ impl HttpTransport {
     }
 }
 
-impl WritableSink<LogInfo> for HttpTransport {
+impl WritableSink<FormattedEntry> for HttpTransport {
     async fn write(
         &mut self,
-        info: LogInfo,
+        entry: FormattedEntry,
         _controller: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
+        // HTTP ships the structured entry as JSON; the rendered string is unused.
+        let info = entry.info;
         if let Some(batch_size) = self.options.batch_size {
             if batch_size > 1 {
                 self.buffer.push(info);
@@ -393,7 +395,7 @@ mod tests {
         let log = timestamp()
             .transform(LogInfo::new("info", "Test single log"))
             .unwrap();
-        writer.write(log).await.expect("write");
+        writer.write(FormattedEntry::new(log, None)).await.expect("write");
         writer.close().await.expect("close");
 
         // Give server thread a moment to record the request.
@@ -428,14 +430,14 @@ mod tests {
             .transform(LogInfo::new("error", "Test log 2 in batch"))
             .unwrap();
         // First two trigger a batch send (size=2).
-        writer.write(log1).await.expect("write");
-        writer.write(log2).await.expect("write");
+        writer.write(FormattedEntry::new(log1, None)).await.expect("write");
+        writer.write(FormattedEntry::new(log2, None)).await.expect("write");
 
         // Third stays buffered until close() drains it.
         let log3 = timestamp()
             .transform(LogInfo::new("info", "Test log for flush"))
             .unwrap();
-        writer.write(log3).await.expect("write");
+        writer.write(FormattedEntry::new(log3, None)).await.expect("write");
         writer.close().await.expect("close");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -483,7 +485,7 @@ mod tests {
         let log = timestamp()
             .transform(LogInfo::new("info", "Test with custom headers"))
             .unwrap();
-        writer.write(log).await.expect("write");
+        writer.write(FormattedEntry::new(log, None)).await.expect("write");
         writer.close().await.expect("close");
 
         tokio::time::sleep(Duration::from_millis(100)).await;

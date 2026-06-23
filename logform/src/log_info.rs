@@ -15,11 +15,6 @@ pub struct LogInfo {
     pub level: String,
     pub message: String,
     pub meta: Meta,
-    /// The terminal output string produced by a finalizer format.
-    /// Transports read this field (via Display) instead of `message`.
-    /// Set only by finalizers; transforms never touch it.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    pub formatted: Option<String>,
 }
 
 impl LogInfo {
@@ -28,7 +23,6 @@ impl LogInfo {
             level: level.into(),
             message: message.into(),
             meta: Meta::new(),
-            formatted: None,
         }
     }
 
@@ -41,7 +35,6 @@ impl LogInfo {
             level: level.into(),
             message: message.into(),
             meta: meta.into(),
-            formatted: None,
         }
     }
 
@@ -101,8 +94,7 @@ impl LogInfo {
                 level,
                 message,
                 meta,
-                formatted: None,
-            })
+                })
         } else {
             Err("Input value is not a JSON object".to_string())
         }
@@ -152,10 +144,8 @@ macro_rules! log_info {
 
 impl fmt::Display for LogInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(s) = &self.formatted {
-            return write!(f, "{}", s);
-        }
-        // No finalizer ran — emit level + message + meta so nothing is silently dropped
+        // The structured rendering: level + message + meta. A rendered terminal
+        // string lives on `FormattedEntry`, not here.
         if self.meta.is_empty() {
             write!(f, "{} {}", self.level, self.message)
         } else {
@@ -220,16 +210,14 @@ impl FromStr for LogInfo {
                 level,
                 message,
                 meta,
-                formatted: None,
-            })
+                })
         } else {
             // No metadata
             Ok(LogInfo {
                 level,
                 message: rest.to_string(),
                 meta: Meta::new(),
-                formatted: None,
-            })
+                })
         }
     }
 }
@@ -304,16 +292,6 @@ mod display_tests {
         assert_eq!(parsed["host"], json!("example.com"));
     }
 
-    #[test]
-    fn test_display_with_formatted() {
-        let log = LogInfo {
-            level: "info".to_string(),
-            message: "original".to_string(),
-            meta: Default::default(),
-            formatted: Some("custom output".to_string()),
-        };
-        assert_eq!(format!("{}", log), "custom output");
-    }
 
     #[test]
     fn test_from_str_simple() {

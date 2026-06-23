@@ -3,13 +3,13 @@ use crate::{
     logger_levels::LoggerLevels,
     logger_transport::{IntoLoggerTransport, LoggerTransport},
 };
-use logform::{json, Format, IntoFormatPipeline, LogInfo};
+use logform::{json, FormatPipeline, IntoFormatPipeline};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone)]
 pub struct LoggerOptions {
     pub levels: Option<LoggerLevels>,
-    pub format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    pub format: Option<Arc<FormatPipeline>>,
     pub level: Option<String>,
     pub transports: Option<Vec<(TransportHandle, LoggerTransport)>>,
 }

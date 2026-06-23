@@ -3246,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "whatwg_streams"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "futures",
  "parking_lot",

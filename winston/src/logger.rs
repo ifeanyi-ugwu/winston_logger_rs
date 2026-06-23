@@ -734,7 +734,7 @@ impl<'kvs> log::kv::Visitor<'kvs> for KeyValueCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logform::FinalizeExt;
+    use logform::{FinalizeExt, FormattedEntry};
     use crate::logger_options::LoggerOptions;
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
@@ -765,13 +765,13 @@ mod tests {
         }
     }
 
-    impl WritableSink<LogInfo> for TestTransport {
+    impl WritableSink<FormattedEntry> for TestTransport {
         async fn write(
             &mut self,
-            info: LogInfo,
+            entry: FormattedEntry,
             _controller: &mut WritableStreamDefaultController,
         ) -> StreamResult<()> {
-            self.logs.lock().unwrap().push(info);
+            self.logs.lock().unwrap().push(entry.info);
             Ok(())
         }
     }
@@ -1280,10 +1280,10 @@ mod tests {
         permits: futures::channel::mpsc::UnboundedReceiver<()>,
     }
 
-    impl WritableSink<LogInfo> for PermittedTransport {
+    impl WritableSink<FormattedEntry> for PermittedTransport {
         async fn write(
             &mut self,
-            _info: LogInfo,
+            _entry: FormattedEntry,
             _controller: &mut WritableStreamDefaultController,
         ) -> StreamResult<()> {
             let _ = self.permits.next().await;
@@ -1452,14 +1452,15 @@ mod tests {
             inner: PermittedTransport,
             seen: Arc<Mutex<Vec<String>>>,
         }
-        impl WritableSink<LogInfo> for Wrapped {
+        impl WritableSink<FormattedEntry> for Wrapped {
             async fn write(
                 &mut self,
-                info: LogInfo,
+                entry: FormattedEntry,
                 ctrl: &mut WritableStreamDefaultController,
             ) -> StreamResult<()> {
-                self.inner.write(info.clone(), ctrl).await?;
-                self.seen.lock().unwrap().push(info.message);
+                let message = entry.info.message.clone();
+                self.inner.write(entry, ctrl).await?;
+                self.seen.lock().unwrap().push(message);
                 Ok(())
             }
         }

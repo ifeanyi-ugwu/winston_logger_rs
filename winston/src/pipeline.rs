@@ -10,7 +10,7 @@ use std::{
 
 use futures::channel::{mpsc as fmpsc, oneshot};
 use futures::StreamExt;
-use logform::{Format, LogInfo};
+use logform::{FormatPipeline, FormattedEntry, LogInfo};
 use whatwg_streams::{
     CountQueuingStrategy, StreamResult, WritableSink, WritableStream,
     WritableStreamDefaultWriter,
@@ -136,7 +136,7 @@ pub fn single_threaded_spawner() -> SpawnFn {
 }
 
 
-/// Sink-type-erased view of a `WritableStreamDefaultWriter<LogInfo, _>`.
+/// Sink-type-erased view of a `WritableStreamDefaultWriter<FormattedEntry, _>`.
 ///
 /// Each transport has a different concrete `Sink` type, so the slot pump
 /// can't store its writer behind a homogeneous interface directly. The
@@ -149,7 +149,7 @@ pub fn single_threaded_spawner() -> SpawnFn {
 pub(crate) trait ErasedWriter: Send + Sync {
     fn enqueue_when_ready<'a>(
         &'a self,
-        info: LogInfo,
+        entry: FormattedEntry,
     ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
 
     fn flush<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
@@ -157,15 +157,15 @@ pub(crate) trait ErasedWriter: Send + Sync {
     fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>>;
 }
 
-impl<Sink> ErasedWriter for WritableStreamDefaultWriter<LogInfo, Sink>
+impl<Sink> ErasedWriter for WritableStreamDefaultWriter<FormattedEntry, Sink>
 where
-    Sink: WritableSink<LogInfo> + Send + Sync + 'static,
+    Sink: WritableSink<FormattedEntry> + Send + Sync + 'static,
 {
     fn enqueue_when_ready<'a>(
         &'a self,
-        info: LogInfo,
+        entry: FormattedEntry,
     ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>> {
-        Box::pin(WritableStreamDefaultWriter::enqueue_when_ready(self, info))
+        Box::pin(WritableStreamDefaultWriter::enqueue_when_ready(self, entry))
     }
 
     fn flush<'a>(&'a self) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'a>> {
@@ -218,7 +218,7 @@ where
 
 /// Message sent from the fanout to a slot's pump task.
 enum SlotMessage {
-    Entry(LogInfo),
+    Entry(FormattedEntry),
     /// Barrier: pump processes prior `Entry` messages, drains until the
     /// stream is ready, then acks. Used to implement logger-level flush.
     Flush(oneshot::Sender<()>),
@@ -232,7 +232,7 @@ enum SlotMessage {
 pub(crate) struct TransportSlot {
     pub(crate) handle: TransportHandle,
     pub(crate) level: Option<String>,
-    pub(crate) transport_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    pub(crate) transport_format: Option<Arc<FormatPipeline>>,
     pub(crate) overflow: OverflowPolicy,
     /// Single-producer mailbox into the per-slot pump. `MailboxSender`'s
     /// `&self` API lets every caller push through an `Arc<TransportSlot>`
@@ -270,8 +270,8 @@ async fn slot_pump(
 ) {
     while let Some(msg) = mailbox_rx.next().await {
         match msg {
-            SlotMessage::Entry(info) => {
-                let _ = writer.enqueue_when_ready(info).await;
+            SlotMessage::Entry(entry) => {
+                let _ = writer.enqueue_when_ready(entry).await;
             }
             SlotMessage::Flush(ack) => {
                 let _ = writer.flush().await;
@@ -296,7 +296,7 @@ async fn slot_pump(
 pub(crate) struct LoggerState {
     pub(crate) spawn_fn: SpawnFn,
     pub(crate) slots: Vec<Arc<TransportSlot>>,
-    pub(crate) global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    pub(crate) global_format: Option<Arc<FormatPipeline>>,
     pub(crate) global_level: Option<String>,
     pub(crate) levels: Option<LoggerLevels>,
     /// Entries logged before any transport was admitted. Drained into the
@@ -309,7 +309,7 @@ pub(crate) struct LoggerState {
 impl LoggerState {
     pub(crate) fn new(
         spawn_fn: SpawnFn,
-        global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+        global_format: Option<Arc<FormatPipeline>>,
         global_level: Option<String>,
         levels: Option<LoggerLevels>,
         buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
@@ -398,7 +398,7 @@ impl LoggerState {
 /// other potentially-parking primitives.
 pub(crate) struct StateSnapshot {
     pub(crate) slots: Vec<Arc<TransportSlot>>,
-    pub(crate) global_format: Option<Arc<dyn Format<Input = LogInfo> + Send + Sync>>,
+    pub(crate) global_format: Option<Arc<FormatPipeline>>,
     pub(crate) global_level: Option<String>,
     pub(crate) levels: Option<LoggerLevels>,
     pub(crate) buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
@@ -425,11 +425,11 @@ impl StateSnapshot {
         }
     }
 
-    fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<LogInfo> {
+    fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<FormattedEntry> {
         match (&slot.transport_format, &self.global_format) {
-            (Some(tf), _) => tf.transform(entry.clone()),
-            (None, Some(gf)) => gf.transform(entry.clone()),
-            (None, None) => Some(entry.clone()),
+            (Some(tf), _) => tf.apply(entry.clone()),
+            (None, Some(gf)) => gf.apply(entry.clone()),
+            (None, None) => Some(FormattedEntry::new(entry.clone(), None)),
         }
     }
 
@@ -463,8 +463,8 @@ impl StateSnapshot {
             if !self.passes_level(&entry.level, slot.level.as_ref()) {
                 continue;
             }
-            let Some(info) = self.format_for(slot, entry) else { continue };
-            if let Some(deferred) = self.try_push_to_slot(slot, info) {
+            let Some(formatted) = self.format_for(slot, entry) else { continue };
+            if let Some(deferred) = self.try_push_to_slot(slot, formatted) {
                 deferred_blocks.push((idx, deferred));
             }
         }
@@ -483,8 +483,8 @@ impl StateSnapshot {
     /// then call `push_blocking` in phase 2. Returns `None` on any other
     /// outcome (success, drop policy, slot torn down) — all of which the
     /// caller treats as "done" for this slot.
-    fn try_push_to_slot(&self, slot: &TransportSlot, info: LogInfo) -> Option<SlotMessage> {
-        match slot.mailbox_tx.try_push(SlotMessage::Entry(info)) {
+    fn try_push_to_slot(&self, slot: &TransportSlot, entry: FormattedEntry) -> Option<SlotMessage> {
+        match slot.mailbox_tx.try_push(SlotMessage::Entry(entry)) {
             Ok(()) => {
                 slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
                 if slot.was_saturated.swap(false, Ordering::Relaxed) {
