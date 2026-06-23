@@ -1,5 +1,5 @@
-use logform::{FormatPipeline, FormattedEntry, LogInfo};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use logform::{FormatPipeline, FormattedEntry, LogInfo, Meta};
+use std::{sync::Arc, time::Instant};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
 use whatwg_streams::{CountQueuingStrategy, WritableStream};
@@ -11,7 +11,7 @@ use winston_transport::Transport;
 /// own concrete sink type while still living together in a `Vec`.
 type EnqueueFn = Box<dyn Fn(FormattedEntry) + Send + Sync>;
 
-struct SpanFields(HashMap<String, serde_json::Value>);
+struct SpanFields(Meta);
 
 fn map_level(level: &Level) -> &'static str {
     match *level {
@@ -23,19 +23,16 @@ fn map_level(level: &Level) -> &'static str {
     }
 }
 
-fn insert_location(meta: &mut HashMap<String, serde_json::Value>, m: &tracing::Metadata<'_>) {
+fn insert_location(meta: &mut Meta, m: &tracing::Metadata<'_>) {
     meta.insert(
-        "target".to_string(),
+        "target",
         serde_json::Value::String(m.target().to_string()),
     );
     if let Some(file) = m.file() {
-        meta.insert(
-            "file".to_string(),
-            serde_json::Value::String(file.to_string()),
-        );
+        meta.insert("file", serde_json::Value::String(file.to_string()));
     }
     if let Some(line) = m.line() {
-        meta.insert("line".to_string(), serde_json::Value::Number(line.into()));
+        meta.insert("line", serde_json::Value::Number(line.into()));
     }
 }
 
@@ -45,16 +42,17 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     let level = map_level(event.metadata().level()).to_string();
-    let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut fields = Meta::new();
 
     // Walk ancestor spans outermost → innermost so that more specific
-    // (closer) spans override broader context.
+    // (closer) spans override broader context. Cloning the span's `Meta`
+    // preserves each key's `Cow` — static field names stay borrowed.
     if let Some(scope) = ctx.event_scope(event) {
         let spans: Vec<_> = scope.collect();
         for span in spans.iter().rev() {
             if let Some(sf) = span.extensions().get::<SpanFields>() {
-                for (k, v) in &sf.0 {
-                    fields.insert(k.clone(), v.clone());
+                for (k, v) in sf.0.clone() {
+                    fields.insert(k, v);
                 }
             }
         }
@@ -76,25 +74,25 @@ where
     LogInfo::from_parts(level, message, fields)
 }
 
-struct FieldVisitor<'a>(&'a mut HashMap<String, serde_json::Value>);
+struct FieldVisitor<'a>(&'a mut Meta);
 
 impl tracing::field::Visit for FieldVisitor<'_> {
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
         let number = serde_json::Number::from_f64(value).unwrap_or_else(|| 0.into());
         self.0
-            .insert(field.name().to_string(), serde_json::Value::Number(number));
+            .insert(field.name(), serde_json::Value::Number(number));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
         self.0.insert(
-            field.name().to_string(),
+            field.name(),
             serde_json::Value::Number(value.into()),
         );
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
         self.0.insert(
-            field.name().to_string(),
+            field.name(),
             serde_json::Value::Number(value.into()),
         );
     }
@@ -102,26 +100,26 @@ impl tracing::field::Visit for FieldVisitor<'_> {
     fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
         // serde_json::Number doesn't support i128; store as string to avoid silent truncation.
         self.0.insert(
-            field.name().to_string(),
+            field.name(),
             serde_json::Value::String(value.to_string()),
         );
     }
 
     fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
         self.0.insert(
-            field.name().to_string(),
+            field.name(),
             serde_json::Value::String(value.to_string()),
         );
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         self.0
-            .insert(field.name().to_string(), serde_json::Value::Bool(value));
+            .insert(field.name(), serde_json::Value::Bool(value));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         self.0.insert(
-            field.name().to_string(),
+            field.name(),
             serde_json::Value::String(value.to_string()),
         );
     }
@@ -144,7 +142,7 @@ impl tracing::field::Visit for FieldVisitor<'_> {
         } else {
             serde_json::Value::Array(chain)
         };
-        self.0.insert(field.name().to_string(), val);
+        self.0.insert(field.name(), val);
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -155,7 +153,7 @@ impl tracing::field::Visit for FieldVisitor<'_> {
             return;
         }
         self.0
-            .insert(field.name().to_string(), serde_json::Value::String(s));
+            .insert(field.name(), serde_json::Value::String(s));
     }
 }
 
@@ -289,10 +287,10 @@ where
         ctx: Context<'_, S>,
     ) {
         let span = ctx.span(id).expect("span not found, this is a bug");
-        let mut fields = HashMap::new();
+        let mut fields = Meta::new();
         // Seed with the span name so child events know which span they fired in.
         fields.insert(
-            "span".to_string(),
+            "span",
             serde_json::Value::String(span.name().to_string()),
         );
         attrs.record(&mut FieldVisitor(&mut fields));
@@ -494,10 +492,10 @@ where
         let span = ctx.span(id).expect("span not found, this is a bug");
         let span_name = span.name().to_string();
 
-        let mut fields = HashMap::new();
+        let mut fields = Meta::new();
         // Seed with the span name so child events know which span they fired in.
         fields.insert(
-            "span".to_string(),
+            "span",
             serde_json::Value::String(span_name.clone()),
         );
         attrs.record(&mut FieldVisitor(&mut fields));
@@ -568,11 +566,11 @@ where
             f.remove("span");
             f
         } else {
-            HashMap::new()
+            Meta::new()
         };
 
         if let Some(ms) = elapsed_ms {
-            meta.insert("duration_ms".to_string(), serde_json::json!(ms));
+            meta.insert("duration_ms", serde_json::json!(ms));
         }
 
         let metadata = span.metadata();
