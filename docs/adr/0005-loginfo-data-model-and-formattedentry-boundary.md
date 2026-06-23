@@ -1,6 +1,6 @@
 # ADR 0005 — LogInfo data model and the FormattedEntry boundary
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
