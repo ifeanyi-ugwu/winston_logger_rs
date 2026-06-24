@@ -103,7 +103,7 @@ pub struct Logger {
     min_required_severity_cache: AtomicU8,
 
     /// Snapshot of the active levels map (name → severity). Read by
-    /// `is_level_enabled_fast` to resolve an entry's severity without
+    /// `is_level_enabled` to resolve an entry's severity without
     /// touching `shared_state`. Updated whenever levels change.
     levels_snapshot: RwLock<HashMap<String, u8>>,
 
@@ -255,7 +255,7 @@ impl Logger {
     /// filter" and short-circuits to true without any lock. Otherwise checks
     /// the levels snapshot — a `parking_lot::RwLock` held only for the
     /// duration of one HashMap lookup on a small fixed-size map.
-    pub fn is_level_enabled_fast(&self, level: &str) -> bool {
+    pub fn is_level_enabled(&self, level: &str) -> bool {
         let min = self.min_required_severity_cache.load(Ordering::Relaxed);
         if min == u8::MAX {
             return true;
@@ -268,7 +268,7 @@ impl Logger {
     /// parks the calling thread on the slot's `Condvar` until room appears
     /// — the slowest Block slot sets the producer's rate.
     pub fn log(&self, entry: LogInfo) {
-        if !self.is_level_enabled_fast(&entry.level) {
+        if !self.is_level_enabled(&entry.level) {
             return;
         }
         let snapshot = self.state.read().snapshot();
@@ -278,7 +278,7 @@ impl Logger {
     /// Constructs and logs an entry only if the level passes the filter.
     /// The closure is never called for levels that would be discarded.
     pub fn log_lazy(&self, level: &str, f: impl FnOnce() -> LogInfo) {
-        if self.is_level_enabled_fast(level) {
+        if self.is_level_enabled(level) {
             self.log(f());
         }
     }
@@ -635,12 +635,12 @@ fn log_level_str(level: log::Level) -> &'static str {
 #[cfg(feature = "log-backend")]
 impl Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        self.is_level_enabled_fast(log_level_str(metadata.level()))
+        self.is_level_enabled(log_level_str(metadata.level()))
     }
 
     fn log(&self, record: &Record) {
         let level_str = log_level_str(record.level());
-        if !self.is_level_enabled_fast(level_str) {
+        if !self.is_level_enabled(level_str) {
             return;
         }
 

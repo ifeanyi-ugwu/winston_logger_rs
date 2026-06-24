@@ -531,7 +531,7 @@ where
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
         self.logger
-            .is_level_enabled_fast(map_level(metadata.level()))
+            .is_level_enabled(map_level(metadata.level()))
     }
 
     fn max_level_hint(&self) -> Option<LevelFilter> {
@@ -542,7 +542,7 @@ where
             (Level::WARN, LevelFilter::WARN),
             (Level::ERROR, LevelFilter::ERROR),
         ] {
-            if self.logger.is_level_enabled_fast(map_level(&level)) {
+            if self.logger.is_level_enabled(map_level(&level)) {
                 return Some(filter);
             }
         }
