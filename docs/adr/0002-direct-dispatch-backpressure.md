@@ -2,6 +2,14 @@
 
 **Status:** Accepted
 
+> **Amended by [ADR 0007](0007-shallow-writablestream-high-water-mark.md).** The
+> per-slot `WritableStream` queue is no longer bounded by `HWM = queue_capacity`;
+> its high-water mark is a fixed cache-fit constant (`min(queue_capacity, 64)` by
+> default, settable per transport via `LoggerTransport::with_ws_high_water_mark`).
+> So the worst-case in-flight figure below is `Σ_i (queue_capacity[i] + ws_hwm[i])`
+> ≈ `Σ_i (queue_capacity[i] + 64)`, **not** `2 · Σ queue_capacity[i]`. The
+> per-slot mailbox + dispatch model is otherwise unchanged.
+
 ## Context
 
 The Logger's front end is currently a chain of four queues between `log()` and

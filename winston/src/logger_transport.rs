@@ -28,6 +28,9 @@ pub struct LoggerTransport {
     format: Option<Arc<FormatPipeline>>,
     overflow_policy: OverflowPolicy,
     queue_capacity: usize,
+    /// Advanced override for the WritableStream high-water mark. `None` uses
+    /// the cache-fit default (`min(queue_capacity, 64)`).
+    ws_high_water_mark: Option<usize>,
 }
 
 impl LoggerTransport {
@@ -47,6 +50,7 @@ impl LoggerTransport {
             format: None,
             overflow_policy: OverflowPolicy::default(),
             queue_capacity: DEFAULT_TRANSPORT_QUEUE_CAPACITY,
+            ws_high_water_mark: None,
         }
     }
 
@@ -73,16 +77,60 @@ impl LoggerTransport {
     /// burst-absorption depth: a `Block` slot parks the caller, and a `Drop`
     /// slot starts dropping, once this many entries are in flight.
     ///
-    /// The `WritableStream` behind the mailbox adds only a small fixed cache-fit
-    /// buffer (~64 entries, not a second copy of this value), so worst-case
+    /// The `WritableStream` behind the mailbox adds only a small cache-fit buffer
+    /// (~64 entries by default, not a second copy of this value), so worst-case
     /// in-flight is ~`capacity + 64`, not `2 × capacity`. In steady state both
-    /// sit near-empty. ADR 0007 and `docs/queue-depth-investigation.md` derive
-    /// why the WS depth is a fixed absolute rather than the mailbox capacity.
+    /// sit near-empty. That WS depth is an absolute cache-fit constant, not a
+    /// function of this capacity, and is itself tunable for advanced cases via
+    /// [`with_ws_high_water_mark`](Self::with_ws_high_water_mark) — see ADR 0007
+    /// and `docs/queue-depth-investigation.md`.
     ///
     /// Clamped to a minimum of 1. Defaults to
     /// [`DEFAULT_TRANSPORT_QUEUE_CAPACITY`].
     pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
         self.queue_capacity = capacity.max(1);
+        self
+    }
+
+    /// Override the WritableStream high-water mark for this transport.
+    ///
+    /// **Advanced.** Most transports should leave this at the default. It is
+    /// *not* a buffer size in the usual sense — increasing it generally makes
+    /// sustained throughput **worse**, not better, and raises memory. If that
+    /// sounds backwards, read on before using it.
+    ///
+    /// # What it controls
+    ///
+    /// The depth of the internal queue between the per-slot pump and the
+    /// `WritableStream` controller — the pump→sink throttle. It carries **no**
+    /// overflow policy (that is [`with_queue_capacity`](Self::with_queue_capacity)
+    /// + [`OverflowPolicy`]); it only sets how far the pump may run ahead of the
+    /// sink before it parks.
+    ///
+    /// # Why the default is shallow, and why bigger is usually worse
+    ///
+    /// In a saturated pipeline the cross-thread handoff cost is hidden, so a
+    /// shallow queue wins on **cache locality**: the controller reads entries the
+    /// pump just wrote, still in cache; a deep queue makes it read cold, evicted
+    /// data — slower — and raises worst-case in-flight memory. The
+    /// sustained-throughput optimum is therefore an absolute count,
+    /// `≈ L1_cache_size / sizeof(FormattedEntry)` (~64 by default), independent
+    /// of `queue_capacity`. See ADR 0007 and `docs/queue-depth-investigation.md`.
+    ///
+    /// # When overriding is justified
+    ///
+    /// - **A batching sink** — one whose `write` drains several entries per call
+    ///   (a buffered file, an HTTP sink that POSTs N entries) — wants a *deeper*
+    ///   WS so the controller has a batch ready. Set it near your batch size.
+    ///   This is the one case where deeper genuinely helps.
+    /// - **Unusual hardware or very large entries** shift the cache-fit optimum.
+    ///   To find yours, adapt `winston/benches/queue_depth.rs` with your own
+    ///   transport, or estimate `L1 / sizeof(FormattedEntry)`.
+    ///
+    /// Unlike the default, an explicit value is **not** capped to
+    /// `queue_capacity` — set it deliberately. Clamped to a minimum of 1.
+    pub fn with_ws_high_water_mark(mut self, hwm: usize) -> Self {
+        self.ws_high_water_mark = Some(hwm.max(1));
         self
     }
 
@@ -100,6 +148,13 @@ impl LoggerTransport {
 
     pub fn queue_capacity(&self) -> usize {
         self.queue_capacity
+    }
+
+    /// Explicit WritableStream high-water mark override, if set via
+    /// [`with_ws_high_water_mark`](Self::with_ws_high_water_mark). `None` means
+    /// the cache-fit default applies.
+    pub fn ws_high_water_mark(&self) -> Option<usize> {
+        self.ws_high_water_mark
     }
 
     pub fn query_handle(&self) -> Option<&Arc<dyn DynQueryHandle>> {
@@ -121,6 +176,7 @@ impl fmt::Debug for LoggerTransport {
             .field("queryable", &self.query_handle.is_some())
             .field("overflow_policy", &self.overflow_policy)
             .field("queue_capacity", &self.queue_capacity)
+            .field("ws_high_water_mark", &self.ws_high_water_mark)
             .finish()
     }
 }

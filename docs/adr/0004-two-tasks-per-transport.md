@@ -2,6 +2,13 @@
 
 **Status:** Accepted
 
+> **Amended by [ADR 0007](0007-shallow-writablestream-high-water-mark.md).** The
+> `WritableStream` queue depth is no longer `HWM = queue_capacity`; it is a fixed
+> cache-fit constant (`min(queue_capacity, 64)` by default, settable per transport
+> via `LoggerTransport::with_ws_high_water_mark`). The two-task pipelining argument
+> below is unchanged — the depth is still > 1 — but it no longer scales with
+> `queue_capacity`.
+
 ## Context
 
 Each transport in the pipeline runs behind two concurrent tasks:

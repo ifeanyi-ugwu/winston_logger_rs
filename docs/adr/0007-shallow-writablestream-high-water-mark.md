@@ -75,6 +75,15 @@ fn resolve_ws_hwm(capacity: usize) -> usize { capacity.min(DEFAULT_WS_HWM) }
 - `DEFAULT_WS_HWM` is machine-tuned (`L1 / sizeof(entry)`); 64 is a conservative
   default across typical entry sizes, not a universal constant. The
   `internal-bench` feature's `WINSTON_WS_HWM` override exists to re-derive it.
+- An **advanced per-transport escape hatch** is provided —
+  `LoggerTransport::with_ws_high_water_mark` — for the cases the default cannot
+  serve: a **batching sink** (writes N entries per call, wants a deeper WS so the
+  controller pulls a batch) or measured hardware/entry-size tuning. It is *not*
+  the recommended path: its docs lead with the counterintuitive direction (deeper
+  is usually worse) to deter cargo-cult tuning, since the WS HWM's intuitive
+  "bigger = safer" reading is wrong. An explicit value is honored as-is (not
+  capped to `capacity`); the default `min(capacity, 64)` remains the answer for
+  ~all transports.
 
 ## Alternatives considered and rejected
 
@@ -89,11 +98,6 @@ fn resolve_ws_hwm(capacity: usize) -> usize { capacity.min(DEFAULT_WS_HWM) }
   ADR, considered when the plateau was still thought to be ~1024. Subsumed: with
   the knee derived at ~128, the "cap" *is* the default, and at a much smaller
   value than 1024.
-- **Expose WS HWM as per-transport config.** Deferred. Worth revisiting only when
-  a batching sink lands (one that writes N entries per call), which would prefer a
-  deeper WS so the controller can pull a batch — at which point the WS depth
-  becomes sink-determined rather than a global constant. The current model writes
-  one entry at a time, so a single cache-fit constant suffices.
 
 ## References
 

@@ -61,6 +61,13 @@ impl<'a> TransportBuilder<'a> {
         self
     }
 
+    /// Advanced: override the WritableStream high-water mark. See
+    /// [`LoggerTransport::with_ws_high_water_mark`] — bigger is usually worse.
+    pub fn with_ws_high_water_mark(mut self, hwm: usize) -> Self {
+        self.logger_transport = self.logger_transport.with_ws_high_water_mark(hwm);
+        self
+    }
+
     pub fn add(self) -> TransportHandle {
         self.logger.add_transport(self.logger_transport)
     }
@@ -921,6 +928,34 @@ mod tests {
 
         assert!(logger.remove_transport(handle));
         assert!(!logger.remove_transport(handle));
+    }
+
+    #[test]
+    fn test_with_ws_high_water_mark_stores_and_clamps() {
+        let lt = LoggerTransport::new(TestTransport::new()).with_ws_high_water_mark(8);
+        assert_eq!(lt.ws_high_water_mark(), Some(8));
+
+        let clamped = LoggerTransport::new(TestTransport::new()).with_ws_high_water_mark(0);
+        assert_eq!(clamped.ws_high_water_mark(), Some(1));
+
+        // Unset by default.
+        assert_eq!(LoggerTransport::new(TestTransport::new()).ws_high_water_mark(), None);
+    }
+
+    #[test]
+    fn test_ws_high_water_mark_override_still_delivers() {
+        // Exercises the build_slot → resolve_ws_hwm explicit-override path; an
+        // override deeper than the queue_capacity is honored as-is.
+        let transport = TestTransport::new();
+        let lt = LoggerTransport::new(transport.clone())
+            .with_queue_capacity(2)
+            .with_ws_high_water_mark(64);
+        let logger = Logger::builder().transport(lt).build();
+
+        logger.log(LogInfo::new("info", "via overridden ws hwm"));
+        logger.flush().unwrap();
+
+        assert_eq!(transport.get_logs().len(), 1);
     }
 
     #[test]

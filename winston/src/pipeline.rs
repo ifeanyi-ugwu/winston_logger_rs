@@ -191,13 +191,14 @@ pub type TransportWriterBuilder =
 /// `LoggerTransport::with_queue_capacity`.
 pub const DEFAULT_TRANSPORT_QUEUE_CAPACITY: usize = 1024;
 
-/// WritableStream high-water mark for a slot, as a fixed cache-fit constant
-/// rather than the mailbox capacity. The WS queue is the pump↔controller
-/// throttle, not a policy buffer, and its sustained-throughput optimum is an
-/// absolute count ≈ `L1 / sizeof(FormattedEntry)` — independent of capacity.
-/// A shallow WS keeps the pump→controller handoff cache-warm; a deep one makes
-/// the controller read cold, evicted data. Capped below by the mailbox so a
-/// tiny `queue_capacity` is never out-deepened. See ADR 0007 and
+/// Default WritableStream high-water mark for a slot — a fixed cache-fit
+/// constant rather than the mailbox capacity (a transport may override it via
+/// `LoggerTransport::with_ws_high_water_mark`). The WS queue is the
+/// pump↔controller throttle, not a policy buffer, and its sustained-throughput
+/// optimum is an absolute count ≈ `L1 / sizeof(FormattedEntry)` — independent of
+/// capacity. A shallow WS keeps the pump→controller handoff cache-warm; a deep
+/// one makes the controller read cold, evicted data. Capped below by the mailbox
+/// so a tiny `queue_capacity` is never out-deepened. See ADR 0007 and
 /// `docs/queue-depth-investigation.md`.
 pub(crate) const DEFAULT_WS_HWM: usize = 64;
 
@@ -301,12 +302,14 @@ async fn slot_pump(
 }
 
 
-/// The WritableStream high-water mark for a slot: the fixed cache-fit constant
-/// [`DEFAULT_WS_HWM`], capped below by the mailbox `capacity` so a tiny capacity
-/// is never out-deepened by the WS. Under the `internal-bench` feature a
-/// `WINSTON_WS_HWM` env var overrides it, so the `queue_depth` benchmark can
-/// sweep the WS depth independently of the mailbox; no effect in normal builds.
-fn resolve_ws_hwm(capacity: usize) -> usize {
+/// The WritableStream high-water mark for a slot. An `explicit` override
+/// (`LoggerTransport::with_ws_high_water_mark`) wins as-is; otherwise the fixed
+/// cache-fit constant [`DEFAULT_WS_HWM`], capped below by the mailbox `capacity`
+/// so a tiny capacity is never out-deepened by the WS. Under the
+/// `internal-bench` feature a `WINSTON_WS_HWM` env var forces it, so the
+/// `queue_depth` benchmark can sweep the WS depth independently of the mailbox;
+/// no effect in normal builds.
+fn resolve_ws_hwm(capacity: usize, explicit: Option<usize>) -> usize {
     #[cfg(feature = "internal-bench")]
     if let Some(n) = std::env::var("WINSTON_WS_HWM")
         .ok()
@@ -314,7 +317,10 @@ fn resolve_ws_hwm(capacity: usize) -> usize {
     {
         return n.max(1);
     }
-    capacity.min(DEFAULT_WS_HWM)
+    match explicit {
+        Some(n) => n.max(1),
+        None => capacity.min(DEFAULT_WS_HWM),
+    }
 }
 
 /// Build one slot from a `LoggerTransport`: spawn its pump on `spawn_fn`, and
@@ -333,8 +339,9 @@ pub(crate) fn build_slot(
     let transport_format = transport.get_format();
     let overflow = transport.overflow_policy();
     let capacity = transport.queue_capacity();
+    let ws_hwm = resolve_ws_hwm(capacity, transport.ws_high_water_mark());
     let builder = transport.take_builder()?;
-    let writer = builder(Arc::clone(spawn_fn), resolve_ws_hwm(capacity));
+    let writer = builder(Arc::clone(spawn_fn), ws_hwm);
 
     let stats = stats_map
         .write()
