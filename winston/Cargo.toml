@@ -32,6 +32,10 @@ serial_test = "3.2.0"
 name = "logger_benchmark"
 harness = false
 
+[[bench]]
+name = "queue_depth"
+harness = false
+
 [profile.bench]
 debug = true
 
@@ -39,3 +43,7 @@ debug = true
 log-backend = ["log"]
 #log-backend-kv = ["log-backend", "log/kv"]
 log-backend-kv = ["log-backend", "log/kv_unstable"]
+# Benchmark-only: lets `queue_depth` override the per-slot WritableStream
+# high-water mark via the WINSTON_WS_HWM env var, to sweep WS depth
+# independently of the mailbox capacity. No effect in normal builds.
+internal-bench = []

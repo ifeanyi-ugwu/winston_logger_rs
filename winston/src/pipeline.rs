@@ -186,12 +186,20 @@ where
 pub type TransportWriterBuilder =
     Box<dyn FnOnce(SpawnFn, usize) -> Box<dyn ErasedWriter> + Send>;
 
-/// Default per-transport queue capacity. Applied to both the slot mailbox
-/// and the WritableStream's high-water mark when the transport doesn't
-/// override it via `LoggerTransport::with_queue_capacity`. Worst-case
-/// in-flight per transport is therefore ~2× this value (see ADR 0006 for why
-/// the WS queue is kept as deep as the mailbox rather than shrunk).
+/// Default per-transport mailbox capacity — the deep buffer that bears the
+/// slot's [`OverflowPolicy`]. Used when the transport doesn't override it via
+/// `LoggerTransport::with_queue_capacity`.
 pub const DEFAULT_TRANSPORT_QUEUE_CAPACITY: usize = 1024;
+
+/// WritableStream high-water mark for a slot, as a fixed cache-fit constant
+/// rather than the mailbox capacity. The WS queue is the pump↔controller
+/// throttle, not a policy buffer, and its sustained-throughput optimum is an
+/// absolute count ≈ `L1 / sizeof(FormattedEntry)` — independent of capacity.
+/// A shallow WS keeps the pump→controller handoff cache-warm; a deep one makes
+/// the controller read cold, evicted data. Capped below by the mailbox so a
+/// tiny `queue_capacity` is never out-deepened. See ADR 0007 and
+/// `docs/queue-depth-investigation.md`.
+pub(crate) const DEFAULT_WS_HWM: usize = 64;
 
 /// Construct the type-erased builder used by `LoggerTransport`.
 ///
@@ -293,13 +301,28 @@ async fn slot_pump(
 }
 
 
+/// The WritableStream high-water mark for a slot: the fixed cache-fit constant
+/// [`DEFAULT_WS_HWM`], capped below by the mailbox `capacity` so a tiny capacity
+/// is never out-deepened by the WS. Under the `internal-bench` feature a
+/// `WINSTON_WS_HWM` env var overrides it, so the `queue_depth` benchmark can
+/// sweep the WS depth independently of the mailbox; no effect in normal builds.
+fn resolve_ws_hwm(capacity: usize) -> usize {
+    #[cfg(feature = "internal-bench")]
+    if let Some(n) = std::env::var("WINSTON_WS_HWM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return n.max(1);
+    }
+    capacity.min(DEFAULT_WS_HWM)
+}
+
 /// Build one slot from a `LoggerTransport`: spawn its pump on `spawn_fn`, and
-/// wire both bounded buffers at the transport's `queue_capacity` — the mailbox
+/// wire its two bounded buffers — the mailbox at the transport's `queue_capacity`
 /// (sync front door, bearing the slot's `OverflowPolicy`) and the
-/// `WritableStream`'s high-water mark (the pump↔controller throttle, kept this
-/// deep on purpose — see ADR 0006). Returns `None` if the transport's writer
-/// builder was already consumed (e.g. a duplicate add) — that slot is silently
-/// skipped.
+/// `WritableStream` at [`resolve_ws_hwm`] (the shallow pump↔controller throttle).
+/// Returns `None` if the transport's writer builder was already consumed (e.g. a
+/// duplicate add) — that slot is silently skipped.
 pub(crate) fn build_slot(
     spawn_fn: &SpawnFn,
     stats_map: &TransportStatsMap,
@@ -311,7 +334,7 @@ pub(crate) fn build_slot(
     let overflow = transport.overflow_policy();
     let capacity = transport.queue_capacity();
     let builder = transport.take_builder()?;
-    let writer = builder(Arc::clone(spawn_fn), capacity);
+    let writer = builder(Arc::clone(spawn_fn), resolve_ws_hwm(capacity));
 
     let stats = stats_map
         .write()

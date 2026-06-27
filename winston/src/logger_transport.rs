@@ -68,16 +68,16 @@ impl LoggerTransport {
         self
     }
 
-    /// Set the per-transport queue capacity.
+    /// Set the per-transport **mailbox** capacity — the deep buffer the caller
+    /// dispatches into, which bears the slot's [`OverflowPolicy`]. This is the
+    /// burst-absorption depth: a `Block` slot parks the caller, and a `Drop`
+    /// slot starts dropping, once this many entries are in flight.
     ///
-    /// The value is applied to *both* bounded buffers between dispatch and
-    /// sink: the mailbox the caller dispatches into (which bears the slot's
-    /// [`OverflowPolicy`]) and the WritableStream's high-water mark the pump
-    /// enqueues against. Worst-case in-flight for this transport can therefore
-    /// reach ~2× this value under sustained saturation before the
-    /// [`OverflowPolicy`] kicks in; in steady state both buffers sit
-    /// near-empty. ADR 0006 records why the WS buffer is kept this deep rather
-    /// than shrunk.
+    /// The `WritableStream` behind the mailbox adds only a small fixed cache-fit
+    /// buffer (~64 entries, not a second copy of this value), so worst-case
+    /// in-flight is ~`capacity + 64`, not `2 × capacity`. In steady state both
+    /// sit near-empty. ADR 0007 and `docs/queue-depth-investigation.md` derive
+    /// why the WS depth is a fixed absolute rather than the mailbox capacity.
     ///
     /// Clamped to a minimum of 1. Defaults to
     /// [`DEFAULT_TRANSPORT_QUEUE_CAPACITY`].

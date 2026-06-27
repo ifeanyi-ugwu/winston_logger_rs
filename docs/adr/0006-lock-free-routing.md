@@ -109,6 +109,14 @@ Rejected — it regressed the common paths and bought no correctness:
 
 ### Single buffer / shallow WS high-water mark ("kill the 2×")
 
+> **Superseded by [ADR 0007](0007-shallow-writablestream-high-water-mark.md).**
+> The rejection below rests on a burst-then-flush benchmark whose fixed 1000-entry
+> burst manufactures a false "deeper is better" plateau. A purpose-built
+> *sustained* benchmark reversed it: shallow WS is the throughput optimum, the
+> knee is an absolute cache-fit count (not a fraction of capacity), and the WS HWM
+> is now `min(capacity, 64)`. See `docs/queue-depth-investigation.md`. The analysis
+> below is retained as the record of the artifact-laden first read.
+
 Per transport there are two bounded buffers in series — the mailbox (capacity N,
 bearing `OverflowPolicy`) and the WritableStream's internal queue (HWM also N).
 Shrinking the WS HWM to a small fixed depth would cut worst-case in-flight from
