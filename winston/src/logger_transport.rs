@@ -70,11 +70,14 @@ impl LoggerTransport {
 
     /// Set the per-transport queue capacity.
     ///
-    /// The value is applied to *both* layers between fanout and sink: the
-    /// mailbox the fanout dispatches into, and the WritableStream's
-    /// high-water mark the pump enqueues against. Total in-flight chunks
-    /// for this transport can therefore reach up to ~2× this value before
-    /// the slot's [`OverflowPolicy`] kicks in.
+    /// The value is applied to *both* bounded buffers between dispatch and
+    /// sink: the mailbox the caller dispatches into (which bears the slot's
+    /// [`OverflowPolicy`]) and the WritableStream's high-water mark the pump
+    /// enqueues against. Worst-case in-flight for this transport can therefore
+    /// reach ~2× this value under sustained saturation before the
+    /// [`OverflowPolicy`] kicks in; in steady state both buffers sit
+    /// near-empty. ADR 0006 records why the WS buffer is kept this deep rather
+    /// than shrunk.
     ///
     /// Clamped to a minimum of 1. Defaults to
     /// [`DEFAULT_TRANSPORT_QUEUE_CAPACITY`].

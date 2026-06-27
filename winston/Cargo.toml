@@ -11,6 +11,7 @@ keywords = ["winston", "logger", "logging"]
 categories = ["development-tools::debugging"]
 
 [dependencies]
+arc-swap = "1.7"
 chrono = "0.4.38"
 crossbeam-channel = "0.5.13"
 futures.workspace = true

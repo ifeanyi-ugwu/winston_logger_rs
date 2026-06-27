@@ -3,10 +3,11 @@ use crate::{
     logger_options::{LoggerOptions, OverflowPolicy},
     logger_transport::{IntoLoggerTransport, LoggerTransport},
     pipeline::{
-        self, close_slots_sync, BackpressureEvent, EventSenders, LoggerState, TransportStats,
-        TransportStatsInner, TransportStatsMap,
+        self, build_slot, close_slots_sync, BackpressureEvent, EventSenders, Routing,
+        TransportStats, TransportStatsInner, TransportStatsMap,
     },
 };
+use arc_swap::ArcSwap;
 use futures::channel::mpsc as fmpsc;
 use logform::LogInfo;
 use parking_lot::RwLock;
@@ -86,15 +87,19 @@ pub(crate) struct SharedState {
 pub struct Logger {
     pub(crate) shared_state: Arc<RwLock<SharedState>>,
 
-    /// Per-slot mailboxes + format/level/levels + spawn_fn. Held behind a
-    /// `RwLock` so `log()` reads a cheap `Arc`-snapshot, drops the lock, and
-    /// dispatches *without* the lock — a `Block`-policy `push_blocking`
-    /// parking the caller doesn't stall admin operations.
-    state: Arc<RwLock<LoggerState>>,
+    /// Immutable routing (slots + global format/level/levels) behind an
+    /// `ArcSwap`. `log()` does one lock-free `load_full` and dispatches against
+    /// it — no slot-list copy, no lock — so a `Block`-policy park can't stall
+    /// admin operations. Mutations rebuild a `Routing` and `store` it.
+    routing: ArcSwap<Routing>,
 
-    /// Entries logged before any transport was admitted. Also held by
-    /// `LoggerState` (same `Arc`); kept on the Logger for direct access
-    /// from tests and any future query path.
+    /// Serialises admin operations (add/remove/configure/close) that rebuild
+    /// and `store` the routing. `log()` never takes it.
+    admin_lock: parking_lot::Mutex<()>,
+
+    /// Entries logged before any transport was admitted. Also held by the
+    /// `Routing` (same `Arc`); kept on the Logger for direct access from
+    /// tests and any future query path.
     pub(crate) buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
 
     is_closed: AtomicBool,
@@ -111,10 +116,10 @@ pub struct Logger {
     /// drains. Same spawner the per-slot pumps use internally.
     spawn_fn: pipeline::SpawnFn,
 
-    /// Per-transport counters, shared with `LoggerState` (same `Arc`).
+    /// Per-transport counters, shared with each slot (same `Arc`).
     pub(crate) stats_map: TransportStatsMap,
 
-    /// Live `BackpressureEvent` subscribers, shared with `LoggerState`.
+    /// Live `BackpressureEvent` subscribers, shared with the `Routing` (same `Arc`).
     pub(crate) event_senders: EventSenders,
 }
 
@@ -157,21 +162,23 @@ impl Logger {
             }
         }
 
-        let mut state = LoggerState::new(
-            Arc::clone(&spawn_fn),
+        // Build initial slots inline (no message-passing). Each `build_slot`
+        // spawns the per-slot pump task on `spawn_fn`.
+        let mut slots = Vec::new();
+        for (handle, transport) in options.transports.clone().unwrap_or_default() {
+            if let Some(slot) = build_slot(&spawn_fn, &stats_map, handle, transport) {
+                slots.push(slot);
+            }
+        }
+
+        let routing = ArcSwap::from_pointee(Routing::new(
+            slots,
             options.format.clone(),
             options.level.clone(),
             options.levels.clone(),
             Arc::clone(&buffer),
-            Arc::clone(&stats_map),
             Arc::clone(&event_senders),
-        );
-
-        // Admit initial transports inline (no message-passing). Each
-        // `admit` spawns the per-slot pump task on `spawn_fn`.
-        for (handle, transport) in options.transports.clone().unwrap_or_default() {
-            state.admit(handle, transport);
-        }
+        ));
 
         let severity_cache = min_required_severity.unwrap_or(u8::MAX);
 
@@ -183,7 +190,8 @@ impl Logger {
 
         Logger {
             shared_state,
-            state: Arc::new(RwLock::new(state)),
+            routing,
+            admin_lock: parking_lot::Mutex::new(()),
             buffer,
             is_closed: AtomicBool::new(false),
             min_required_severity_cache: AtomicU8::new(severity_cache),
@@ -271,8 +279,7 @@ impl Logger {
         if !self.is_level_enabled(&entry.level) {
             return;
         }
-        let snapshot = self.state.read().snapshot();
-        snapshot.process_entry(Arc::new(entry));
+        self.routing.load_full().process_entry(Arc::new(entry));
     }
 
     /// Constructs and logs an entry only if the level passes the filter.
@@ -287,8 +294,7 @@ impl Logger {
     /// decided the entry is interesting and wants the dispatch path
     /// without re-checking.
     pub fn logi(&self, entry: LogInfo) {
-        let snapshot = self.state.read().snapshot();
-        snapshot.process_entry(Arc::new(entry));
+        self.routing.load_full().process_entry(Arc::new(entry));
     }
 
     /// Synchronous flush: send a `Flush` barrier into every slot's mailbox
@@ -298,8 +304,7 @@ impl Logger {
         if self.is_closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let snapshot = self.state.read().snapshot();
-        snapshot.flush_all_sync();
+        self.routing.load_full().flush_all_sync();
         Ok(())
     }
 
@@ -310,19 +315,16 @@ impl Logger {
         if self.is_closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        let _admin = self.admin_lock.lock();
+        let cur = self.routing.load_full();
         // Flush first so any in-flight entries hit the sink before close.
-        let snapshot = self.state.read().snapshot();
-        snapshot.flush_all_sync();
-        drop(snapshot);
-
-        // Take ownership of the slots out of state under the write lock,
-        // drop the lock, then close each in parallel (close_slots_sync
-        // blocks on pump_done — must not hold the state lock across it).
-        let drained = {
-            let mut state = self.state.write();
-            state.drain_slots()
-        };
-        close_slots_sync(drained, &self.stats_map);
+        cur.flush_all_sync();
+        // Publish an empty slot list, then close the old slots outside any
+        // lock (close_slots_sync blocks on pump_done).
+        let old_slots = cur.slots.clone();
+        self.routing.store(Arc::new(cur.with_slots(Vec::new())));
+        drop(cur);
+        close_slots_sync(old_slots, &self.stats_map);
     }
 
     /// Drain past entries matching `options` from every queryable transport.
@@ -411,20 +413,28 @@ impl Logger {
             .entry(handle)
             .or_insert_with(|| Arc::new(TransportStatsInner::default()));
 
-        // Admit the slot directly (no message-passing).
-        let was_first = {
-            let mut state = self.state.write();
-            let was_first = state.slots.is_empty();
-            state.admit(handle, logger_transport);
-            was_first
+        // Admit the slot: build it, then publish a routing with it appended.
+        let (was_first, added) = {
+            let _admin = self.admin_lock.lock();
+            let cur = self.routing.load_full();
+            let was_first = cur.slots.is_empty();
+            let added = if let Some(slot) =
+                build_slot(&self.spawn_fn, &self.stats_map, handle, logger_transport)
+            {
+                let mut slots = cur.slots.clone();
+                slots.push(slot);
+                self.routing.store(Arc::new(cur.with_slots(slots)));
+                true
+            } else {
+                false
+            };
+            (was_first, added)
         };
 
         // First-slot admit: drain any pre-transport buffer through it.
-        // Done outside the write lock so a slow Block sink doesn't stall
-        // the admin path.
-        if was_first {
-            let snapshot = self.state.read().snapshot();
-            snapshot.drain_buffer_to_slots();
+        // Done outside the admin lock so a slow Block sink doesn't stall it.
+        if was_first && added {
+            self.routing.load_full().drain_buffer_to_slots();
         }
 
         handle
@@ -477,16 +487,24 @@ impl Logger {
             return false;
         }
 
-        // Take the matching slot out under the write lock, drop the lock,
-        // then close it (close blocks on pump_done — never hold a lock
-        // across it).
+        // Publish a routing without the matching slot, then close it outside
+        // the admin lock (close blocks on pump_done).
         let taken = {
-            let mut state = self.state.write();
-            if let Some(pos) = state.slots.iter().position(|s| s.handle == handle) {
-                Some(state.slots.remove(pos))
-            } else {
-                None
+            let _admin = self.admin_lock.lock();
+            let cur = self.routing.load_full();
+            let mut taken = None;
+            let mut kept = Vec::with_capacity(cur.slots.len());
+            for slot in &cur.slots {
+                if taken.is_none() && slot.handle == handle {
+                    taken = Some(Arc::clone(slot));
+                } else {
+                    kept.push(Arc::clone(slot));
+                }
             }
+            if taken.is_some() {
+                self.routing.store(Arc::new(cur.with_slots(kept)));
+            }
+            taken
         };
         if let Some(slot) = taken {
             close_slots_sync(vec![slot], &self.stats_map);
@@ -566,30 +584,45 @@ impl Logger {
                 }
             }
 
-            // Drain old slots, update routing, admit new slots — all under the
-            // write lock, then close old slots outside it.
+            // Build new slots, publish the new routing, then close old slots
+            // outside the admin lock (close blocks on pump_done).
             let old_slots = {
-                let mut state = self.state.write();
-                let old = state.drain_slots();
-                state.global_format = format;
-                state.global_level = level;
-                state.levels = levels;
+                let _admin = self.admin_lock.lock();
+                let cur = self.routing.load_full();
+                let old_slots = cur.slots.clone();
+                let mut slots = Vec::new();
                 for (h, t) in new_transports {
-                    state.admit(h, t);
+                    if let Some(slot) = build_slot(&self.spawn_fn, &self.stats_map, h, t) {
+                        slots.push(slot);
+                    }
                 }
-                old
+                self.routing.store(Arc::new(Routing::new(
+                    slots,
+                    format,
+                    level,
+                    levels,
+                    Arc::clone(&self.buffer),
+                    Arc::clone(&self.event_senders),
+                )));
+                old_slots
             };
             close_slots_sync(old_slots, &self.stats_map);
 
             // Drain any pre-transport buffer through the new slot list.
-            let snapshot = self.state.read().snapshot();
-            snapshot.drain_buffer_to_slots();
+            self.routing.load_full().drain_buffer_to_slots();
         } else {
-            // Transports unchanged: propagate routing changes without touching slots.
-            let mut state = self.state.write();
-            state.global_format = format;
-            state.global_level = level;
-            state.levels = levels;
+            // Transports unchanged: republish routing with new format/level/levels,
+            // reusing the live slot list.
+            let _admin = self.admin_lock.lock();
+            let cur = self.routing.load_full();
+            self.routing.store(Arc::new(Routing::new(
+                cur.slots.clone(),
+                format,
+                level,
+                levels,
+                Arc::clone(&self.buffer),
+                Arc::clone(&self.event_senders),
+            )));
         }
     }
 

@@ -188,7 +188,9 @@ pub type TransportWriterBuilder =
 
 /// Default per-transport queue capacity. Applied to both the slot mailbox
 /// and the WritableStream's high-water mark when the transport doesn't
-/// override it via `LoggerTransport::with_queue_capacity`.
+/// override it via `LoggerTransport::with_queue_capacity`. Worst-case
+/// in-flight per transport is therefore ~2× this value (see ADR 0006 for why
+/// the WS queue is kept as deep as the mailbox rather than shrunk).
 pub const DEFAULT_TRANSPORT_QUEUE_CAPACITY: usize = 1024;
 
 /// Construct the type-erased builder used by `LoggerTransport`.
@@ -216,8 +218,9 @@ where
 }
 
 
-/// Message sent from the fanout to a slot's pump task.
-enum SlotMessage {
+/// Message sent from the dispatch path to a slot's pump task.
+pub(crate) enum SlotMessage {
+    /// A fully-rendered entry (format applied on the caller at dispatch).
     Entry(FormattedEntry),
     /// Barrier: pump processes prior `Entry` messages, drains until the
     /// stream is ready, then acks. Used to implement logger-level flush.
@@ -254,15 +257,18 @@ pub(crate) struct TransportSlot {
 
 /// The per-transport pump task.
 ///
-/// Owns the slot's writer and drains the mailbox in order. Entries go
-/// through `enqueue_when_ready` — the pump parks when the WritableStream's
-/// queue hits its high-water mark, so the HWM does real work and chunks
-/// pipeline through the sink instead of being serialised on completion.
+/// Owns the slot's writer and drains the mailbox in order. For each entry it
+/// runs the finalizer (the render the caller deferred), then hands the
+/// resulting `FormattedEntry` to `enqueue_when_ready` — the pump parks when the
+/// WritableStream's queue hits its high-water mark, so chunks pipeline through
+/// the sink instead of being serialised on completion. Rendering here keeps it
+/// off the caller's thread, parallel across transports, and skipped for any
+/// entry dropped at the mailbox boundary.
 ///
 /// `Flush` translates to `writer.flush()`, which awaits every queued and
 /// in-flight chunk against the sink without tearing the stream down. The
-/// pump is policy-agnostic — `OverflowPolicy` only governs the fanout's
-/// dispatch on a full mailbox.
+/// pump is policy-agnostic — `OverflowPolicy` only governs the dispatch path's
+/// behaviour on a full mailbox.
 async fn slot_pump(
     mut mailbox_rx: MailboxReceiver<SlotMessage>,
     writer: Box<dyn ErasedWriter>,
@@ -287,14 +293,57 @@ async fn slot_pump(
 }
 
 
-/// The Logger's runtime state. Owned by `Logger` behind a
-/// `parking_lot::RwLock`: `log()` takes a read lock, snapshots the slot
-/// list (cheap `Arc` clones), and dispatches *without* holding the lock,
-/// so a `Block`-policy `push_blocking` parking the producer doesn't
-/// stall admin operations. Admin operations (add/remove/configure/close)
-/// take the write lock.
-pub(crate) struct LoggerState {
-    pub(crate) spawn_fn: SpawnFn,
+/// Build one slot from a `LoggerTransport`: spawn its pump on `spawn_fn`, and
+/// wire both bounded buffers at the transport's `queue_capacity` — the mailbox
+/// (sync front door, bearing the slot's `OverflowPolicy`) and the
+/// `WritableStream`'s high-water mark (the pump↔controller throttle, kept this
+/// deep on purpose — see ADR 0006). Returns `None` if the transport's writer
+/// builder was already consumed (e.g. a duplicate add) — that slot is silently
+/// skipped.
+pub(crate) fn build_slot(
+    spawn_fn: &SpawnFn,
+    stats_map: &TransportStatsMap,
+    handle: TransportHandle,
+    transport: LoggerTransport,
+) -> Option<Arc<TransportSlot>> {
+    let level = transport.get_level().cloned();
+    let transport_format = transport.get_format();
+    let overflow = transport.overflow_policy();
+    let capacity = transport.queue_capacity();
+    let builder = transport.take_builder()?;
+    let writer = builder(Arc::clone(spawn_fn), capacity);
+
+    let stats = stats_map
+        .write()
+        .unwrap()
+        .entry(handle)
+        .or_insert_with(|| Arc::new(TransportStatsInner::default()))
+        .clone();
+
+    let (mailbox_tx, mailbox_rx) = mailbox::channel::<SlotMessage>(capacity);
+    let (done_tx, done_rx) = oneshot::channel();
+    let pump = slot_pump(mailbox_rx, writer, done_tx);
+    spawn_fn(Box::pin(pump));
+
+    Some(Arc::new(TransportSlot {
+        handle,
+        level,
+        transport_format,
+        overflow,
+        mailbox_tx,
+        pump_done: parking_lot::Mutex::new(Some(done_rx)),
+        stats,
+        was_saturated: AtomicBool::new(false),
+    }))
+}
+
+/// Immutable routing state for the hot dispatch path. Held by `Logger`
+/// behind an `ArcSwap`: `log()` does a single lock-free `load_full`, then
+/// dispatches against the loaded `Routing`. A `Block`-policy park holds only
+/// this `Arc`, never a lock, so a parked producer can't stall admin
+/// operations. Admin operations rebuild a `Routing` and `store` it under a
+/// serialising mutex.
+pub(crate) struct Routing {
     pub(crate) slots: Vec<Arc<TransportSlot>>,
     pub(crate) global_format: Option<Arc<FormatPipeline>>,
     pub(crate) global_level: Option<String>,
@@ -302,80 +351,34 @@ pub(crate) struct LoggerState {
     /// Entries logged before any transport was admitted. Drained into the
     /// slots the moment the first transport arrives.
     pub(crate) buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-    pub(crate) stats_map: TransportStatsMap,
     pub(crate) event_senders: EventSenders,
 }
 
-impl LoggerState {
+impl Routing {
     pub(crate) fn new(
-        spawn_fn: SpawnFn,
+        slots: Vec<Arc<TransportSlot>>,
         global_format: Option<Arc<FormatPipeline>>,
         global_level: Option<String>,
         levels: Option<LoggerLevels>,
         buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-        stats_map: TransportStatsMap,
         event_senders: EventSenders,
     ) -> Self {
         Self {
-            spawn_fn,
-            slots: Vec::new(),
+            slots,
             global_format,
             global_level,
             levels,
             buffer,
-            stats_map,
             event_senders,
         }
     }
 
-    /// Build a slot from a `LoggerTransport` and push it onto the list.
-    /// Caller is responsible for triggering `drain_buffer_locked` after
-    /// admit if this is the first slot (so pre-transport entries land).
-    pub(crate) fn admit(
-        &mut self,
-        handle: TransportHandle,
-        transport: LoggerTransport,
-    ) {
-        let level = transport.get_level().cloned();
-        let transport_format = transport.get_format();
-        let overflow = transport.overflow_policy();
-        let capacity = transport.queue_capacity();
-        let Some(builder) = transport.take_builder() else {
-            return; // Already consumed (e.g. duplicate add) — ignore silently.
-        };
-        let writer = builder(Arc::clone(&self.spawn_fn), capacity);
-
-        let stats = self
-            .stats_map
-            .write()
-            .unwrap()
-            .entry(handle)
-            .or_insert_with(|| Arc::new(TransportStatsInner::default()))
-            .clone();
-
-        let (mailbox_tx, mailbox_rx) = mailbox::channel::<SlotMessage>(capacity);
-        let (done_tx, done_rx) = oneshot::channel();
-        let pump = slot_pump(mailbox_rx, writer, done_tx);
-        (self.spawn_fn)(Box::pin(pump));
-
-        self.slots.push(Arc::new(TransportSlot {
-            handle,
-            level,
-            transport_format,
-            overflow,
-            mailbox_tx,
-            pump_done: parking_lot::Mutex::new(Some(done_rx)),
-            stats,
-            was_saturated: AtomicBool::new(false),
-        }));
-    }
-
-    /// Snapshot the slot list and global format/level/levels. Cheap (Arc
-    /// clones); held *only* during the snapshot itself, then released so
-    /// dispatch happens lock-free.
-    pub(crate) fn snapshot(&self) -> StateSnapshot {
-        StateSnapshot {
-            slots: self.slots.clone(),
+    /// Clone the routing with a different slot list, reusing the (small)
+    /// global format/level/levels and the shared buffer/event_senders. Used
+    /// by `add`/`remove`/`close` to publish a new slot list.
+    pub(crate) fn with_slots(&self, slots: Vec<Arc<TransportSlot>>) -> Self {
+        Self {
+            slots,
             global_format: self.global_format.clone(),
             global_level: self.global_level.clone(),
             levels: self.levels.clone(),
@@ -384,28 +387,6 @@ impl LoggerState {
         }
     }
 
-    /// Take Close-receivers for the current slots so `Drop` can join them
-    /// without holding the state lock. Used during shutdown when the
-    /// caller already owns `&mut self`.
-    pub(crate) fn drain_slots(&mut self) -> Vec<Arc<TransportSlot>> {
-        std::mem::take(&mut self.slots)
-    }
-}
-
-/// Read-only snapshot of `LoggerState` taken under a brief lock. All
-/// dispatch and admin-blocking operations work against the snapshot, so
-/// the actual `LoggerState` lock isn't held across `push_blocking` or
-/// other potentially-parking primitives.
-pub(crate) struct StateSnapshot {
-    pub(crate) slots: Vec<Arc<TransportSlot>>,
-    pub(crate) global_format: Option<Arc<FormatPipeline>>,
-    pub(crate) global_level: Option<String>,
-    pub(crate) levels: Option<LoggerLevels>,
-    pub(crate) buffer: Arc<Mutex<VecDeque<Arc<LogInfo>>>>,
-    pub(crate) event_senders: EventSenders,
-}
-
-impl StateSnapshot {
     fn passes_level(&self, entry_level: &str, transport_level: Option<&String>) -> bool {
         let levels = match &self.levels {
             Some(l) => l,
@@ -425,6 +406,9 @@ impl StateSnapshot {
         }
     }
 
+    /// Render an entry for one slot: the slot's own format if set, else the
+    /// global format, else passthrough. Returns `None` when a transform in the
+    /// pipeline drops the entry.
     fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<FormattedEntry> {
         match (&slot.transport_format, &self.global_format) {
             (Some(tf), _) => tf.apply(entry.clone()),
@@ -435,10 +419,10 @@ impl StateSnapshot {
 
     /// Synchronously dispatch one entry across every slot. Two phases:
     ///
-    /// 1. Non-blocking `try_push` to every slot whose level admits the
-    ///    entry. Slots with room get it immediately. Drop policies
-    ///    (`DropNewest` / `DropOldest`) resolve in this phase too. Only
-    ///    `Block`-policy slots whose mailbox is full are deferred.
+    /// 1. Render at log-time and non-blocking `try_push` to every slot whose
+    ///    level admits the entry. Slots with room get it immediately. Drop
+    ///    policies (`DropNewest` / `DropOldest`) resolve in this phase too.
+    ///    Only `Block`-policy slots whose mailbox is full are deferred.
     ///
     /// 2. For each deferred `Block` slot, `push_blocking` parks the
     ///    calling thread until that slot has room. Other transports are
@@ -455,16 +439,17 @@ impl StateSnapshot {
     /// considered and rejected (adds executor cost without a
     /// corresponding semantic improvement).
     pub(crate) fn dispatch_entry(&self, entry: &Arc<LogInfo>) {
-        let mut deferred_blocks: Vec<(usize, SlotMessage)> =
-            Vec::with_capacity(self.slots.len());
+        let mut deferred_blocks: Vec<(usize, SlotMessage)> = Vec::new();
 
-        // Phase 1: try-push to every eligible slot.
+        // Phase 1: render at log-time, try-push to every eligible slot.
         for (idx, slot) in self.slots.iter().enumerate() {
             if !self.passes_level(&entry.level, slot.level.as_ref()) {
                 continue;
             }
-            let Some(formatted) = self.format_for(slot, entry) else { continue };
-            if let Some(deferred) = self.try_push_to_slot(slot, formatted) {
+            let Some(formatted) = self.format_for(slot, entry) else {
+                continue;
+            };
+            if let Some(deferred) = self.try_push_to_slot(slot, SlotMessage::Entry(formatted)) {
                 deferred_blocks.push((idx, deferred));
             }
         }
@@ -478,13 +463,13 @@ impl StateSnapshot {
         }
     }
 
-    /// Non-blocking push to a single slot. Returns `Some(msg)` only when
-    /// the slot is `Block`-policy and the mailbox is full — caller must
-    /// then call `push_blocking` in phase 2. Returns `None` on any other
-    /// outcome (success, drop policy, slot torn down) — all of which the
-    /// caller treats as "done" for this slot.
-    fn try_push_to_slot(&self, slot: &TransportSlot, entry: FormattedEntry) -> Option<SlotMessage> {
-        match slot.mailbox_tx.try_push(SlotMessage::Entry(entry)) {
+    /// Non-blocking push of a prepared `Entry` message to a single slot.
+    /// Returns `Some(msg)` only when the slot is `Block`-policy and the
+    /// mailbox is full — caller must then call `push_blocking` in phase 2.
+    /// Returns `None` on any other outcome (success, drop policy, slot torn
+    /// down) — all of which the caller treats as "done" for this slot.
+    fn try_push_to_slot(&self, slot: &TransportSlot, msg: SlotMessage) -> Option<SlotMessage> {
+        match slot.mailbox_tx.try_push(msg) {
             Ok(()) => {
                 slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
                 if slot.was_saturated.swap(false, Ordering::Relaxed) {
