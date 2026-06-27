@@ -1,24 +1,27 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use logform::LogInfo;
+use logform::{FormattedEntry, LogInfo};
 use std::sync::Arc;
+use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
 use winston::Logger;
+use winston_transport::Transport;
 
 fn benchmark_logging(c: &mut Criterion) {
     // 1. Measure just the logger overhead (no real I/O)
     let mut group = c.benchmark_group("logger_overhead");
 
-    // Mock transport that does nothing (measures pure logger speed)
+    // Sink that discards every entry (measures pure logger speed).
     #[derive(Clone)]
     struct NoOpTransport;
-    impl winston_transport::Transport<LogInfo> for NoOpTransport {
-        fn log(&self, _info: LogInfo) {}
-        fn flush(&self) -> Result<(), String> {
+    impl WritableSink<FormattedEntry> for NoOpTransport {
+        async fn write(
+            &mut self,
+            _entry: FormattedEntry,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
             Ok(())
         }
-        fn query(&self, _: &winston_transport::LogQuery) -> Result<Vec<LogInfo>, String> {
-            Ok(vec![])
-        }
     }
+    impl Transport for NoOpTransport {}
 
     group.throughput(Throughput::Elements(1000));
     group.bench_function("noop_transport", |b| {
