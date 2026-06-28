@@ -1,6 +1,7 @@
 # ADR 0008 — Two-pass format composition
 
-**Status:** Proposed (designed; not yet implemented)
+**Status:** Accepted (decisions locked by the pressure-test below; implementation
+pending)
 
 ## Context
 
@@ -164,6 +165,63 @@ output divergence**, and it generalizes to two classes:
 Both classes are the same root cause — single-render vs render-at-every-stage —
 and the same trade that buys the skipped renders in rows 2–4.
 
+## Validation — the finalizer-rule pressure-test
+
+Before building, the rule was swept across *every* shape, not just the four design
+rows. A `FormatPipeline` is one of four shapes — `None`, transforms-only
+(`Gt`/`Tt`), finalizer-only (`Gf`/`Tf`), both (`Gtf`/`Ttf`). Effective
+`(transforms, finalizer)` for all sixteen `global × transport` combinations:
+
+| T ↓ \ G → | `None` | `Gt` (transforms) | `Gf` (finalizer) | `Gtf` (both) |
+|---|---|---|---|---|
+| **`None`** | passthrough | `(Gt, —)` | `(—, Gf)` | `(Gt, Gf)` *inherit* |
+| **`Tt`** (transforms-only) | `(Tt, —)` | `(Gt∘Tt, —)` | `(Tt, —)` ⚠ | `(Gt∘Tt, —)` ⚠ |
+| **`Tf`** (finalizer-only) | `(—, Tf)` | `(Gt, Tf)` ✦ | `(—, Tf)` | `(Gt, Tf)` |
+| **`Ttf`** (both) | `(Tt, Tf)` | `(Gt∘Tt, Tf)` | `(Tt, Tf)` | `(Gt∘Tt, Tf)` |
+
+- **`Tf` / `Ttf` rows** (transport has its own finalizer): global transforms ride
+  along, transport finalizer wins — all clean, all the footgun-fix. The `✦` cell
+  (`Gt` global + `Tf` transport) is the pattern Winston users reach for: a global
+  `timestamp().into_pipeline()` of shared enrichment, each transport picking its
+  own finalizer (`console=simple`, `file=json`).
+- **`None` row**: pure inheritance.
+- **The two `⚠` cells** — `Tt` (transforms-only transport) over a global that *has*
+  a finalizer (`Gf`/`Gtf`): the global finalizer is **dropped**. The only cells
+  that need thought.
+
+Drilling `Tt × Gtf` — global `timestamp()+json()`, transport
+`colorize().into_pipeline()`:
+
+- **Structured sink:** `(timestamp∘colorize, None)` → `rendered: None`, reads
+  `info` — gets the timestamp, no wasted render. Correct, and the point of the
+  rule.
+- **String sink:** same effective → `Display` fallback (colorized, not json). This
+  is Row 5.
+
+The settling point: **this is not a regression.** Today's replace-semantics
+already drops the global finalizer in this cell — `(colorize, None)`; the rule's
+only *change* is that it now **adds** the global transforms (`Gt∘Tt`). So the cell
+goes from "drops everything global" → "keeps global transforms, drops global
+finalizer" — strictly better than current, still divergent from Winston.
+**Accepted, documented.** No sink-type knob: the rule cannot tell a string sink
+from a structured one (the sink chooses what to read), and trying to would
+re-introduce the structured-sink render waste.
+
+**Verdict:** sixteen shapes, exactly two cells need thought, both
+defensible-and-documented, no case produces wrong output. The rule holds.
+
+Three things the sweep surfaced to document (not decide):
+
+- A structured sink with **no** format inherits the global finalizer → renders a
+  string it ignores. The structured-sinks-never-render guarantee is *opt-in*: it
+  requires the sink to carry a transforms-only effective format. Same as today.
+- **Reconfigure freshness** (implementation): the effective pipeline depends on
+  `global_format`, which `configure` can swap without rebuilding slots — so compute
+  it in `format_for` (always fresh; composition is just assembling `Arc` handles)
+  or invalidate a per-slot cache on global change.
+- **Level gating** uses the pre-format level; a transform that rewrites `level`
+  does not affect the gate. Pre-existing, unchanged by two-pass.
+
 ## Invariants
 
 1. **Structured sinks never render** (ADR 0005) — preserved by the
@@ -183,9 +241,9 @@ and the same trade that buys the skipped renders in rows 2–4.
   (`format: json()`, the common setup) → **no change** (nothing to compose). Global
   with transforms + a transport format → that transport now also gets the global
   transforms — almost always the author's intent. Ship with a changelog note.
-- **Render count is per-slot.** Row 1 with three inherit-transports is 3 renders
-  here vs Winston's 1 (Winston renders upstream once and fans out the same
-  rendered `info`). See the dedup follow-up.
+- **Renders stay per-slot** until Layer 2 of the dedup (below): Row 1 with three
+  inherit-transports renders 3× here vs Winston's 1×. The *transform* passes,
+  however, drop to one with Layer 1, which lands with this change.
 - **logform** grows a small `compose`/`then` that builds the effective pipeline per
   the rule — exposing the `transforms` / `finalizer` seam it already has.
 - **`format_for`** builds the effective pipeline from `global_format` +
@@ -193,19 +251,36 @@ and the same trade that buys the skipped renders in rows 2–4.
   recomputed only when `global_format` changes (`configure`, rare), so there is no
   per-`log()` cost.
 
-### Follow-up: global-render-once dedup
+### The dedup: two layers, one bundled and one deferred
 
-`format_for` runs per slot, so a global `timestamp()` across N transports computes
-N timestamps (microseconds apart) and, for inherit-slots, renders the global
-finalizer N times. Running the **global transforms once**, sharing the enriched
-`Arc<LogInfo>`, then per-slot running only the transport transforms + finalize,
-recovers three things: **one timestamp** per event across all transports (a real
-consistency fix), **consistent global filtering** (a stateful/sampling global
-transform decides once), and **fewer passes** (and for inherit-slots, dedups the
-finalizer too — Winston's single-upstream-render). This is *not* the rejected
-finalize-at-pump (ADR 0006): render stays on the caller, so there is no pump-funnel.
-It is a separable refinement, taken after the composition semantics land
-reviewable on their own.
+`format_for` runs per slot, so the **global transforms run once per transport**.
+For *deterministic* transforms (`timestamp`, `label`) that is redundant work plus
+microsecond-divergent timestamps; for a *non-deterministic* global transform — a
+sampling / rate-limit filter that returns `None` to drop — it is an
+**inconsistency**: the entry can be dropped on one transport and kept on another.
+So deduping the global stage is not purely a perf optimization — its absence is a
+**correctness wart**, which is why it splits into two layers with different
+schedules:
+
+- **Layer 1 — the two-stage split (bundled with this change).** Run the global
+  transforms **once**, before the fan-out, producing one enriched `LogInfo`; then
+  per slot run only the transport transforms + finalize. Buys **one timestamp**
+  per event across all transports, **one** decision from a non-deterministic
+  global transform (consistency from day one), and **N−1 fewer** global-transform
+  passes. A global-transform drop up front cleanly skips every slot; a transport
+  transform drop skips only its slot. Cheap, and it removes the wart — so it lands
+  *with* the composition semantics, not after.
+- **Layer 2 — sharing without re-cloning or re-rendering (deferred, not a
+  blocker).** With the enriched info — and, for a pure inherit-slot, the whole
+  rendered `FormattedEntry` — behind an `Arc`, those slots *borrow* instead of
+  cloning and re-rendering (Winston's "render upstream once, fan out the same
+  info"). This needs `FormattedEntry.info` (or `FormattedEntry` itself) to become
+  `Arc`-shared, which ripples to every sink, so it is its own change — taken when
+  convenient, with no correctness consequence to deferring it.
+
+Neither layer is the rejected finalize-at-pump (ADR 0006): rendering stays on the
+caller thread; only the *timing* of the shared transform stage moves (once, up
+front, vs N times in the loop). No pump-funnel.
 
 ## Alternatives considered and rejected
 
@@ -218,16 +293,27 @@ reviewable on their own.
   waste.
 - **"Replace, don't compose" opt-out.** Winston has none, and the case is already
   served by setting a full transport pipeline. Deferred unless a real need appears.
-- **Dedup now.** Folded into the same change. Deferred so the semantics are
-  reviewable independently.
+- **Fully deferring the dedup.** Rejected for Layer 1: shipping per-slot global
+  transforms leaves the consistency wart for non-deterministic global transforms
+  (see the pressure-test). Layer 1 is bundled; only Layer 2 (the `Arc` clone /
+  re-render elimination) is deferred, since deferring it has no correctness cost.
 
-## Open decisions to confirm at implementation
+## Decisions (locked by the pressure-test)
 
 - **Transform order** — global-then-transport (shared context like `timestamp` /
-  `label` established before transport-specific `colorize`). Recommended.
-- **Finalizer rule** — transport-authoritative-when-present, else inherit. The
-  load-bearing decision; the structured-sink-safe choice above. Recommended.
-- **Dedup** — as the fast follow, not in the first change.
+  `label` established before transport-specific `colorize`). **Accepted.**
+- **Finalizer rule** — transport-authoritative-when-present, else inherit.
+  **Accepted** — confirmed sound by the sixteen-shape sweep; the two `⚠` cells are
+  better-than-current and documented divergences from Winston, not regressions.
+- **No opt-out** — a transport that wants replace-semantics sets a full pipeline.
+  **Accepted.**
+- **Dedup** — Layer 1 (two-stage split) **bundled** with this change, for
+  consistency from day one; Layer 2 (`Arc`-in-`FormattedEntry`) **deferred** as a
+  non-blocking follow-up.
+
+Implementation is now mechanical: compose in `format_for` per the rule, hoist the
+global-transform stage out of the slot loop (Layer 1), and carry the three
+documented divergences into the changelog.
 
 ## References
 
