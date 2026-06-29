@@ -277,6 +277,14 @@ schedules:
   `Arc`-shared, which ripples to every sink, so it is its own change — taken when
   convenient, with no correctness consequence to deferring it.
 
+  Measured before building (`logger_benchmark`'s `fanout_render` vs
+  `fanout_passthrough`): the per-slot render is ~30–58% of per-log cost, and only
+  at 4–8 inherit-transports — rare. The dominant multi-transport cost is the
+  fan-out coordination, which Layer 2 does not address; and the no-sink-ripple
+  form of Layer 2 only trades renders for `String` clones (marginal, and a slight
+  regression at one transport). So Layer 2 stays deferred until a many-inherit-
+  transport workload makes the render-dedup pay.
+
 Neither layer is the rejected finalize-at-pump (ADR 0006): rendering stays on the
 caller thread; only the *timing* of the shared transform stage moves (once, up
 front, vs N times in the loop). No pump-funnel.
