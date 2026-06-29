@@ -436,23 +436,41 @@ impl Routing {
         }
     }
 
-    /// Render an entry for one slot: the slot's own format if set, else the
-    /// global format, else passthrough. Returns `None` when a transform in the
-    /// pipeline drops the entry.
-    fn format_for(&self, slot: &TransportSlot, entry: &LogInfo) -> Option<FormattedEntry> {
-        match (&slot.transport_format, &self.global_format) {
-            (Some(tf), _) => tf.apply(entry.clone()),
-            (None, Some(gf)) => gf.apply(entry.clone()),
-            (None, None) => Some(FormattedEntry::new(entry.clone(), None)),
+    /// Stage 2 of the two-pass format: compose the transport's format on top of
+    /// the already-global-*transformed* `enriched` entry and finalize it for one
+    /// slot (ADR 0008). The global *transforms* have already run once, in
+    /// `dispatch_entry`'s stage 1; only the transport-specific work happens here.
+    ///
+    /// - **Transport has a format** → run its transforms over `enriched`, then its
+    ///   finalizer (authoritative, `None` included). Returns `None` if a transport
+    ///   transform drops the entry.
+    /// - **No transport format** → inherit the global finalizer (its transforms
+    ///   already ran); with no global finalizer either, passthrough.
+    fn format_for(&self, slot: &TransportSlot, enriched: &LogInfo) -> Option<FormattedEntry> {
+        match &slot.transport_format {
+            Some(tf) => Some(tf.finalize(tf.transform(enriched.clone())?)),
+            None => match &self.global_format {
+                Some(gf) => Some(gf.finalize(enriched.clone())),
+                None => Some(FormattedEntry::new(enriched.clone(), None)),
+            },
         }
     }
 
-    /// Synchronously dispatch one entry across every slot. Two phases:
+    /// Synchronously dispatch one entry across every slot.
     ///
-    /// 1. Render at log-time and non-blocking `try_push` to every slot whose
-    ///    level admits the entry. Slots with room get it immediately. Drop
-    ///    policies (`DropNewest` / `DropOldest`) resolve in this phase too.
-    ///    Only `Block`-policy slots whose mailbox is full are deferred.
+    /// Stage 1 (once): run the **global transforms** a single time, producing one
+    /// enriched entry shared by every slot — so a time- or state-dependent global
+    /// transform (`timestamp`, a sampling filter) is evaluated once and all
+    /// transports observe the same result (ADR 0008, dedup Layer 1). A global
+    /// transform that drops the entry skips every slot.
+    ///
+    /// Then two phases over the slots:
+    ///
+    /// 1. Compose the transport stage on the enriched entry (`format_for`) and
+    ///    non-blocking `try_push` to every slot whose level admits the entry —
+    ///    level-gated on the *original* entry level, before any transform. Drop
+    ///    policies (`DropNewest` / `DropOldest`) resolve here; only `Block`-policy
+    ///    slots whose mailbox is full are deferred.
     ///
     /// 2. For each deferred `Block` slot, `push_blocking` parks the
     ///    calling thread until that slot has room. Other transports are
@@ -469,14 +487,23 @@ impl Routing {
     /// considered and rejected (adds executor cost without a
     /// corresponding semantic improvement).
     pub(crate) fn dispatch_entry(&self, entry: &Arc<LogInfo>) {
+        // Stage 1: global transforms, once. Drop here skips every slot.
+        let enriched: Arc<LogInfo> = match &self.global_format {
+            Some(gf) => match gf.transform((**entry).clone()) {
+                Some(transformed) => Arc::new(transformed),
+                None => return,
+            },
+            None => Arc::clone(entry),
+        };
+
         let mut deferred_blocks: Vec<(usize, SlotMessage)> = Vec::new();
 
-        // Phase 1: render at log-time, try-push to every eligible slot.
+        // Phase 1: compose the transport stage on `enriched`, try-push.
         for (idx, slot) in self.slots.iter().enumerate() {
             if !self.passes_level(&entry.level, slot.level.as_ref()) {
                 continue;
             }
-            let Some(formatted) = self.format_for(slot, entry) else {
+            let Some(formatted) = self.format_for(slot, &enriched) else {
                 continue;
             };
             if let Some(deferred) = self.try_push_to_slot(slot, SlotMessage::Entry(formatted)) {

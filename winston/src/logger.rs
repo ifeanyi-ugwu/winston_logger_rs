@@ -958,6 +958,120 @@ mod tests {
         assert_eq!(transport.get_logs().len(), 1);
     }
 
+    // --- Two-pass format composition (ADR 0008) ---
+
+    /// A transform that stamps `meta[key] = value`, to observe composition.
+    struct Stamp(&'static str, &'static str);
+    impl logform::Format for Stamp {
+        type Input = LogInfo;
+        fn transform(&self, mut info: LogInfo) -> Option<LogInfo> {
+            info.meta.insert(self.0, serde_json::Value::from(self.1));
+            Some(info)
+        }
+    }
+
+    /// A transform that counts how many times it runs, to observe Layer 1.
+    struct CountingTransform(Arc<std::sync::atomic::AtomicU64>);
+    impl logform::Format for CountingTransform {
+        type Input = LogInfo;
+        fn transform(&self, info: LogInfo) -> Option<LogInfo> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(info)
+        }
+    }
+
+    /// A sink that captures the whole `FormattedEntry` (info + rendered), so a
+    /// test can assert on `rendered`, which `TestTransport` discards.
+    struct CapturingSink {
+        entries: Arc<Mutex<Vec<(LogInfo, Option<String>)>>>,
+    }
+    impl WritableSink<FormattedEntry> for CapturingSink {
+        async fn write(
+            &mut self,
+            entry: FormattedEntry,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .push((entry.info, entry.rendered));
+            Ok(())
+        }
+    }
+    impl Transport for CapturingSink {}
+
+    #[test]
+    fn test_global_transform_composes_into_transport_format() {
+        // Compose, not replace: a transport with its own format still receives
+        // the global transform's effect.
+        let transport = TestTransport::new();
+        let lt = LoggerTransport::new(transport.clone())
+            .with_format(Stamp("t", "transport").into_pipeline());
+        let logger = Logger::builder()
+            .format(Stamp("g", "global").into_pipeline())
+            .transport(lt)
+            .build();
+
+        logger.log(LogInfo::new("info", "hello"));
+        logger.flush().unwrap();
+
+        let logs = transport.get_logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].meta.get("g").and_then(|v| v.as_str()), Some("global"));
+        assert_eq!(logs[0].meta.get("t").and_then(|v| v.as_str()), Some("transport"));
+    }
+
+    #[test]
+    fn test_global_transform_runs_once_across_transports() {
+        // Layer 1 dedup: the global transform runs once per log(), not once per
+        // transport — so a non-deterministic global transform stays consistent.
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let t1 = TestTransport::new();
+        let t2 = TestTransport::new();
+        let logger = Logger::builder()
+            .format(CountingTransform(counter.clone()).into_pipeline())
+            .transport(t1.clone())
+            .transport(t2.clone())
+            .build();
+
+        logger.log(LogInfo::new("info", "hello"));
+        logger.flush().unwrap();
+
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(t1.get_logs().len(), 1);
+        assert_eq!(t2.get_logs().len(), 1);
+    }
+
+    #[test]
+    fn test_transforms_only_transport_keeps_global_transforms_drops_global_finalizer() {
+        // The structured-sink rule (the ⚠ cell): a transforms-only transport
+        // format over a global WITH a finalizer keeps the global transforms but
+        // drops the global finalizer (transport-authoritative), so `rendered` is
+        // None.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let lt = LoggerTransport::new(CapturingSink {
+            entries: captured.clone(),
+        })
+        .with_format(Stamp("t", "transport").into_pipeline());
+        let logger = Logger::builder()
+            .format(Stamp("g", "global").finalize(logform::json()))
+            .transport(lt)
+            .build();
+
+        logger.log(LogInfo::new("info", "hello"));
+        logger.flush().unwrap();
+
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let (info, rendered) = &entries[0];
+        assert_eq!(info.meta.get("g").and_then(|v| v.as_str()), Some("global"));
+        assert_eq!(info.meta.get("t").and_then(|v| v.as_str()), Some("transport"));
+        assert!(
+            rendered.is_none(),
+            "structured-sink rule: the global finalizer must be dropped"
+        );
+    }
+
     #[test]
     fn test_transport_builder() {
         let logger = Logger::new(None);

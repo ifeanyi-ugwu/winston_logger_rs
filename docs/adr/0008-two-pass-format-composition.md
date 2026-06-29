@@ -1,7 +1,6 @@
 # ADR 0008 — Two-pass format composition
 
-**Status:** Accepted (decisions locked by the pressure-test below; implementation
-pending)
+**Status:** Accepted and implemented (decisions locked by the pressure-test below)
 
 ## Context
 
@@ -311,17 +310,21 @@ front, vs N times in the loop). No pump-funnel.
   consistency from day one; Layer 2 (`Arc`-in-`FormattedEntry`) **deferred** as a
   non-blocking follow-up.
 
-Implementation is now mechanical: compose in `format_for` per the rule, hoist the
-global-transform stage out of the slot loop (Layer 1), and carry the three
-documented divergences into the changelog.
+**Implemented.** `Routing::dispatch_entry` runs the global transforms once
+(stage 1) and `Routing::format_for` composes the transport stage on the enriched
+entry per the rule (stage 2); logform exposes `FormatPipeline::transform` /
+`::finalize` to split a pipeline across the two stages. Layer 2
+(`Arc`-in-`FormattedEntry`) remains the deferred follow-up. The three divergences
+are breaking and recorded in the landing commit.
 
 ## References
 
 - `winston-transport` `lib/winston-transport/index.js` — `_write` (the composition
   mechanism verified above).
-- `logform/src/finalizer.rs` — `FormatPipeline { transforms, finalizer }`,
-  `Finalizer::finalize(&LogInfo) -> Option<String>`.
-- `winston/src/pipeline.rs` — `Routing::format_for` (the site to change).
+- `logform/src/finalizer.rs` — `FormatPipeline { transforms, finalizer }` and the
+  `transform` / `finalize` stage methods; `Finalizer::finalize(&LogInfo) -> Option<String>`.
+- `winston/src/pipeline.rs` — `Routing::dispatch_entry` (stage 1) and
+  `Routing::format_for` (stage 2).
 - ADR 0005 — LogInfo data model and the FormattedEntry boundary (the
   transform/finalizer split and the structured-sink invariant this builds on).
 - ADR 0006 — Lock-free routing (why finalize-at-pump was rejected; the dedup here
