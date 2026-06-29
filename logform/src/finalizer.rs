@@ -62,12 +62,32 @@ impl FormatPipeline {
     /// only when a transform drops the entry. With no finalizer, `rendered` is
     /// `None` and no string is produced — a structured sink pays nothing.
     pub fn apply(&self, info: LogInfo) -> Option<FormattedEntry> {
-        let info = match &self.transforms {
-            Some(transforms) => transforms.transform(info)?,
-            None => info,
-        };
+        Some(self.finalize(self.transform(info)?))
+    }
+
+    /// Run only the transform stage, leaving rendering for a later
+    /// [`finalize`](Self::finalize). Returns `None` when a transform drops the
+    /// entry; with no transform chain, returns the entry unchanged.
+    ///
+    /// Pairs with [`finalize`] to split a pipeline across stages — e.g. running a
+    /// shared global format's transforms **once** before fanning an entry out to
+    /// several transports, then finalizing per transport, so a time- or
+    /// state-dependent transform (`timestamp`, a sampling filter) is evaluated a
+    /// single time and every transport observes the same result.
+    pub fn transform(&self, info: LogInfo) -> Option<LogInfo> {
+        match &self.transforms {
+            Some(transforms) => transforms.transform(info),
+            None => Some(info),
+        }
+    }
+
+    /// Run only the finalize stage against an already-transformed entry,
+    /// producing the [`FormattedEntry`] a sink writes. Pairs with
+    /// [`transform`](Self::transform); the transform chain is **not** re-run
+    /// here. With no finalizer the `rendered` string is `None`.
+    pub fn finalize(&self, info: LogInfo) -> FormattedEntry {
         let rendered = self.finalizer.as_ref().and_then(|f| f.finalize(&info));
-        Some(FormattedEntry { info, rendered })
+        FormattedEntry { info, rendered }
     }
 }
 
