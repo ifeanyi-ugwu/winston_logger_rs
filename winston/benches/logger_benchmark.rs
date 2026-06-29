@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use logform::{FormattedEntry, LogInfo};
+use logform::{FinalizeExt, FormattedEntry, LogInfo};
 use std::sync::Arc;
 use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
 use winston::Logger;
@@ -35,6 +35,54 @@ fn benchmark_logging(c: &mut Criterion) {
         });
     });
 
+    group.finish();
+
+    // 1b. Fan-out render scaling: K transports all inheriting the default
+    // json() global format, so each renders the entry per slot. Shows whether
+    // caller throughput degrades with transport count — i.e. whether the
+    // per-inherit-slot render is a real cost that Layer 2's render-dedup
+    // (render once, share across inherit-slots) would remove.
+    let mut group = c.benchmark_group("fanout_render");
+    for k in [1usize, 2, 4, 8] {
+        group.throughput(Throughput::Elements(1000));
+        group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, &k| {
+            let mut builder = Logger::builder();
+            for _ in 0..k {
+                builder = builder.transport(NoOpTransport);
+            }
+            let logger = builder.build();
+            b.iter(|| {
+                for _ in 0..1000 {
+                    logger.log(black_box(LogInfo::new("info", "benchmark message")));
+                }
+                logger.flush().unwrap();
+            });
+        });
+    }
+    group.finish();
+
+    // 1c. Same fan-out, but passthrough (no render) — isolates the per-slot
+    // render (json above) from the K-way fan-out coordination overhead. If this
+    // scales the same as `fanout_render`, render is not the cost and Layer 2's
+    // render-dedup would not help.
+    let mut group = c.benchmark_group("fanout_passthrough");
+    for k in [1usize, 2, 4, 8] {
+        group.throughput(Throughput::Elements(1000));
+        group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, &k| {
+            let mut builder =
+                Logger::builder().format(logform::passthrough().into_pipeline());
+            for _ in 0..k {
+                builder = builder.transport(NoOpTransport);
+            }
+            let logger = builder.build();
+            b.iter(|| {
+                for _ in 0..1000 {
+                    logger.log(black_box(LogInfo::new("info", "benchmark message")));
+                }
+                logger.flush().unwrap();
+            });
+        });
+    }
     group.finish();
 
     // 2. Multi-threaded contention test
