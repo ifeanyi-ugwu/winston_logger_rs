@@ -283,7 +283,8 @@ schedules:
   fan-out coordination, which Layer 2 does not address; and the no-sink-ripple
   form of Layer 2 only trades renders for `String` clones (marginal, and a slight
   regression at one transport). So Layer 2 stays deferred until a many-inherit-
-  transport workload makes the render-dedup pay.
+  transport workload makes the render-dedup pay. Full analysis and the re-run that
+  would overturn this: `docs/render-dedup-investigation.md`.
 
 Neither layer is the rejected finalize-at-pump (ADR 0006): rendering stays on the
 caller thread; only the *timing* of the shared transform stage moves (once, up
