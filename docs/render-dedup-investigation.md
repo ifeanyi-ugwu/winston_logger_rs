@@ -148,9 +148,10 @@ rebuild Layer 2 if **both** hold:
 Build order: the **no-sink-ripple** form (a) first — render once, clone into each
 inherit-slot's mailbox, with the N=1 branch — and escalate to the
 **`Arc<FormattedEntry>`** form (b) only if the per-slot string clones it leaves
-behind also show up in the numbers. And first confirm the fan-out super-linearity is
-real steady-state cost, not the flush artifact (a no-flush, sustained fan-out
-bench) — that, not the render, is the larger lever.
+behind also show up in the numbers. The fan-out super-linearity — the larger lever
+this investigation surfaced — was chased down separately and fixed:
+`docs/spawner-oversubscription-investigation.md` (it is thread oversubscription
+under `default_spawner`, addressed by `pooled_spawner`).
 
 ## References
 
