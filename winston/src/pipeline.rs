@@ -92,8 +92,16 @@ fn emit_event(senders: &EventSenders, event: BackpressureEvent) {
 /// `smol::spawn`, or any other executor's spawn primitive wrapped in an `Arc`.
 pub type SpawnFn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync>;
 
-/// The built-in spawner: runs each future on its own OS thread.
-/// Used automatically when no spawner is provided.
+/// The built-in spawner: runs each future on its own OS thread. Used
+/// automatically when no spawner is provided.
+///
+/// Simple and isolating — a transport that blocks in `poll` can't stall any
+/// other. But each transport runs two tasks (pump + WS controller), so a logger
+/// with many transports spawns many OS threads and oversubscribes the scheduler:
+/// fan-out cost scales super-linearly past ~4 transports (see
+/// `docs/spawner-oversubscription-investigation.md`). For many transports, prefer
+/// [`pooled_spawner`] (bounded threads, tolerates blocking) or
+/// [`single_threaded_spawner`] (fastest, non-blocking sinks only).
 pub fn default_spawner() -> SpawnFn {
     Arc::new(|fut: Pin<Box<dyn Future<Output = ()> + Send + 'static>>| {
         std::thread::spawn(move || {
@@ -102,21 +110,19 @@ pub fn default_spawner() -> SpawnFn {
     })
 }
 
-/// Single-threaded spawner: every spawned future runs on one shared OS thread,
-/// multiplexed cooperatively via a `FuturesUnordered` set.
-///
-/// Use this when all transports are fully async / non-blocking. A transport
-/// that performs synchronous blocking I/O inside `poll` will stall every other
-/// task on the executor — pick `default_spawner` instead in that case.
-pub fn single_threaded_spawner() -> SpawnFn {
-    type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-    let (tx, rx) = fmpsc::unbounded::<BoxFuture>();
+type SpawnedFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Spawn one OS thread running a cooperative executor (a `FuturesUnordered`
+/// pumped by an mpsc channel) and return the sender that feeds futures to it.
+/// Shared by [`single_threaded_spawner`] and [`pooled_spawner`].
+fn spawn_cooperative_executor(name: String) -> fmpsc::UnboundedSender<SpawnedFuture> {
+    let (tx, rx) = fmpsc::unbounded::<SpawnedFuture>();
     std::thread::Builder::new()
-        .name("winston-executor".into())
+        .name(name)
         .spawn(move || {
             futures::executor::block_on(async move {
                 let mut rx = rx;
-                let mut tasks = futures::stream::FuturesUnordered::<BoxFuture>::new();
+                let mut tasks = futures::stream::FuturesUnordered::<SpawnedFuture>::new();
                 loop {
                     futures::select! {
                         incoming = rx.next() => match incoming {
@@ -130,8 +136,45 @@ pub fn single_threaded_spawner() -> SpawnFn {
             });
         })
         .expect("failed to spawn winston executor thread");
+    tx
+}
+
+/// Single-threaded spawner: every spawned future runs on one shared OS thread,
+/// multiplexed cooperatively via a `FuturesUnordered` set.
+///
+/// The fastest option for fully async / non-blocking transports — it also keeps
+/// each transport's pump and WS controller on the same thread, so their handoff
+/// costs no cross-thread wakeup. But every task shares the one thread, so a
+/// transport that performs synchronous blocking I/O inside `poll` stalls every
+/// other task — pick [`default_spawner`] or [`pooled_spawner`] in that case.
+pub fn single_threaded_spawner() -> SpawnFn {
+    let tx = spawn_cooperative_executor("winston-executor".into());
     Arc::new(move |fut| {
         let _ = tx.unbounded_send(fut);
+    })
+}
+
+/// Bounded-pool spawner: `n` cooperative executor threads, with spawned futures
+/// distributed round-robin.
+///
+/// Caps total threads at `n` regardless of transport count, so it does **not**
+/// oversubscribe the scheduler the way [`default_spawner`] does at many
+/// transports — while a transport that blocks in `poll` stalls only the tasks
+/// sharing its worker, not all of them (unlike [`single_threaded_spawner`]). The
+/// scalable middle ground: prefer it for loggers with many transports,
+/// especially a mix of blocking and non-blocking sinks.
+///
+/// `n` is clamped to at least 1; a good value is roughly the core count. See
+/// `docs/spawner-oversubscription-investigation.md`.
+pub fn pooled_spawner(n: usize) -> SpawnFn {
+    let n = n.max(1);
+    let senders: Vec<_> = (0..n)
+        .map(|i| spawn_cooperative_executor(format!("winston-executor-{i}")))
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    Arc::new(move |fut| {
+        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
+        let _ = senders[idx].unbounded_send(fut);
     })
 }
 

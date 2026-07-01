@@ -20,7 +20,8 @@ pub use logger::Logger;
 pub use logger_options::{LoggerOptions, OverflowPolicy};
 pub use logger_transport::LoggerTransport;
 pub use pipeline::{
-    default_spawner, single_threaded_spawner, BackpressureEvent, SpawnFn, TransportStats,
+    default_spawner, pooled_spawner, single_threaded_spawner, BackpressureEvent, SpawnFn,
+    TransportStats,
 };
 pub use winston_transport::{
     BoxedReadableSource, DrainReceipt, DynIngestHandle, DynQueryHandle, DynReadableSource,
