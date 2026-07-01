@@ -2,7 +2,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use logform::{FinalizeExt, FormattedEntry, LogInfo};
 use std::sync::Arc;
 use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
-use winston::{default_spawner, single_threaded_spawner, Logger, LoggerOptions, SpawnFn};
+use winston::{
+    default_spawner, pooled_spawner, single_threaded_spawner, Logger, LoggerOptions, SpawnFn,
+};
 use winston_transport::Transport;
 
 fn benchmark_logging(c: &mut Criterion) {
@@ -92,12 +94,15 @@ fn benchmark_logging(c: &mut Criterion) {
     // stays ~linear, the cost is thread oversubscription, not the fan-out
     // itself — and the lever is a pooled spawner, not the core.
     let mut group = c.benchmark_group("fanout_spawner");
-    let spawners: [(&str, fn() -> SpawnFn); 2] =
-        [("default", default_spawner), ("single", single_threaded_spawner)];
-    for (name, make) in spawners {
+    let spawners: Vec<(&str, Box<dyn Fn() -> SpawnFn>)> = vec![
+        ("default", Box::new(default_spawner)),
+        ("single", Box::new(single_threaded_spawner)),
+        ("pooled", Box::new(|| pooled_spawner(4))),
+    ];
+    for (name, make) in &spawners {
         for k in [1usize, 2, 4, 8, 16] {
             group.throughput(Throughput::Elements(1000));
-            group.bench_with_input(BenchmarkId::new(name, k), &k, |b, &k| {
+            group.bench_with_input(BenchmarkId::new(*name, k), &k, |b, &k| {
                 let mut opts =
                     LoggerOptions::new().format(logform::passthrough().into_pipeline());
                 for _ in 0..k {

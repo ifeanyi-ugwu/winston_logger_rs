@@ -1073,6 +1073,23 @@ mod tests {
     }
 
     #[test]
+    fn test_pooled_spawner_delivers_across_transports() {
+        // A logger on the bounded-pool spawner still fans out to every transport.
+        let t1 = TestTransport::new();
+        let t2 = TestTransport::new();
+        let opts = LoggerOptions::new()
+            .transport(t1.clone())
+            .transport(t2.clone());
+        let logger = Logger::new_with_spawner(Some(opts), crate::pooled_spawner(2));
+
+        logger.log(LogInfo::new("info", "pooled"));
+        logger.flush().unwrap();
+
+        assert_eq!(t1.get_logs().len(), 1);
+        assert_eq!(t2.get_logs().len(), 1);
+    }
+
+    #[test]
     fn test_transport_builder() {
         let logger = Logger::new(None);
         let transport = TestTransport::new();
