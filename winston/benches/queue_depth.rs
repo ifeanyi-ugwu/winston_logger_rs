@@ -42,7 +42,7 @@ use logform::{FinalizeExt, FormattedEntry, LogInfo};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
+use whatwg_streams::StreamResult;
 use winston::{Logger, LoggerTransport, OverflowPolicy, Transport};
 
 /// Entries per measured batch. Must stay well above any swept queue depth so the
@@ -55,18 +55,12 @@ struct CountingSink {
     count: Arc<AtomicU64>,
 }
 
-impl WritableSink<FormattedEntry> for CountingSink {
-    async fn write(
-        &mut self,
-        _entry: FormattedEntry,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+impl Transport for CountingSink {
+    async fn log(&mut self, _entry: FormattedEntry) -> StreamResult<()> {
         self.count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
-
-impl Transport for CountingSink {}
 
 fn bench_sustained_drain(c: &mut Criterion) {
     let mut group = c.benchmark_group("sustained_drain");

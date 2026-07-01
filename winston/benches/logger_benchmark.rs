@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use logform::{FinalizeExt, FormattedEntry, LogInfo};
 use std::sync::Arc;
-use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
+use whatwg_streams::StreamResult;
 use winston::{
     default_spawner, pooled_spawner, single_threaded_spawner, Logger, LoggerOptions, SpawnFn,
 };
@@ -14,16 +14,11 @@ fn benchmark_logging(c: &mut Criterion) {
     // Sink that discards every entry (measures pure logger speed).
     #[derive(Clone)]
     struct NoOpTransport;
-    impl WritableSink<FormattedEntry> for NoOpTransport {
-        async fn write(
-            &mut self,
-            _entry: FormattedEntry,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
+    impl Transport for NoOpTransport {
+        async fn log(&mut self, _entry: FormattedEntry) -> StreamResult<()> {
             Ok(())
         }
     }
-    impl Transport for NoOpTransport {}
 
     group.throughput(Throughput::Elements(1000));
     group.bench_function("noop_transport", |b| {

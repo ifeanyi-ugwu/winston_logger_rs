@@ -7,9 +7,7 @@ use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use whatwg_streams::{
-    StreamError, StreamResult, WritableSink, WritableStreamDefaultController,
-};
+use whatwg_streams::{StreamError, StreamResult};
 use winston_transport::{DynIngestHandle, Transport};
 
 pub struct DailyRotateFileOptions {
@@ -358,12 +356,8 @@ impl DailyRotateFile {
     }
 }
 
-impl WritableSink<FormattedEntry> for DailyRotateFile {
-    async fn write(
-        &mut self,
-        entry: FormattedEntry,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+impl Transport for DailyRotateFile {
+    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
         // Use the full Display so any logform finalizer (json, printf, etc.)
         // gets honored. This matches `winston_file::FileTransport` and lets
         // rotated files round-trip through `FileSource` for `ship_rotated_files`.
@@ -380,9 +374,7 @@ impl WritableSink<FormattedEntry> for DailyRotateFile {
         self.writer.flush()?;
         Ok(())
     }
-}
 
-impl Transport for DailyRotateFile {
     // Query is intentionally unsupported — the rotation/archive lifecycle
     // means past entries live in N files (and possibly .gz archives) that the
     // transport doesn't track centrally. If you need query, log to a regular
@@ -605,6 +597,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
     use whatwg_streams::{CountQueuingStrategy, WritableStream};
+    use winston_transport::TransportSink;
 
     fn fe(level: &str, msg: impl Into<String>) -> FormattedEntry {
         FormattedEntry::new(LogInfo::new(level, msg), None)
@@ -628,11 +621,14 @@ mod tests {
     fn drive<F, Fut>(transport: DailyRotateFile, body: F)
     where
         F: FnOnce(
-            whatwg_streams::WritableStreamDefaultWriter<FormattedEntry, DailyRotateFile>,
+            whatwg_streams::WritableStreamDefaultWriter<
+                FormattedEntry,
+                TransportSink<DailyRotateFile>,
+            >,
         ) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(64))
             .spawn(thread_spawner);
         futures::executor::block_on(async {

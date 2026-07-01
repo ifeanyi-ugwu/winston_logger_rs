@@ -4,10 +4,7 @@ use logform::{FormattedEntry, LogInfo};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use whatwg_streams::{
-    ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
-    WritableStreamDefaultController,
-};
+use whatwg_streams::{ReadableSource, ReadableStreamDefaultController, StreamResult};
 use winston_transport::{DynQueryHandle, DynReadableSource, LogQuery, Transport};
 
 /// Configuration for MockTransport behavior
@@ -32,10 +29,10 @@ impl Default for MockConfig {
 
 /// A comprehensive mock transport for testing.
 ///
-/// Implements the new `Transport: WritableSink<LogInfo>` contract. Cloning
-/// shares the underlying `Arc<Mutex<Vec<LogInfo>>>` so the test thread keeps
-/// a handle to inspect what got written, even after the Logger consumes the
-/// transport into its `WritableStream`.
+/// Implements the `Transport` contract. Cloning shares the underlying
+/// `Arc<Mutex<Vec<LogInfo>>>` so the test thread keeps a handle to inspect
+/// what got written, even after the Logger consumes the transport into its
+/// `WritableStream`.
 #[derive(Clone, Debug)]
 pub struct MockTransport {
     pub logs: Arc<Mutex<Vec<LogInfo>>>,
@@ -93,12 +90,8 @@ impl MockTransport {
     }
 }
 
-impl WritableSink<FormattedEntry> for MockTransport {
-    async fn write(
-        &mut self,
-        entry: FormattedEntry,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+impl Transport for MockTransport {
+    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
         if self.config.should_fail_log {
             return Ok(());
         }
@@ -108,9 +101,7 @@ impl WritableSink<FormattedEntry> for MockTransport {
         self.logs.lock().unwrap().push(entry.info);
         Ok(())
     }
-}
 
-impl Transport for MockTransport {
     fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
         Some(Box::new(MockQueryHandle {
             logs: Arc::clone(&self.logs),

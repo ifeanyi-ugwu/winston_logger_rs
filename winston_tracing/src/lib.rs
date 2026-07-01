@@ -4,7 +4,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
 use whatwg_streams::{CountQueuingStrategy, WritableStream};
 use winston::{Logger, SpawnFn};
-use winston_transport::Transport;
+use winston_transport::{Transport, TransportSink};
 
 /// Type-erased per-transport enqueue closure used by [`DirectLayer`]. Captures
 /// a typed `WritableStreamDefaultWriter` so each `Transport` impl can have its
@@ -227,7 +227,7 @@ impl DirectLayerBuilder {
         T: Transport,
     {
         let spawn_for_stream = Arc::clone(&self.spawn_fn);
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(1024))
             .spawn(move |fut| spawn_for_stream(fut));
         let (locked, writer) = stream
@@ -595,7 +595,7 @@ mod tests {
     use logform::{FinalizeExt, Format};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::prelude::*;
-    use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
+    use whatwg_streams::StreamResult;
     use winston::default_spawner;
 
     /// Test transport: pushes each entry into a shared `Vec`. Cloning shares
@@ -605,18 +605,12 @@ mod tests {
     #[derive(Clone)]
     struct CaptureTransport(Arc<Mutex<Vec<LogInfo>>>);
 
-    impl WritableSink<FormattedEntry> for CaptureTransport {
-        async fn write(
-            &mut self,
-            entry: FormattedEntry,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
+    impl Transport for CaptureTransport {
+        async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
             self.0.lock().unwrap().push(entry.info);
             Ok(())
         }
     }
-
-    impl Transport for CaptureTransport {}
 
     fn capture() -> (CaptureTransport, Arc<Mutex<Vec<LogInfo>>>) {
         let store = Arc::new(Mutex::new(Vec::new()));

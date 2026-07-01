@@ -19,7 +19,7 @@ use logform::{FormattedEntry, LogInfo};
 use reqwest::Client;
 use serde_json::Value;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
-use whatwg_streams::{StreamError, StreamResult, WritableSink, WritableStreamDefaultController};
+use whatwg_streams::{StreamError, StreamResult};
 use winston_transport::{content_id, DynIngestHandle, Transport};
 
 /// Flatten `entry` to JSON and stamp an `_id` field with its [`content_id`].
@@ -105,12 +105,10 @@ impl HttpTransport {
     }
 }
 
-impl WritableSink<FormattedEntry> for HttpTransport {
-    async fn write(
-        &mut self,
-        entry: FormattedEntry,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+impl Transport for HttpTransport {
+    // No query — HTTP transport doesn't keep a local log store.
+
+    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
         // HTTP ships the structured entry as JSON; the rendered string is unused.
         let info = entry.info;
         if let Some(batch_size) = self.options.batch_size {
@@ -134,10 +132,6 @@ impl WritableSink<FormattedEntry> for HttpTransport {
         }
         Ok(())
     }
-}
-
-impl Transport for HttpTransport {
-    // No query — HTTP transport doesn't keep a local log store.
 
     fn ingest_handle(&self) -> Option<Box<dyn DynIngestHandle>> {
         Some(Box::new(HttpIngestHandle {
@@ -276,6 +270,7 @@ mod tests {
         thread,
     };
     use whatwg_streams::{CountQueuingStrategy, WritableStream};
+    use winston_transport::TransportSink;
 
     /// Mock HTTP server that records POSTed JSON bodies and (optionally) the
     /// request headers from each POST. Polls accept with a 5s deadline so it
@@ -387,7 +382,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}", port);
 
         let transport = HttpTransport::builder().url(&url).build();
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(test_spawner);
         let (_locked, writer) = stream.get_writer().expect("get_writer");
@@ -418,7 +413,7 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{}", port);
         let transport = HttpTransport::builder().url(&url).batch_size(2).build();
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(test_spawner);
         let (_locked, writer) = stream.get_writer().expect("get_writer");
@@ -477,7 +472,7 @@ mod tests {
         headers.insert("X-Custom-Header".to_string(), "test-value".to_string());
 
         let transport = HttpTransport::builder().url(&url).headers(headers).build();
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(test_spawner);
         let (_locked, writer) = stream.get_writer().expect("get_writer");

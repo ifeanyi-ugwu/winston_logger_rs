@@ -8,4 +8,5 @@ pub use logform::{Format, FormattedEntry, LogInfo, Meta};
 pub use proxy::{content_id, DrainReceipt, FanOutStats};
 pub use transport::{
     BoxedReadableSource, DynIngestHandle, DynQueryHandle, DynReadableSource, Transport,
+    TransportSink,
 };

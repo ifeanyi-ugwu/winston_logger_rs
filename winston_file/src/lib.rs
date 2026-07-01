@@ -7,10 +7,7 @@ use chrono::{DateTime, Utc};
 use dateparser::parse;
 use logform::{FormattedEntry, LogInfo};
 use serde_json::Value;
-use whatwg_streams::{
-    ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
-    WritableStreamDefaultController,
-};
+use whatwg_streams::{ReadableSource, ReadableStreamDefaultController, StreamResult};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -108,12 +105,8 @@ impl FileTransport {
     }
 }
 
-impl WritableSink<FormattedEntry> for FileTransport {
-    async fn write(
-        &mut self,
-        entry: FormattedEntry,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+impl Transport for FileTransport {
+    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
         let mut inner = self.inner.lock();
         writeln!(&mut inner.writer, "{}", entry)?;
         Ok(())
@@ -124,9 +117,7 @@ impl WritableSink<FormattedEntry> for FileTransport {
         inner.writer.flush()?;
         Ok(())
     }
-}
 
-impl Transport for FileTransport {
     fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
         Some(Box::new(FileQueryHandle {
             path: self.path.clone(),
@@ -341,7 +332,7 @@ fn unique_renamed_path(path: &Path) -> std::io::Result<PathBuf> {
 
 /// Out-of-band ingest target. Each call opens a fresh append-mode file
 /// handle, writes every entry as a line, flushes, and closes. Safe to run
-/// concurrently with the live `WritableSink` writer because POSIX `O_APPEND`
+/// concurrently with the live writer because POSIX `O_APPEND`
 /// guarantees atomic appends per write call (within `PIPE_BUF`).
 struct FileIngestHandle {
     path: PathBuf,
@@ -563,7 +554,7 @@ mod tests {
     use logform::{json, timestamp, FinalizeExt, Format};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use whatwg_streams::{CountQueuingStrategy, ReadableStream, WritableStream};
-    use winston_transport::BoxedReadableSource;
+    use winston_transport::{BoxedReadableSource, TransportSink};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -593,7 +584,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let transport = FileTransport::builder().filename(&path).build();
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(thread_spawner);
 
@@ -621,7 +612,7 @@ mod tests {
         // Write
         {
             let transport = FileTransport::builder().filename(&path).build();
-            let stream = WritableStream::builder(transport)
+            let stream = WritableStream::builder(TransportSink(transport))
                 .strategy(CountQueuingStrategy::new(8))
                 .spawn(thread_spawner);
 
@@ -679,7 +670,7 @@ mod tests {
         let transport = FileTransport::builder().filename(&path).build();
         let rotate = transport.rotate_handle();
 
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(thread_spawner);
         let (_locked, writer) = stream.get_writer().expect("get_writer");
@@ -742,7 +733,7 @@ mod tests {
 
         let transport = FileTransport::builder().filename(&path).build();
         let rotate = transport.rotate_handle();
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(thread_spawner);
         let (_locked, writer) = stream.get_writer().expect("get_writer");

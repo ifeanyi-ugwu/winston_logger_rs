@@ -11,9 +11,9 @@ use crate::{
 
 /// Configuration the Logger holds about a registered transport.
 ///
-/// The write side of a `Transport: WritableSink<LogInfo>` is consumed when
-/// the fanout task admits the transport — at that point the typed transport
-/// is moved into a `WritableStream`. The read side (`query_handle`) is
+/// The write side of a transport is consumed when the fanout task admits it —
+/// at that point the typed transport is wrapped in a `TransportSink` and moved
+/// into a `WritableStream`. The read side (`query_handle`) is
 /// extracted before consumption and stored separately so `Logger::query`
 /// keeps working independently of the writer's lifetime.
 #[derive(Clone)]

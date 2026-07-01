@@ -15,7 +15,7 @@ use whatwg_streams::{
     CountQueuingStrategy, StreamResult, WritableSink, WritableStream,
     WritableStreamDefaultWriter,
 };
-use winston_transport::Transport;
+use winston_transport::{Transport, TransportSink};
 
 use crate::{
     logger::TransportHandle,
@@ -255,7 +255,7 @@ where
     T: Transport,
 {
     Box::new(move |spawn_fn: SpawnFn, hwm: usize| {
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(hwm))
             .spawn(move |fut| spawn_fn(fut));
 

@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
 };
 
-use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
+use whatwg_streams::StreamResult;
 
 pub use winston_file::FileTransport as File;
 pub use winston_transport::*;
@@ -34,17 +34,14 @@ where
     }
 }
 
-impl<W, L> WritableSink<L> for WriterTransport<W, L>
+impl<W> Transport for WriterTransport<W, FormattedEntry>
 where
     W: Write + Send + Sync + 'static,
-    L: Display + Send + Sync + 'static,
 {
-    async fn write(
-        &mut self,
-        chunk: L,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
-        writeln!(&mut self.writer, "{}", chunk)?;
+    // Stdout/stderr/etc. don't keep history — query is unsupported.
+
+    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+        writeln!(&mut self.writer, "{}", entry)?;
         Ok(())
     }
 
@@ -52,13 +49,6 @@ where
         self.writer.flush()?;
         Ok(())
     }
-}
-
-impl<W> Transport for WriterTransport<W, FormattedEntry>
-where
-    W: Write + Send + Sync + 'static,
-{
-    // Stdout/stderr/etc. don't keep history — query is unsupported.
 }
 
 /// Convenience: `WriterTransport` that writes to standard output.

@@ -28,8 +28,7 @@ use mongodb::{
 use serde::{Deserialize, Serialize};
 use to_mongodb_filter::ToMongoDbFilter;
 use whatwg_streams::{
-    ReadableSource, ReadableStreamDefaultController, StreamError, StreamResult, WritableSink,
-    WritableStreamDefaultController,
+    ReadableSource, ReadableStreamDefaultController, StreamError, StreamResult,
 };
 use winston_transport::{
     DrainReceipt, DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Order, Transport,
@@ -119,11 +118,8 @@ impl MongoDBTransportBuilder {
     }
 }
 
-impl WritableSink<FormattedEntry> for MongoDBTransport {
-    async fn start(
-        &mut self,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+impl Transport for MongoDBTransport {
+    async fn start(&mut self) -> StreamResult<()> {
         let client = Client::with_uri_str(&self.options.connection_string)
             .await
             .map_err(StreamError::other)?;
@@ -134,11 +130,7 @@ impl WritableSink<FormattedEntry> for MongoDBTransport {
         Ok(())
     }
 
-    async fn write(
-        &mut self,
-        entry: FormattedEntry,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
+    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
         let collection = self
             .collection
             .as_ref()
@@ -156,9 +148,7 @@ impl WritableSink<FormattedEntry> for MongoDBTransport {
             .map_err(StreamError::other)?;
         Ok(())
     }
-}
 
-impl Transport for MongoDBTransport {
     fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
         Some(Box::new(MongoDBQueryHandle {
             options: self.options.clone(),
@@ -657,7 +647,7 @@ mod tests {
     use mongodb::bson::doc;
     use std::env;
     use whatwg_streams::{CountQueuingStrategy, ReadableStream, WritableStream};
-    use winston_transport::BoxedReadableSource;
+    use winston_transport::{BoxedReadableSource, TransportSink};
 
     fn fe(level: &str, msg: impl Into<String>) -> FormattedEntry {
         FormattedEntry::new(LogInfo::new(level, msg), None)
@@ -685,7 +675,7 @@ mod tests {
         };
 
         let transport = MongoDBTransport::new(options.clone());
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(|fut| {
                 tokio::spawn(fut);
@@ -730,7 +720,7 @@ mod tests {
         }
 
         let transport = MongoDBTransport::new(options.clone());
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(|fut| {
                 tokio::spawn(fut);

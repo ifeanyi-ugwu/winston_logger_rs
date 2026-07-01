@@ -185,7 +185,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use whatwg_streams::{CountQueuingStrategy, StreamResult, WritableStream};
-    use winston_transport::DynIngestHandle;
+    use winston_transport::{DynIngestHandle, TransportSink};
 
     use crate::DailyRotateFile;
 
@@ -222,12 +222,15 @@ mod tests {
     fn drive<F, Fut>(transport: DailyRotateFile, body: F)
     where
         F: FnOnce(
-            whatwg_streams::WritableStreamDefaultWriter<FormattedEntry, DailyRotateFile>,
+            whatwg_streams::WritableStreamDefaultWriter<
+                FormattedEntry,
+                TransportSink<DailyRotateFile>,
+            >,
         ) -> Fut,
         Fut: Future<Output = ()>,
     {
         // Re-borrow the spawner because Fn-not-FnOnce traverses ownership.
-        let stream = WritableStream::builder(transport)
+        let stream = WritableStream::builder(TransportSink(transport))
             .strategy(CountQueuingStrategy::new(64))
             .spawn(|fut| {
                 std::thread::spawn(move || futures::executor::block_on(fut));

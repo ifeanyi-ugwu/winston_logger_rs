@@ -778,10 +778,7 @@ mod tests {
     use crate::logger_options::LoggerOptions;
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
-    use whatwg_streams::{
-        ReadableSource, ReadableStreamDefaultController, StreamResult, WritableSink,
-        WritableStreamDefaultController,
-    };
+    use whatwg_streams::{ReadableSource, ReadableStreamDefaultController, StreamResult};
     use winston_transport::{DynQueryHandle, DynReadableSource};
 
     /// Test transport: collects writes into a shared `Vec`. Cloning shares the
@@ -805,18 +802,12 @@ mod tests {
         }
     }
 
-    impl WritableSink<FormattedEntry> for TestTransport {
-        async fn write(
-            &mut self,
-            entry: FormattedEntry,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
+    impl Transport for TestTransport {
+        async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
             self.logs.lock().unwrap().push(entry.info);
             Ok(())
         }
-    }
 
-    impl Transport for TestTransport {
         fn query_handle(&self) -> Option<Box<dyn DynQueryHandle>> {
             Some(Box::new(TestQueryHandle {
                 logs: Arc::clone(&self.logs),
@@ -985,12 +976,8 @@ mod tests {
     struct CapturingSink {
         entries: Arc<Mutex<Vec<(LogInfo, Option<String>)>>>,
     }
-    impl WritableSink<FormattedEntry> for CapturingSink {
-        async fn write(
-            &mut self,
-            entry: FormattedEntry,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
+    impl Transport for CapturingSink {
+        async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
             self.entries
                 .lock()
                 .unwrap()
@@ -998,7 +985,6 @@ mod tests {
             Ok(())
         }
     }
-    impl Transport for CapturingSink {}
 
     #[test]
     fn test_global_transform_composes_into_transport_format() {
@@ -1471,7 +1457,7 @@ mod tests {
         assert!(logger.transport_stats(fake).is_none());
     }
 
-    /// A WritableSink that takes its write-completion permits from a
+    /// A transport that takes its write-completion permits from a
     /// channel — sustains backpressure across many writes (not just the
     /// first), unlike a single-shot oneshot gate. The test drives the
     /// rate by sending permits.
@@ -1479,18 +1465,12 @@ mod tests {
         permits: futures::channel::mpsc::UnboundedReceiver<()>,
     }
 
-    impl WritableSink<FormattedEntry> for PermittedTransport {
-        async fn write(
-            &mut self,
-            _entry: FormattedEntry,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
+    impl Transport for PermittedTransport {
+        async fn log(&mut self, _entry: FormattedEntry) -> StreamResult<()> {
             let _ = self.permits.next().await;
             Ok(())
         }
     }
-
-    impl Transport for PermittedTransport {}
 
     /// RAII: closes the permit channel on drop by sending enough permits
     /// to drain whatever is in flight, so logger Drop's `close → flush`
@@ -1651,19 +1631,14 @@ mod tests {
             inner: PermittedTransport,
             seen: Arc<Mutex<Vec<String>>>,
         }
-        impl WritableSink<FormattedEntry> for Wrapped {
-            async fn write(
-                &mut self,
-                entry: FormattedEntry,
-                ctrl: &mut WritableStreamDefaultController,
-            ) -> StreamResult<()> {
+        impl Transport for Wrapped {
+            async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
                 let message = entry.info.message.clone();
-                self.inner.write(entry, ctrl).await?;
+                self.inner.log(entry).await?;
                 self.seen.lock().unwrap().push(message);
                 Ok(())
             }
         }
-        impl Transport for Wrapped {}
 
         let lt = LoggerTransport::new(Wrapped {
             inner: transport,
