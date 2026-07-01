@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use logform::{FinalizeExt, FormattedEntry, LogInfo};
 use std::sync::Arc;
 use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
-use winston::Logger;
+use winston::{default_spawner, single_threaded_spawner, Logger, LoggerOptions, SpawnFn};
 use winston_transport::Transport;
 
 fn benchmark_logging(c: &mut Criterion) {
@@ -82,6 +82,36 @@ fn benchmark_logging(c: &mut Criterion) {
                 logger.flush().unwrap();
             });
         });
+    }
+    group.finish();
+
+    // 1d. Fan-out scaling under two spawners: `default` (one OS thread per
+    // task → 2 threads per transport) vs `single_threaded` (all tasks share one
+    // executor thread). Passthrough (no render), so this isolates the K-way
+    // fan-out coordination. If `default` blows up super-linearly while `single`
+    // stays ~linear, the cost is thread oversubscription, not the fan-out
+    // itself — and the lever is a pooled spawner, not the core.
+    let mut group = c.benchmark_group("fanout_spawner");
+    let spawners: [(&str, fn() -> SpawnFn); 2] =
+        [("default", default_spawner), ("single", single_threaded_spawner)];
+    for (name, make) in spawners {
+        for k in [1usize, 2, 4, 8, 16] {
+            group.throughput(Throughput::Elements(1000));
+            group.bench_with_input(BenchmarkId::new(name, k), &k, |b, &k| {
+                let mut opts =
+                    LoggerOptions::new().format(logform::passthrough().into_pipeline());
+                for _ in 0..k {
+                    opts = opts.transport(NoOpTransport);
+                }
+                let logger = Logger::new_with_spawner(Some(opts), make());
+                b.iter(|| {
+                    for _ in 0..1000 {
+                        logger.log(black_box(LogInfo::new("info", "benchmark message")));
+                    }
+                    logger.flush().unwrap();
+                });
+            });
+        }
     }
     group.finish();
 
