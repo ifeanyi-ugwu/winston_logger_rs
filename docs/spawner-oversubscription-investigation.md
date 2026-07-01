@@ -39,6 +39,25 @@ The blow-up at K=4→8 is exactly where `2K` crosses a typical core count. So th
 cost is not the fan-out itself; it is oversubscribing the scheduler with idle-but-
 wakeable threads.
 
+## The plan (measure → isolate → decide)
+
+Same discipline as the queue-depth and render-dedup investigations:
+
+1. **Separate real cost from the flush artifact.** The fan-out bench logs
+   `1000 + flush` per iteration, and a per-iteration flush has masqueraded as a
+   real cost twice already. First confirm the super-linearity is not just that.
+2. **Isolate the mechanism with one knob: the spawner.** `single_threaded_spawner`
+   runs all tasks on one thread — no oversubscription, but serialized. Run the
+   fan-out under both spawners across K; three outcomes discriminate the cause in a
+   single run:
+   - `single` linear while `default` blows up → **thread oversubscription** (the
+     lead hypothesis); the lever is the spawner, not the core.
+   - both blow up → **inherent fan-out coordination** (wakeup storms); harder, rarer.
+   - neither blows up without the flush → it was the **flush artifact**; no real
+     steady-state issue.
+3. **Decide** by which outcome lands: oversubscription → a bounded-thread spawner;
+   flush artifact → document; inherent → weigh against rarity (K≥8 is uncommon).
+
 ## The decisive measurement
 
 The `single_threaded_spawner` runs *all* tasks on one cooperative thread — no
@@ -83,6 +102,13 @@ loop), with spawned tasks distributed round-robin. It caps threads at `n`
 regardless of transport count, so it does not oversubscribe — and a transport that
 blocks in `poll` stalls only the tasks sharing its worker, not all of them. It is
 `~40` lines reusing the existing single-thread executor, needing no new dependency.
+
+winston is runtime-agnostic, so a bounded pool already *existed*: `SpawnFn` accepts
+any executor's spawn primitive, and passing a `tokio` (or `smol`) multi-thread
+runtime handle is a bounded pool with real work-stealing. `pooled_spawner` bundles
+that option for callers who don't want to pull in an async runtime just to fan out
+to many transports; a `tokio` runtime remains the better choice when the
+application already has one.
 
 The three spawners now form a clear ladder:
 
