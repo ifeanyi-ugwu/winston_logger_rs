@@ -1,8 +1,11 @@
 # Investigation — the mailbox is SPSC by label, MPSC by use
 
-**Status:** Investigation log / open decision on the async producer path (relates
-to [ADR 0002](adr/0002-direct-dispatch-backpressure.md), which established the
-per-slot mailbox and rejected an async `log()` API).
+**Status:** Investigation log / reasoning trail. The async-producer decision
+(fork C — build the opt-in async door via Route 1) is recorded in
+[ADR 0009](adr/0009-async-logging-door.md); this page remains the exploration
+behind it. Relates to
+[ADR 0002](adr/0002-direct-dispatch-backpressure.md), which established the
+per-slot mailbox and the sync `log()` this extends.
 
 ## How to read this
 
@@ -492,8 +495,10 @@ level-gate and entry construction live inside the block, so laziness is preserve
 
 ## Open questions / to extend
 
-- **Which fork.** The trigger for anything past (A) is a concrete async
-  must-not-drop caller appearing.
+- **Fork chosen: C**, recorded in [ADR 0009](adr/0009-async-logging-door.md) —
+  build the opt-in async door via Route 1 (direct per-slot await on an
+  `event-listener` waiter), `_async` naming, phased rollout. This section is the
+  reasoning behind that choice.
 - **Fork C's shape is worked out** under *Building the async door* — Route 1
   (direct per-slot await) over Route 2 (dispatcher). What stays open there: the
   go/no-go, the API naming (`log_async` / `info_async!`), and the exact

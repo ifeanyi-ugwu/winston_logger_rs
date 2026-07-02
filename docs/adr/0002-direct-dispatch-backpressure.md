@@ -218,6 +218,9 @@ existing public interface without touching the Logger.
 - **Async `log()` API (`async fn log`).** Makes the sync-async impedance
   go away, but breaks every sync call site (which is most of them — `log`
   crate adapter, all of `println!`-style usage). Wrong trade.
+  **Revisited by [ADR 0009](0009-async-logging-door.md):** the rejection is of
+  *replacing* sync `log()`; 0009 adds an *opt-in* `log_async` alongside it, which
+  this decision does not foreclose.
 
 - **`block_on(async_send)` inside `log()` per call.** Spins up a tiny
   executor (or pins a static one) per call. Performance hit per `log`, and
