@@ -341,16 +341,158 @@ built**, **(B)** only as an interim if the path is kept in the meantime. Note th
 adapter, `println!`-style usage). The niche here is *adding* an async variant
 alongside the sync one, which 0002 does not foreclose.
 
+## Building the async door (fork C in depth)
+
+Fork C — exposing a cooperative async logging path — has enough structure that
+its shape is worth recording before any code lands.
+
+### What the await waits on — room, never the write
+
+The sink is already detached from the caller: `log()` never waits for a write. The
+pump owns that, draining the mailbox and doing
+`writer.enqueue_when_ready(entry).await` on its own task
+(`winston/src/pipeline.rs:329-332`). Even sync `Block` only waits for *a slot to
+free* so the entry can be handed off — never for the entry to reach the sink.
+
+So the async door's only await point is **enqueue room**. `send().await` returns
+`Ready` on the first poll when the mailbox has space (no suspension at all); it
+yields only when full, and resumes the instant the pump pops one entry and frees a
+slot (`winston/src/mailbox.rs:169-173`, `:180-184`). It resumes on "a slot freed,"
+not "my entry written" — identical semantics to `push_blocking`, task-yield
+instead of thread-park. Under sustained overload, "room to enqueue" is paced by the
+sink's drain rate, which is what makes it real backpressure — but it throttles the
+caller to the sink's rate, never to any specific write.
+
+Two await-able things must not be conflated:
+
+| await… | meaning | API |
+| --- | --- | --- |
+| enqueue / room | wait until the buffer can accept the entry — backpressure | the async `log_async` |
+| write / durability | wait until everything queued is written out | `flush()` |
+
+`log()` — sync or async — always means "hand off to the buffer," never "wait until
+durable." Await-until-written is `flush()`, a far stronger and more expensive
+guarantee that has no place per-log-line.
+
+### The impossibility triangle — the await cannot be designed away
+
+Under sustained overload (entries arriving faster than the sink drains, long
+enough to fill the buffer), the enqueue boundary offers exactly three moves, and
+they trade off against three desirable properties — pick any two:
+
+```text
+                        lossless (Block)
+                          /          \
+              [Block-thread]        [Yield-task]
+              sync call ✓           no thread-park ✓
+              no park   ✗           lossless      ✓
+                         \          / needs .await ✗
+                    sync call ─── [Drop] ─── no thread-park
+                             lossless ✗
+```
+
+- **Block the thread** (sync `Block`): lossless + sync call, but parks the worker.
+- **Drop** (Drop policies): sync call + no park, but lossy.
+- **Yield the task** (async door): lossless + no park, but needs `.await`.
+
+The pigeonhole makes this fundamental, not incidental: infinite inflow, finite
+outflow, finite memory, no blocking, no dropping is a contradiction. An
+intermediary buffer adds a larger cushion before the boundary is hit; it does not
+add a fourth corner. So the `.await` *is* the mechanism of cooperative lossless
+backpressure — a yield point in the caller's control flow — not removable
+ugliness. Delete it and saturation forces Drop or thread-park.
+
+### Two routes to the door
+
+**Route 1 — direct per-slot `send().await` (needs step A).** `log_async` fans out
+like `dispatch_entry`: phase 1 `try_push` to every slot, phase 2 `send().await`
+the `Block`-full slots. Each slot stays independent — a caller awaits *per-slot*
+room, no shared upstream queue, per-transport `OverflowPolicy` intact. The only
+blocker is the single-slot `AtomicWaker`; step A's waiter queue removes it.
+
+**Route 2 — single dispatcher task.** Callers `try_push` (non-blocking) into one
+front queue; a single owner task drains it and does the `send().await`s. Its one
+clean benefit: the dispatcher is the *sole* producer into each mailbox, so the
+`AtomicWaker` is correct by construction — Route 2 sidesteps step A. Its sharp
+cost is head-of-line blocking, the exact coupling
+[ADR 0002](adr/0002-direct-dispatch-backpressure.md) removed:
+
+```text
+today (per-slot, independent):        dispatcher (shared front queue):
+
+log() ─┬─► [file mailbox] ─► pump     log() ─► [ ONE queue ] ─► dispatcher ─┬─► file
+       ├─► [console]      ─► pump                                            ├─► console
+       └─► [http]         ─► pump                                            └─► http
+   each drains independently          a slow Block sink parks the dispatcher →
+                                       front queue backs up → every lane stalls
+```
+
+A slow `Block` sink stalls the dispatcher, backs up the shared queue, and blocks
+console + http logging behind the file sink. A shared upstream queue also cannot
+express per-transport policy at its own boundary — when full it makes one decision
+for all lanes. The escape (per-transport front queues) just re-creates the
+mailboxes with an extra hop. So Route 2 either collapses per-transport
+independence or is redundant.
+
+**Recommended: Route 1.** The waiter queue is ~15 local lines and preserves the
+per-slot independence the architecture is built on; the dispatcher trades that
+independence away to save it.
+
+### ADR 0002, reconciled
+
+[ADR 0002](adr/0002-direct-dispatch-backpressure.md) rejected an intermediary
+queue for two reasons: *unbounded* (turns `Block` into silent-drop-at-OOM) and
+*shared/layered* (a second pressure point that collapses the per-transport model).
+A bounded per-path queue dodges the first; a shared upstream queue hits the
+second. The objection was never the queue's existence or size — it is that a
+*shared, upstream* buffer fights the per-transport architecture. Separately, 0002
+rejected *replacing* `log()` with `async fn log`; *adding* an opt-in async variant
+alongside the sync one is not foreclosed.
+
+### API surface, build order, and the macro layer
+
+The async door is opt-in and additive; sync `log()` is unchanged. The `.await`
+belongs only to the must-not-drop lane — droppable logs (telemetry, debug, request
+lines) stay on sync `log()` with a Drop policy (no await, no park). The ergonomic
+cost shrinks to the few call sites that genuinely cannot drop.
+
+Build order — the macros are the veneer, built last:
+
+1. **Step A** — the mailbox waiter queue (`send` MP-correct).
+2. **`Logger::log_async(&self, entry)`** — async twin of `dispatch_entry`
+   (`winston/src/pipeline.rs:557-563`); phase 2 awaits the `Block`-full slots.
+3. **`global::log_async(entry).await`** — mirror of `global::log`
+   (`winston/src/global.rs:51`); `is_level_enabled` stays sync.
+4. **Async macros** — a `create_async_level_macros!` mirror of
+   `create_level_macros!` (`winston/src/log_macros.rs:79`). The only delta per arm
+   is `.log(entry)` → `.log_async(entry).await`.
+
+The macro should expand to an `async {}` block so the suspend point is **visible**
+at the call site (`info_async!(...).await`), not hidden inside a statement — an
+awaited log is a cancellation/ordering point and async Rust reads it as one. The
+level-gate and entry construction live inside the block, so laziness is preserved
+(nothing built when the level is disabled).
+
+### Two edges to handle
+
+- **Cancellation drops.** `info_async!(...).await` is a cancellation point: a task
+  dropped while the `send` is `Pending` (mailbox full) loses that entry — never
+  enqueued. The async lane's guarantee is *lossless under backpressure, not under
+  cancellation*. This surprises exactly the caller who reached for it to avoid
+  dropping; document it loudly on `log_async`.
+- **Parallel phase 2.** Awaiting the `Block`-full slots serially lets one slow slot
+  delay the rest. `join_all` / `FuturesUnordered` over the per-slot `send().await`s
+  keeps them waiting in parallel — the async incarnation of
+  [ADR 0003](adr/0003-parallel-deferred-block-dispatch.md).
+
 ## Open questions / to extend
 
 - **Which fork.** The trigger for anything past (A) is a concrete async
   must-not-drop caller appearing.
-- **If (C): per-call await or a single dispatcher?** A per-call `log().await`
-  (fork-1 ergonomics) is a waker-queue swap in the mailbox. A single dispatcher
-  task — callers `try_push` non-blocking into a front queue, one owner task does
-  the `send().await`s — keeps the call site non-blocking and needs no primitive
-  change, but re-serialises dispatch and must re-derive the parallel fan-out of
-  [ADR 0003](adr/0003-parallel-deferred-block-dispatch.md) inside the dispatcher.
+- **Fork C's shape is worked out** under *Building the async door* — Route 1
+  (direct per-slot await) over Route 2 (dispatcher). What stays open there: the
+  go/no-go, the API naming (`log_async` / `info_async!`), and the exact
+  cancellation contract to publish on `log_async`.
 - **Promote invariants to code comments.** The notify-outside-the-lock safety
   property (`mailbox.rs:201`) and the SPSC-label caveat on the producer side
   (`mailbox.rs:21`) are load-bearing and currently implicit.
