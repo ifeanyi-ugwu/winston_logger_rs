@@ -631,11 +631,24 @@ pub fn tokio_spawner() -> Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send + 's
 }
 
 
-#[cfg(test)]
+// Gated behind `container-tests`: these spin up a real MongoDB via
+// testcontainers, so a normal `cargo test` neither compiles the testcontainers
+// dependency nor pulls the Docker image. Run with:
+//   cargo test -p winston_mongodb --features container-tests
+//
+// Requires a running Docker daemon. The first run on a machine pulls the
+// `mongo:5.0.6` image — a one-time cost of tens of seconds — after which Docker
+// caches it and runs take a couple of seconds. Point the suite at an external
+// server via `WINSTON_MONGODB_TEST_URI` to skip the container entirely.
+#[cfg(all(test, feature = "container-tests"))]
 mod tests {
     use super::*;
     use mongodb::bson::doc;
     use std::env;
+    use testcontainers_modules::{
+        mongo::Mongo,
+        testcontainers::{runners::AsyncRunner, ContainerAsync},
+    };
     use whatwg_streams::{CountQueuingStrategy, ReadableStream, WritableStream};
     use winston_transport::{BoxedQuerySource, TransportSink};
 
@@ -643,20 +656,34 @@ mod tests {
         FormattedEntry::new(LogInfo::new(level, msg), None)
     }
 
-    fn require_uri() -> Option<String> {
-        dotenv::dotenv().ok();
-        match env::var("MONGODB_URI") {
-            Ok(uri) => Some(uri),
-            Err(_) => {
-                eprintln!("Skipping test: MONGODB_URI not set");
-                None
-            }
+    /// Start a throwaway MongoDB for one test and return `(guard, uri)`.
+    ///
+    /// The `ContainerAsync` guard must stay alive for the duration of the test:
+    /// its `Drop` removes the container. Bind it (`let (_mongo, uri) = ...`) so
+    /// it lives to the end of the test rather than dropping immediately.
+    ///
+    /// Set `WINSTON_MONGODB_TEST_URI` to run against an external MongoDB instead
+    /// (CI without a Docker daemon); the guard is then `None`.
+    async fn mongo_setup() -> (Option<ContainerAsync<Mongo>>, String) {
+        if let Ok(uri) = env::var("WINSTON_MONGODB_TEST_URI") {
+            return (None, uri);
         }
+
+        let container = Mongo::default()
+            .start()
+            .await
+            .expect("start MongoDB test container (is the Docker daemon running?)");
+        let port = container
+            .get_host_port_ipv4(27017)
+            .await
+            .expect("map MongoDB container port");
+        let uri = format!("mongodb://127.0.0.1:{port}/?directConnection=true");
+        (Some(container), uri)
     }
 
     #[tokio::test]
     async fn writes_through_writable_stream() {
-        let Some(uri) = require_uri() else { return };
+        let (_mongo, uri) = mongo_setup().await;
 
         let options = MongoDBOptions {
             connection_string: uri.clone(),
@@ -691,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_streams_results() {
-        let Some(uri) = require_uri() else { return };
+        let (_mongo, uri) = mongo_setup().await;
 
         let options = MongoDBOptions {
             connection_string: uri.clone(),
@@ -762,7 +789,7 @@ mod tests {
     /// equivalent: out-of-band batch acceptance from another transport.
     #[tokio::test]
     async fn ingest_handle_inserts_batch() {
-        let Some(uri) = require_uri() else { return };
+        let (_mongo, uri) = mongo_setup().await;
 
         let options = MongoDBOptions {
             connection_string: uri.clone(),
@@ -818,7 +845,7 @@ mod tests {
     /// cursor opened is NOT deleted.
     #[tokio::test]
     async fn query_consuming_then_delete_removes_exactly_consumed() {
-        let Some(uri) = require_uri() else { return };
+        let (_mongo, uri) = mongo_setup().await;
 
         let options = MongoDBOptions {
             connection_string: uri.clone(),
@@ -924,7 +951,7 @@ mod tests {
     /// swallowed). This is the target half of exactly-once-ish proxying.
     #[tokio::test]
     async fn idempotent_ingest_dedups_on_resend() {
-        let Some(uri) = require_uri() else { return };
+        let (_mongo, uri) = mongo_setup().await;
 
         let options = MongoDBOptions {
             connection_string: uri.clone(),

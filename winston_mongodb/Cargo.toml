@@ -19,8 +19,16 @@ tokio = { version = "1.43.0", features = ["rt"] }
 whatwg_streams.workspace = true
 winston_transport.workspace = true
 bson = { version = "2.0", features = ["chrono-0_4"] }
+# Test-only, but dev-dependencies can't be optional — gated by the
+# `container-tests` feature so a normal `cargo test` neither compiles it nor
+# pulls the MongoDB Docker image.
+testcontainers-modules = { version = "0.15.0", features = ["mongo"], optional = true }
+
+[features]
+# Enables the Docker-backed integration tests (require a running Docker daemon):
+# `cargo test -p winston_mongodb --features container-tests`.
+container-tests = ["dep:testcontainers-modules"]
 
 [dev-dependencies]
-dotenv = "0.15.0"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros", "time"] }
 winston.workspace = true
