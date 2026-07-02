@@ -7,6 +7,6 @@ pub use log_query::{LogQuery, Order};
 pub use logform::{Format, FormattedEntry, LogInfo, Meta};
 pub use proxy::{content_id, DrainReceipt, FanOutStats};
 pub use transport::{
-    BoxedReadableSource, DynIngestHandle, DynQueryHandle, DynReadableSource, Transport,
-    TransportSink,
+    BoxedQuerySource, DynIngestHandle, DynQueryHandle, DynQuerySource, QuerySource, Transport,
+    TransportError, TransportResult, TransportSink,
 };

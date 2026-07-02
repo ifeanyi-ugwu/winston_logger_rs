@@ -97,9 +97,9 @@ use futures::future::join_all;
 use logform::LogInfo;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use whatwg_streams::{CountQueuingStrategy, ReadableStream, StreamError, StreamResult};
+use whatwg_streams::{CountQueuingStrategy, ReadableStream};
 
-use crate::{BoxedReadableSource, DynIngestHandle, DynReadableSource};
+use crate::{BoxedQuerySource, DynIngestHandle, DynQuerySource, TransportError, TransportResult};
 
 /// A stable content-derived identifier for a log entry — the dedup key that
 /// turns at-least-once delivery into effectively exactly-once *for an
@@ -201,9 +201,9 @@ impl DrainReceipt {
 /// # Example
 ///
 /// ```ignore
-/// # use winston_transport::{proxy::pipe_to_ingest, DynIngestHandle, DynReadableSource};
+/// # use winston_transport::{proxy::pipe_to_ingest, DynIngestHandle, DynQuerySource};
 /// # async fn ex(
-/// #     source: Box<dyn DynReadableSource>,
+/// #     source: Box<dyn DynQuerySource>,
 /// #     target: &dyn DynIngestHandle,
 /// # ) {
 /// let receipt = pipe_to_ingest(
@@ -217,21 +217,21 @@ impl DrainReceipt {
 /// # }
 /// ```
 pub async fn pipe_to_ingest<F, R>(
-    source: Box<dyn DynReadableSource>,
+    source: Box<dyn DynQuerySource>,
     target: &dyn DynIngestHandle,
     batch_size: usize,
     spawn_fn: F,
-) -> StreamResult<DrainReceipt>
+) -> TransportResult<DrainReceipt>
 where
     F: FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> R,
 {
-    let stream = ReadableStream::builder(BoxedReadableSource(source))
+    let stream = ReadableStream::builder(BoxedQuerySource(source))
         .strategy(CountQueuingStrategy::new(64))
         .spawn(spawn_fn);
 
     let (_locked, reader) = stream
         .get_reader()
-        .map_err(|_| StreamError::from("pipe_to_ingest: failed to acquire reader"))?;
+        .map_err(|_| TransportError::from("pipe_to_ingest: failed to acquire reader"))?;
 
     let cap = batch_size.max(1);
     let mut total = 0usize;
@@ -289,11 +289,11 @@ where
 /// }
 /// ```
 pub async fn fan_out_to_ingests<F, R>(
-    source: Box<dyn DynReadableSource>,
+    source: Box<dyn DynQuerySource>,
     targets: &[&dyn DynIngestHandle],
     batch_size: usize,
     spawn_fn: F,
-) -> StreamResult<FanOutStats>
+) -> TransportResult<FanOutStats>
 where
     F: FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> R,
 {
@@ -301,13 +301,13 @@ where
         return Ok(FanOutStats::default());
     }
 
-    let stream = ReadableStream::builder(BoxedReadableSource(source))
+    let stream = ReadableStream::builder(BoxedQuerySource(source))
         .strategy(CountQueuingStrategy::new(64))
         .spawn(spawn_fn);
 
     let (_locked, reader) = stream
         .get_reader()
-        .map_err(|_| StreamError::from("fan_out_to_ingests: failed to acquire reader"))?;
+        .map_err(|_| TransportError::from("fan_out_to_ingests: failed to acquire reader"))?;
 
     let mut stats = FanOutStats {
         per_target_shipped: vec![0; targets.len()],
@@ -394,25 +394,14 @@ impl FanOutStats {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use whatwg_streams::{ReadableSource, ReadableStreamDefaultController, StreamResult};
+    use crate::QuerySource;
 
-    /// Vec-backed source: yields one chunk per pull until exhausted.
+    /// Vec-backed source: yields one entry per `next` until exhausted.
     struct VecSource(std::vec::IntoIter<LogInfo>);
 
-    impl ReadableSource<LogInfo> for VecSource {
-        async fn pull(
-            &mut self,
-            controller: &mut ReadableStreamDefaultController<LogInfo>,
-        ) -> StreamResult<()> {
-            match self.0.next() {
-                Some(entry) => {
-                    let _ = controller.enqueue(entry);
-                }
-                None => {
-                    let _ = controller.close();
-                }
-            }
-            Ok(())
+    impl QuerySource for VecSource {
+        async fn next(&mut self) -> TransportResult<Option<LogInfo>> {
+            Ok(self.0.next())
         }
     }
 
@@ -425,7 +414,7 @@ mod tests {
         fn ingest<'s>(
             &'s self,
             logs: Vec<LogInfo>,
-        ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+        ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
             let store = Arc::clone(&self.0);
             Box::pin(async move {
                 store.lock().unwrap().extend(logs);
@@ -461,7 +450,7 @@ mod tests {
         let entries: Vec<LogInfo> = (0..7)
             .map(|i| LogInfo::new("info", &format!("entry {i}")))
             .collect();
-        let source: Box<dyn DynReadableSource> =
+        let source: Box<dyn DynQuerySource> =
             Box::new(VecSource(entries.into_iter()));
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -487,7 +476,7 @@ mod tests {
         let entries: Vec<LogInfo> = (0..5)
             .map(|i| LogInfo::new("info", &format!("e{i}")))
             .collect();
-        let source: Box<dyn DynReadableSource> =
+        let source: Box<dyn DynQuerySource> =
             Box::new(VecSource(entries.into_iter()));
 
         let c1 = Arc::new(Mutex::new(Vec::new()));
@@ -523,7 +512,7 @@ mod tests {
 
     #[test]
     fn fan_out_to_ingests_empty_targets_short_circuits() {
-        let source: Box<dyn DynReadableSource> =
+        let source: Box<dyn DynQuerySource> =
             Box::new(VecSource(vec![LogInfo::new("info", "x")].into_iter()));
 
         let stats = futures::executor::block_on(fan_out_to_ingests(
@@ -549,8 +538,8 @@ mod tests {
         fn ingest<'s>(
             &'s self,
             _logs: Vec<LogInfo>,
-        ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
-            Box::pin(async { Err(StreamError::from("simulated failure")) })
+        ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
+            Box::pin(async { Err(TransportError::from("simulated failure")) })
         }
     }
 
@@ -559,7 +548,7 @@ mod tests {
         let entries: Vec<LogInfo> = (0..4)
             .map(|i| LogInfo::new("info", &format!("e{i}")))
             .collect();
-        let source: Box<dyn DynReadableSource> =
+        let source: Box<dyn DynQuerySource> =
             Box::new(VecSource(entries.into_iter()));
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -633,14 +622,14 @@ mod tests {
         fn ingest<'s>(
             &'s self,
             logs: Vec<LogInfo>,
-        ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+        ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
             let idempotent = self.idempotent;
             let state = Arc::clone(&self.state);
             Box::pin(async move {
                 let mut st = state.lock().unwrap();
                 st.calls += 1;
                 if st.calls == st.fail_on_call {
-                    return Err(StreamError::from("simulated mid-stream failure"));
+                    return Err(TransportError::from("simulated mid-stream failure"));
                 }
                 if idempotent {
                     for e in &logs {
@@ -654,7 +643,7 @@ mod tests {
         }
     }
 
-    fn four_entries() -> Box<dyn DynReadableSource> {
+    fn four_entries() -> Box<dyn DynQuerySource> {
         Box::new(VecSource(
             (0..4)
                 .map(|i| LogInfo::new("info", &format!("e{i}")))

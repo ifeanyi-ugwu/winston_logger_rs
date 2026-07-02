@@ -27,11 +27,9 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use to_mongodb_filter::ToMongoDbFilter;
-use whatwg_streams::{
-    ReadableSource, ReadableStreamDefaultController, StreamError, StreamResult,
-};
 use winston_transport::{
-    DrainReceipt, DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Order, Transport,
+    DrainReceipt, DynIngestHandle, DynQueryHandle, DynQuerySource, LogQuery, Order, QuerySource,
+    Transport, TransportError, TransportResult,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,22 +117,22 @@ impl MongoDBTransportBuilder {
 }
 
 impl Transport for MongoDBTransport {
-    async fn start(&mut self) -> StreamResult<()> {
+    async fn start(&mut self) -> TransportResult<()> {
         let client = Client::with_uri_str(&self.options.connection_string)
             .await
-            .map_err(StreamError::other)?;
+            .map_err(TransportError::other)?;
         let db = client.database(&self.options.database);
         let collection: Collection<LogDocument> = db.collection(&self.options.collection);
-        create_indexes(&collection).await.map_err(StreamError::other)?;
+        create_indexes(&collection).await.map_err(TransportError::other)?;
         self.collection = Some(collection);
         Ok(())
     }
 
-    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+    async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
         let collection = self
             .collection
             .as_ref()
-            .ok_or_else(|| StreamError::from("MongoDBTransport not started"))?;
+            .ok_or_else(|| TransportError::from("MongoDBTransport not started"))?;
         let info = entry.info;
         let doc = LogDocument {
             timestamp: Utc::now(),
@@ -145,7 +143,7 @@ impl Transport for MongoDBTransport {
         collection
             .insert_one(doc)
             .await
-            .map_err(StreamError::other)?;
+            .map_err(TransportError::other)?;
         Ok(())
     }
 
@@ -201,14 +199,14 @@ impl DynIngestHandle for MongoDBIngestHandle {
     fn ingest<'s>(
         &'s self,
         logs: Vec<LogInfo>,
-    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
         Box::pin(async move {
             if logs.is_empty() {
                 return Ok(());
             }
             let client = Client::with_uri_str(&self.options.connection_string)
                 .await
-                .map_err(StreamError::other)?;
+                .map_err(TransportError::other)?;
             let db = client.database(&self.options.database);
 
             if self.idempotent {
@@ -241,7 +239,7 @@ impl DynIngestHandle for MongoDBIngestHandle {
                     // that's the whole point of idempotent ingest. Any
                     // other write error (or a write-concern error) is real.
                     Err(e) if is_all_duplicate_key(&e) => Ok(()),
-                    Err(e) => Err(StreamError::other(e)),
+                    Err(e) => Err(TransportError::other(e)),
                 }
             } else {
                 let collection: Collection<LogDocument> =
@@ -258,7 +256,7 @@ impl DynIngestHandle for MongoDBIngestHandle {
                 collection
                     .insert_many(docs)
                     .await
-                    .map_err(StreamError::other)?;
+                    .map_err(TransportError::other)?;
                 Ok(())
             }
         })
@@ -290,7 +288,7 @@ pub struct MongoDBQueryHandle {
 }
 
 impl DynQueryHandle for MongoDBQueryHandle {
-    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>> {
+    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynQuerySource>> {
         Some(Box::new(MongoDBSource::new(
             self.options.clone(),
             options.clone(),
@@ -313,7 +311,7 @@ impl MongoDBQueryHandle {
     pub fn query_consuming(
         &self,
         options: &LogQuery,
-    ) -> (Box<dyn DynReadableSource>, MongoDBConsumeToken) {
+    ) -> (Box<dyn DynQuerySource>, MongoDBConsumeToken) {
         let consumed: Arc<Mutex<Vec<bson::oid::ObjectId>>> =
             Arc::new(Mutex::new(Vec::new()));
         let source = MongoDBConsumingSource {
@@ -357,13 +355,13 @@ impl MongoDBConsumeToken {
     ///
     /// If the source emitted nothing, this is `Ok(0)` without hitting the
     /// server (and the receipt's count must be 0 too).
-    pub async fn delete_consumed(self, receipt: DrainReceipt) -> StreamResult<u64> {
+    pub async fn delete_consumed(self, receipt: DrainReceipt) -> TransportResult<u64> {
         let ids: Vec<bson::oid::ObjectId> = {
             let guard = self.consumed.lock().unwrap();
             guard.clone()
         };
         if receipt.entries_shipped() != ids.len() {
-            return Err(StreamError::from(format!(
+            return Err(TransportError::from(format!(
                 "delete_consumed: receipt reports {} shipped but this source \
                  emitted {} — did you pass a receipt from a different drain?",
                 receipt.entries_shipped(),
@@ -375,14 +373,14 @@ impl MongoDBConsumeToken {
         }
         let client = Client::with_uri_str(&self.options.connection_string)
             .await
-            .map_err(StreamError::other)?;
+            .map_err(TransportError::other)?;
         let collection: Collection<LogDocument> = client
             .database(&self.options.database)
             .collection(&self.options.collection);
         let result = collection
             .delete_many(doc! { "_id": { "$in": ids } })
             .await
-            .map_err(StreamError::other)?;
+            .map_err(TransportError::other)?;
         Ok(result.deleted_count)
     }
 }
@@ -397,15 +395,12 @@ struct MongoDBConsumingSource {
     consumed: Arc<Mutex<Vec<bson::oid::ObjectId>>>,
 }
 
-impl ReadableSource<LogInfo> for MongoDBConsumingSource {
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableStreamDefaultController<LogInfo>,
-    ) -> StreamResult<()> {
+impl QuerySource for MongoDBConsumingSource {
+    async fn next(&mut self) -> TransportResult<Option<LogInfo>> {
         if !self.initialized {
             let client = Client::with_uri_str(&self.options.connection_string)
                 .await
-                .map_err(StreamError::other)?;
+                .map_err(TransportError::other)?;
             let collection: Collection<Document> = client
                 .database(&self.options.database)
                 .collection(&self.options.collection);
@@ -415,21 +410,21 @@ impl ReadableSource<LogInfo> for MongoDBConsumingSource {
                 .find(filter)
                 .with_options(options)
                 .await
-                .map_err(StreamError::other)?;
+                .map_err(TransportError::other)?;
             self.cursor = Some(cursor);
             self.initialized = true;
         }
 
         let Some(cursor) = self.cursor.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
 
         match cursor.next().await {
             None => {
-                let _ = controller.close();
                 self.cursor = None;
+                Ok(None)
             }
-            Some(Err(e)) => return Err(StreamError::other(e)),
+            Some(Err(e)) => Err(TransportError::other(e)),
             Some(Ok(mut raw)) => {
                 // Capture `_id`, then strip it so the flattened `meta` in
                 // `LogDocument` doesn't pick it up.
@@ -437,20 +432,19 @@ impl ReadableSource<LogInfo> for MongoDBConsumingSource {
                     self.consumed.lock().unwrap().push(id);
                 }
                 let log_doc: LogDocument =
-                    bson::from_document(raw).map_err(StreamError::other)?;
+                    bson::from_document(raw).map_err(TransportError::other)?;
                 let mut log_info = document_to_loginfo(log_doc);
                 if !self.query.fields.is_empty() {
                     apply_field_projection(&mut log_info, &self.query.fields);
                 }
-                let _ = controller.enqueue(log_info);
+                Ok(Some(log_info))
             }
         }
-        Ok(())
     }
 }
 
-/// Streaming source: opens client + cursor lazily on first `pull`, then
-/// emits one document per `pull` call until the cursor is exhausted.
+/// Streaming source: opens client + cursor lazily on first `next`, then
+/// emits one document per `next` call until the cursor is exhausted.
 pub struct MongoDBSource {
     options: MongoDBOptions,
     query: LogQuery,
@@ -468,10 +462,10 @@ impl MongoDBSource {
         }
     }
 
-    async fn open_cursor(&mut self) -> StreamResult<mongodb::Cursor<LogDocument>> {
+    async fn open_cursor(&mut self) -> TransportResult<mongodb::Cursor<LogDocument>> {
         let client = Client::with_uri_str(&self.options.connection_string)
             .await
-            .map_err(StreamError::other)?;
+            .map_err(TransportError::other)?;
         let db = client.database(&self.options.database);
         let collection: Collection<LogDocument> = db.collection(&self.options.collection);
 
@@ -482,15 +476,12 @@ impl MongoDBSource {
             .find(filter)
             .with_options(options)
             .await
-            .map_err(StreamError::other)
+            .map_err(TransportError::other)
     }
 }
 
-impl ReadableSource<LogInfo> for MongoDBSource {
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableStreamDefaultController<LogInfo>,
-    ) -> StreamResult<()> {
+impl QuerySource for MongoDBSource {
+    async fn next(&mut self) -> TransportResult<Option<LogInfo>> {
         if !self.initialized {
             let cursor = self.open_cursor().await?;
             self.cursor = Some(cursor);
@@ -498,24 +489,23 @@ impl ReadableSource<LogInfo> for MongoDBSource {
         }
 
         let Some(cursor) = self.cursor.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
 
         match cursor.next().await {
             None => {
-                let _ = controller.close();
                 self.cursor = None;
+                Ok(None)
             }
-            Some(Err(e)) => return Err(StreamError::other(e)),
+            Some(Err(e)) => Err(TransportError::other(e)),
             Some(Ok(doc)) => {
                 let mut log_info = document_to_loginfo(doc);
                 if !self.query.fields.is_empty() {
                     apply_field_projection(&mut log_info, &self.query.fields);
                 }
-                let _ = controller.enqueue(log_info);
+                Ok(Some(log_info))
             }
         }
-        Ok(())
     }
 }
 
@@ -647,7 +637,7 @@ mod tests {
     use mongodb::bson::doc;
     use std::env;
     use whatwg_streams::{CountQueuingStrategy, ReadableStream, WritableStream};
-    use winston_transport::{BoxedReadableSource, TransportSink};
+    use winston_transport::{BoxedQuerySource, TransportSink};
 
     fn fe(level: &str, msg: impl Into<String>) -> FormattedEntry {
         FormattedEntry::new(LogInfo::new(level, msg), None)
@@ -745,7 +735,7 @@ mod tests {
         let mut q = LogQuery::new();
         q.levels = vec!["info".to_string()];
         let source = handle.query(&q).expect("query returned None");
-        let read_stream = ReadableStream::builder(BoxedReadableSource(source))
+        let read_stream = ReadableStream::builder(BoxedQuerySource(source))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(|fut| {
                 tokio::spawn(fut);
@@ -875,7 +865,7 @@ mod tests {
             fn ingest<'s>(
                 &'s self,
                 logs: Vec<LogInfo>,
-            ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+            ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
                 let store = Arc::clone(&self.0);
                 Box::pin(async move {
                     store.lock().unwrap().extend(logs);

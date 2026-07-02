@@ -4,8 +4,6 @@ use std::{
     marker::PhantomData,
 };
 
-use whatwg_streams::StreamResult;
-
 pub use winston_file::FileTransport as File;
 pub use winston_transport::*;
 
@@ -40,12 +38,12 @@ where
 {
     // Stdout/stderr/etc. don't keep history — query is unsupported.
 
-    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+    async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
         writeln!(&mut self.writer, "{}", entry)?;
         Ok(())
     }
 
-    async fn close(mut self) -> StreamResult<()> {
+    async fn close(mut self) -> TransportResult<()> {
         self.writer.flush()?;
         Ok(())
     }

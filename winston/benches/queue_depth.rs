@@ -42,7 +42,7 @@ use logform::{FinalizeExt, FormattedEntry, LogInfo};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use whatwg_streams::StreamResult;
+use winston_transport::TransportResult;
 use winston::{Logger, LoggerTransport, OverflowPolicy, Transport};
 
 /// Entries per measured batch. Must stay well above any swept queue depth so the
@@ -56,7 +56,7 @@ struct CountingSink {
 }
 
 impl Transport for CountingSink {
-    async fn log(&mut self, _entry: FormattedEntry) -> StreamResult<()> {
+    async fn log(&mut self, _entry: FormattedEntry) -> TransportResult<()> {
         self.count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

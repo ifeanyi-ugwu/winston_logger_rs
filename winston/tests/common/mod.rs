@@ -4,8 +4,9 @@ use logform::{FormattedEntry, LogInfo};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use whatwg_streams::{ReadableSource, ReadableStreamDefaultController, StreamResult};
-use winston_transport::{DynQueryHandle, DynReadableSource, LogQuery, Transport};
+use winston_transport::{
+    DynQueryHandle, DynQuerySource, LogQuery, QuerySource, Transport, TransportResult,
+};
 
 /// Configuration for MockTransport behavior
 #[derive(Clone, Debug)]
@@ -91,7 +92,7 @@ impl MockTransport {
 }
 
 impl Transport for MockTransport {
-    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+    async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
         if self.config.should_fail_log {
             return Ok(());
         }
@@ -114,7 +115,7 @@ struct MockQueryHandle {
 }
 
 impl DynQueryHandle for MockQueryHandle {
-    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>> {
+    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynQuerySource>> {
         let snapshot: Vec<LogInfo> = {
             let logs = self.logs.lock().unwrap();
             logs.iter()
@@ -142,20 +143,9 @@ struct VecSource {
     entries: std::vec::IntoIter<LogInfo>,
 }
 
-impl ReadableSource<LogInfo> for VecSource {
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableStreamDefaultController<LogInfo>,
-    ) -> StreamResult<()> {
-        match self.entries.next() {
-            Some(entry) => {
-                let _ = controller.enqueue(entry);
-            }
-            None => {
-                let _ = controller.close();
-            }
-        }
-        Ok(())
+impl QuerySource for VecSource {
+    async fn next(&mut self) -> TransportResult<Option<LogInfo>> {
+        Ok(self.entries.next())
     }
 }
 

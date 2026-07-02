@@ -7,8 +7,7 @@ use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use whatwg_streams::{StreamError, StreamResult};
-use winston_transport::{DynIngestHandle, Transport};
+use winston_transport::{DynIngestHandle, Transport, TransportError, TransportResult};
 
 pub struct DailyRotateFileOptions {
     pub filename: PathBuf,
@@ -357,7 +356,7 @@ impl DailyRotateFile {
 }
 
 impl Transport for DailyRotateFile {
-    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+    async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
         // Use the full Display so any logform finalizer (json, printf, etc.)
         // gets honored. This matches `winston_file::FileTransport` and lets
         // rotated files round-trip through `FileSource` for `ship_rotated_files`.
@@ -370,7 +369,7 @@ impl Transport for DailyRotateFile {
         Ok(())
     }
 
-    async fn close(mut self) -> StreamResult<()> {
+    async fn close(mut self) -> TransportResult<()> {
         self.writer.flush()?;
         Ok(())
     }
@@ -404,25 +403,25 @@ impl DynIngestHandle for DailyRotateIngestHandle {
     fn ingest<'s>(
         &'s self,
         logs: Vec<LogInfo>,
-    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
         Box::pin(async move {
             if logs.is_empty() {
                 return Ok(());
             }
             let path = match self.active_path.read() {
                 Ok(guard) => guard.clone(),
-                Err(_) => return Err(StreamError::from("daily-rotate active path lock poisoned")),
+                Err(_) => return Err(TransportError::from("daily-rotate active path lock poisoned")),
             };
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
-                .map_err(StreamError::other)?;
+                .map_err(TransportError::other)?;
             let mut writer = BufWriter::new(file);
             for entry in logs {
-                writeln!(&mut writer, "{}", entry).map_err(StreamError::other)?;
+                writeln!(&mut writer, "{}", entry).map_err(TransportError::other)?;
             }
-            writer.flush().map_err(StreamError::other)?;
+            writer.flush().map_err(TransportError::other)?;
             Ok(())
         })
     }

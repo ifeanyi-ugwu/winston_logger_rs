@@ -19,8 +19,9 @@ use logform::{FormattedEntry, LogInfo};
 use reqwest::Client;
 use serde_json::Value;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
-use whatwg_streams::{StreamError, StreamResult};
-use winston_transport::{content_id, DynIngestHandle, Transport};
+use winston_transport::{
+    content_id, DynIngestHandle, Transport, TransportError, TransportResult,
+};
 
 /// Flatten `entry` to JSON and stamp an `_id` field with its [`content_id`].
 /// The endpoint can dedup on `_id` to make a re-POST (after a crash-retry on
@@ -70,7 +71,7 @@ impl HttpTransport {
         HttpTransportBuilder::new()
     }
 
-    async fn send_logs(&self, logs: &[LogInfo]) -> StreamResult<()> {
+    async fn send_logs(&self, logs: &[LogInfo]) -> TransportResult<()> {
         if logs.is_empty() {
             return Ok(());
         }
@@ -93,10 +94,10 @@ impl HttpTransport {
         }
         .send()
         .await
-        .map_err(StreamError::other)?;
+        .map_err(TransportError::other)?;
 
         if !response.status().is_success() {
-            return Err(StreamError::from(format!(
+            return Err(TransportError::from(format!(
                 "HTTP error: {}",
                 response.status()
             )));
@@ -108,7 +109,7 @@ impl HttpTransport {
 impl Transport for HttpTransport {
     // No query — HTTP transport doesn't keep a local log store.
 
-    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+    async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
         // HTTP ships the structured entry as JSON; the rendered string is unused.
         let info = entry.info;
         if let Some(batch_size) = self.options.batch_size {
@@ -125,7 +126,7 @@ impl Transport for HttpTransport {
         Ok(())
     }
 
-    async fn close(mut self) -> StreamResult<()> {
+    async fn close(mut self) -> TransportResult<()> {
         if !self.buffer.is_empty() {
             let to_send: Vec<LogInfo> = self.buffer.drain(..).collect();
             self.send_logs(&to_send).await?;
@@ -155,7 +156,7 @@ impl DynIngestHandle for HttpIngestHandle {
     fn ingest<'s>(
         &'s self,
         logs: Vec<LogInfo>,
-    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
         Box::pin(async move {
             if logs.is_empty() {
                 return Ok(());
@@ -174,10 +175,10 @@ impl DynIngestHandle for HttpIngestHandle {
             }
             .send()
             .await
-            .map_err(StreamError::other)?;
+            .map_err(TransportError::other)?;
 
             if !response.status().is_success() {
-                return Err(StreamError::from(format!(
+                return Err(TransportError::from(format!(
                     "HTTP error: {}",
                     response.status()
                 )));

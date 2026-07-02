@@ -7,17 +7,15 @@ use chrono::{DateTime, Utc};
 use dateparser::parse;
 use logform::{FormattedEntry, LogInfo};
 use serde_json::Value;
-use whatwg_streams::{ReadableSource, ReadableStreamDefaultController, StreamResult};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use whatwg_streams::{
-    CountQueuingStrategy, DefaultStream, ReadableStream, StreamError, Unlocked,
-};
+use whatwg_streams::{CountQueuingStrategy, DefaultStream, ReadableStream, Unlocked};
 use winston_transport::{
-    BoxedReadableSource, DynIngestHandle, DynQueryHandle, DynReadableSource, LogQuery, Transport,
+    BoxedQuerySource, DynIngestHandle, DynQueryHandle, DynQuerySource, LogQuery, QuerySource,
+    Transport, TransportError, TransportResult,
 };
 
 
@@ -106,13 +104,13 @@ impl FileTransport {
 }
 
 impl Transport for FileTransport {
-    async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+    async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
         let mut inner = self.inner.lock();
         writeln!(&mut inner.writer, "{}", entry)?;
         Ok(())
     }
 
-    async fn close(self) -> StreamResult<()> {
+    async fn close(self) -> TransportResult<()> {
         let mut inner = self.inner.lock();
         inner.writer.flush()?;
         Ok(())
@@ -139,10 +137,10 @@ struct FileQueryHandle {
 }
 
 impl DynQueryHandle for FileQueryHandle {
-    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>> {
+    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynQuerySource>> {
         FileSource::open(&self.path, options.clone())
             .ok()
-            .map(|s| Box::new(s) as Box<dyn DynReadableSource>)
+            .map(|s| Box::new(s) as Box<dyn DynQuerySource>)
     }
 }
 
@@ -226,8 +224,8 @@ impl FileRotateHandle {
         };
 
         let source = FileSource::open(&renamed_path, LogQuery::new())?;
-        let source: Box<dyn DynReadableSource> = Box::new(source);
-        let stream = ReadableStream::builder(BoxedReadableSource(source))
+        let source: Box<dyn DynQuerySource> = Box::new(source);
+        let stream = ReadableStream::builder(BoxedQuerySource(source))
             .strategy(CountQueuingStrategy::new(64))
             .spawn(spawn_fn);
 
@@ -281,7 +279,7 @@ impl FileRotateHandle {
 /// split into parts, drain the stream, then `remove_file(&path)`.
 pub struct FileDrain {
     path: PathBuf,
-    stream: ReadableStream<LogInfo, BoxedReadableSource, DefaultStream, Unlocked>,
+    stream: ReadableStream<LogInfo, BoxedQuerySource, DefaultStream, Unlocked>,
 }
 
 impl FileDrain {
@@ -296,7 +294,7 @@ impl FileDrain {
         self,
     ) -> (
         PathBuf,
-        ReadableStream<LogInfo, BoxedReadableSource, DefaultStream, Unlocked>,
+        ReadableStream<LogInfo, BoxedQuerySource, DefaultStream, Unlocked>,
     ) {
         (self.path, self.stream)
     }
@@ -342,7 +340,7 @@ impl DynIngestHandle for FileIngestHandle {
     fn ingest<'s>(
         &'s self,
         logs: Vec<LogInfo>,
-    ) -> Pin<Box<dyn Future<Output = whatwg_streams::StreamResult<()>> + Send + 's>> {
+    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
         Box::pin(async move {
             if logs.is_empty() {
                 return Ok(());
@@ -351,15 +349,15 @@ impl DynIngestHandle for FileIngestHandle {
                 .create(true)
                 .append(true)
                 .open(&self.path)
-                .map_err(StreamError::other)?;
+                .map_err(TransportError::other)?;
             let mut writer = BufWriter::new(file);
             for entry in logs {
                 // Ingested entries are structured `LogInfo`; write them as the
                 // JSON line `parse_log_entry` reads back, so File -> File proxy
                 // round-trips through the queryable on-disk format.
-                writeln!(&mut writer, "{}", entry.to_flat_value()).map_err(StreamError::other)?;
+                writeln!(&mut writer, "{}", entry.to_flat_value()).map_err(TransportError::other)?;
             }
-            writer.flush().map_err(StreamError::other)?;
+            writer.flush().map_err(TransportError::other)?;
             Ok(())
         })
     }
@@ -412,34 +410,29 @@ impl FileSource {
     }
 }
 
-impl ReadableSource<LogInfo> for FileSource {
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableStreamDefaultController<LogInfo>,
-    ) -> StreamResult<()> {
+impl QuerySource for FileSource {
+    async fn next(&mut self) -> TransportResult<Option<LogInfo>> {
         let Some(reader) = self.reader.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
 
         let limit = self.query.limit.unwrap_or(usize::MAX);
         let start = self.query.start.unwrap_or(0);
 
-        // Read forward until we either enqueue exactly one matching entry, hit
+        // Read forward until we either yield exactly one matching entry, hit
         // EOF, or hit the limit.
         let mut line = String::new();
         loop {
             if self.emitted >= limit {
-                let _ = controller.close();
                 self.reader = None;
-                return Ok(());
+                return Ok(None);
             }
 
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => {
-                    let _ = controller.close();
                     self.reader = None;
-                    return Ok(());
+                    return Ok(None);
                 }
                 Err(e) => return Err(e.into()),
                 Ok(_) => {}
@@ -464,9 +457,8 @@ impl ReadableSource<LogInfo> for FileSource {
                 project_fields(entry, &self.query.fields)
             };
 
-            let _ = controller.enqueue(projected);
             self.emitted += 1;
-            return Ok(());
+            return Ok(Some(projected));
         }
     }
 }
@@ -554,7 +546,7 @@ mod tests {
     use logform::{json, timestamp, FinalizeExt, Format};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use whatwg_streams::{CountQueuingStrategy, ReadableStream, WritableStream};
-    use winston_transport::{BoxedReadableSource, TransportSink};
+    use winston_transport::{BoxedQuerySource, TransportSink};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -603,7 +595,7 @@ mod tests {
     }
 
     /// Round-trip: write three entries, query them back via `Transport::query`
-    /// → `BoxedReadableSource` → `ReadableStream`. Filter to `info` only.
+    /// → `BoxedQuerySource` → `ReadableStream`. Filter to `info` only.
     #[test]
     fn query_streams_results_with_level_filter() {
         let path = unique_path("query");
@@ -636,7 +628,7 @@ mod tests {
         q.levels = vec!["info".to_string()];
         let source = handle.query(&q).expect("query returned None");
 
-        let read_stream = ReadableStream::builder(BoxedReadableSource(source))
+        let read_stream = ReadableStream::builder(BoxedQuerySource(source))
             .strategy(CountQueuingStrategy::new(8))
             .spawn(thread_spawner);
 

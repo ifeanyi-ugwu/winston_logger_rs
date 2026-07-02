@@ -595,7 +595,7 @@ mod tests {
     use logform::{FinalizeExt, Format};
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::prelude::*;
-    use whatwg_streams::StreamResult;
+    use winston_transport::TransportResult;
     use winston::default_spawner;
 
     /// Test transport: pushes each entry into a shared `Vec`. Cloning shares
@@ -606,7 +606,7 @@ mod tests {
     struct CaptureTransport(Arc<Mutex<Vec<LogInfo>>>);
 
     impl Transport for CaptureTransport {
-        async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+        async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
             self.0.lock().unwrap().push(entry.info);
             Ok(())
         }

@@ -25,7 +25,7 @@ use std::{
 use flate2::read::GzDecoder;
 use winston_file::FileSource;
 use winston_transport::{
-    proxy::pipe_to_ingest, DynIngestHandle, DynReadableSource, LogQuery,
+    proxy::pipe_to_ingest, DynIngestHandle, DynQuerySource, LogQuery,
 };
 
 use crate::DailyRotateRotationHandle;
@@ -130,7 +130,7 @@ where
         } else {
             Box::new(BufReader::new(file))
         };
-    let source: Box<dyn DynReadableSource> =
+    let source: Box<dyn DynQuerySource> =
         Box::new(FileSource::from_reader(reader, LogQuery::new()));
     let receipt = pipe_to_ingest(source, target, batch_size, move |fut| spawn_fn(fut))
         .await
@@ -184,8 +184,8 @@ mod tests {
     use logform::{json, timestamp, FinalizeExt, Format, FormattedEntry, LogInfo};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
-    use whatwg_streams::{CountQueuingStrategy, StreamResult, WritableStream};
-    use winston_transport::{DynIngestHandle, TransportSink};
+    use whatwg_streams::{CountQueuingStrategy, WritableStream};
+    use winston_transport::{DynIngestHandle, TransportResult, TransportSink};
 
     use crate::DailyRotateFile;
 
@@ -197,7 +197,7 @@ mod tests {
         fn ingest<'s>(
             &'s self,
             logs: Vec<LogInfo>,
-        ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
+        ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>> {
             let store = Arc::clone(&self.0);
             Box::pin(async move {
                 store.lock().unwrap().extend(logs);

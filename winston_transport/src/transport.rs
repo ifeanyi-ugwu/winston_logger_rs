@@ -8,6 +8,19 @@ use whatwg_streams::{
 
 use crate::log_query::LogQuery;
 
+/// Result type returned by transport operations (`log`, `start`, `close`,
+/// `ingest`, `QuerySource::next`).
+///
+/// Currently an alias of the streams crate's result so transports don't depend
+/// on `whatwg_streams` directly. It can become an independent error type later
+/// without changing any transport signature — transports already name it
+/// through `winston_transport`.
+pub type TransportResult<T> = StreamResult<T>;
+
+/// Error type carried by [`TransportResult`]. See [`TransportResult`] for why
+/// it is aliased rather than defined outright.
+pub use whatwg_streams::StreamError as TransportError;
+
 /// The transport contract — what a log destination implements.
 ///
 /// A transport receives each already-formatted entry through [`log`](Transport::log)
@@ -46,7 +59,7 @@ use crate::log_query::LogQuery;
 pub trait Transport: Send + Sync + 'static {
     /// Set up the sink before the first `log` — open a connection, create
     /// indexes, etc. Runs once. Default does nothing.
-    fn start(&mut self) -> impl Future<Output = StreamResult<()>> + Send {
+    fn start(&mut self) -> impl Future<Output = TransportResult<()>> + Send {
         async { Ok(()) }
     }
 
@@ -58,14 +71,14 @@ pub trait Transport: Send + Sync + 'static {
     fn log(
         &mut self,
         entry: FormattedEntry,
-    ) -> impl Future<Output = StreamResult<()>> + Send;
+    ) -> impl Future<Output = TransportResult<()>> + Send;
 
     /// Flush and finalize when the Logger tears the transport down.
     ///
     /// Takes `self` by value so a buffering sink can drain its accumulated
     /// state. Called on graceful shutdown only — teardown that must always run
     /// belongs in a `Drop` impl. Default flushes nothing.
-    fn close(self) -> impl Future<Output = StreamResult<()>> + Send
+    fn close(self) -> impl Future<Output = TransportResult<()>> + Send
     where
         Self: Sized,
     {
@@ -122,7 +135,7 @@ impl<T: Transport> WritableSink<FormattedEntry> for TransportSink<T> {
 /// `WritableStream`. Each call to [`DynQueryHandle::query`] opens a fresh
 /// streaming source over the underlying store.
 pub trait DynQueryHandle: Send + Sync + 'static {
-    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynReadableSource>>;
+    fn query(&self, options: &LogQuery) -> Option<Box<dyn DynQuerySource>>;
 
     /// Synchronous collect for in-memory transports. Returns all matching
     /// entries directly, bypassing `ReadableStream` task/channel overhead.
@@ -144,45 +157,67 @@ pub trait DynIngestHandle: Send + Sync + 'static {
     fn ingest<'s>(
         &'s self,
         logs: Vec<LogInfo>,
-    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>>;
+    ) -> Pin<Box<dyn Future<Output = TransportResult<()>> + Send + 's>>;
 }
 
-/// Object-safe wrapper for [`ReadableSource<LogInfo>`].
+/// A pull-based query source — the read-side counterpart of [`Transport`].
 ///
-/// The base `ReadableSource` trait uses `impl Future` returns and isn't
-/// dyn-compatible. `DynReadableSource` exposes the same shape with `BoxFuture`
-/// returns so query handles can return `Box<dyn DynReadableSource>`. A blanket
-/// impl converts any `S: ReadableSource<LogInfo> + Send + 'static`
-/// automatically — implementers don't write this themselves.
-pub trait DynReadableSource: Send + 'static {
-    fn pull_dyn<'s>(
-        &'s mut self,
-        controller: &'s mut ReadableStreamDefaultController<LogInfo>,
-    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>>;
+/// A [`DynQueryHandle::query`] returns one of these to stream past entries out
+/// of the transport's store. Each [`next`](QuerySource::next) yields the next
+/// matching entry, or `Ok(None)` once the results are exhausted. A source never
+/// touches the streaming machinery: the Logger wraps it in a
+/// [`BoxedQuerySource`] and drives that through a `ReadableStream`, which pulls
+/// on demand and applies backpressure via its queuing strategy.
+///
+/// Synchronous sources return a ready future; sources doing real I/O (a file
+/// read, a DB cursor step) `await` it inside `next`.
+pub trait QuerySource: Send + 'static {
+    fn next(&mut self) -> impl Future<Output = TransportResult<Option<LogInfo>>> + Send;
 }
 
-impl<S> DynReadableSource for S
+/// Object-safe wrapper for [`QuerySource`].
+///
+/// `QuerySource::next` uses an `impl Future` return and isn't dyn-compatible.
+/// `DynQuerySource` exposes the same shape with a `BoxFuture` return so query
+/// handles can return `Box<dyn DynQuerySource>`. A blanket impl converts any
+/// `Q: QuerySource` automatically — implementers don't write this themselves.
+pub trait DynQuerySource: Send + 'static {
+    fn next_dyn(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = TransportResult<Option<LogInfo>>> + Send + '_>>;
+}
+
+impl<Q> DynQuerySource for Q
 where
-    S: ReadableSource<LogInfo> + Send + 'static,
+    Q: QuerySource,
 {
-    fn pull_dyn<'s>(
-        &'s mut self,
-        controller: &'s mut ReadableStreamDefaultController<LogInfo>,
-    ) -> Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 's>> {
-        Box::pin(<S as ReadableSource<LogInfo>>::pull(self, controller))
+    fn next_dyn(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = TransportResult<Option<LogInfo>>> + Send + '_>> {
+        Box::pin(<Q as QuerySource>::next(self))
     }
 }
 
-/// Wraps a `Box<dyn DynReadableSource>` so it can be fed to
-/// `ReadableStream::builder(...)` — the `Box` itself isn't a `ReadableSource`,
-/// but this thin newtype is.
-pub struct BoxedReadableSource(pub Box<dyn DynReadableSource>);
+/// Adapts a `Box<dyn DynQuerySource>` into the `ReadableSource<LogInfo>` a
+/// `ReadableStream` drives. The query consumer wraps a source in this before
+/// building its stream; source authors never construct or see it. This is the
+/// single place the stream-source protocol lives on the read side — the mirror
+/// of [`TransportSink`] on the write side.
+pub struct BoxedQuerySource(pub Box<dyn DynQuerySource>);
 
-impl ReadableSource<LogInfo> for BoxedReadableSource {
+impl ReadableSource<LogInfo> for BoxedQuerySource {
     async fn pull(
         &mut self,
         controller: &mut ReadableStreamDefaultController<LogInfo>,
     ) -> StreamResult<()> {
-        self.0.pull_dyn(controller).await
+        match self.0.next_dyn().await? {
+            Some(entry) => {
+                let _ = controller.enqueue(entry);
+            }
+            None => {
+                let _ = controller.close();
+            }
+        }
+        Ok(())
     }
 }

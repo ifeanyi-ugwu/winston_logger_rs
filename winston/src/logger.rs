@@ -19,7 +19,7 @@ use std::{
     },
 };
 use whatwg_streams::{CountQueuingStrategy, ReadableStream};
-use winston_transport::{BoxedReadableSource, LogQuery, Transport};
+use winston_transport::{BoxedQuerySource, LogQuery, Transport};
 
 static NEXT_TRANSPORT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -336,7 +336,7 @@ impl Logger {
 
     /// Drain past entries matching `options` from every queryable transport.
     /// Each transport that exposed a `query_handle` at registration time
-    /// gets asked to open a fresh `ReadableSource<LogInfo>`; sources are
+    /// gets asked to open a fresh `QuerySource`; sources are
     /// read sequentially.
     pub async fn query(&self, options: &LogQuery) -> Result<Vec<LogInfo>, String> {
         let handles: Vec<_> = {
@@ -363,7 +363,7 @@ impl Logger {
                 continue;
             };
             let spawn_for_stream = Arc::clone(&self.spawn_fn);
-            let stream = ReadableStream::builder(BoxedReadableSource(source))
+            let stream = ReadableStream::builder(BoxedQuerySource(source))
                 .strategy(CountQueuingStrategy::new(64))
                 .spawn(move |fut| spawn_for_stream(fut));
             let (_locked, reader) = stream
@@ -778,8 +778,7 @@ mod tests {
     use crate::logger_options::LoggerOptions;
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
-    use whatwg_streams::{ReadableSource, ReadableStreamDefaultController, StreamResult};
-    use winston_transport::{DynQueryHandle, DynReadableSource};
+    use winston_transport::{DynQueryHandle, DynQuerySource, QuerySource, TransportResult};
 
     /// Test transport: collects writes into a shared `Vec`. Cloning shares the
     /// underlying `Arc<Mutex<Vec<LogInfo>>>` so the test thread keeps a handle
@@ -803,7 +802,7 @@ mod tests {
     }
 
     impl Transport for TestTransport {
-        async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+        async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
             self.logs.lock().unwrap().push(entry.info);
             Ok(())
         }
@@ -820,7 +819,7 @@ mod tests {
     }
 
     impl DynQueryHandle for TestQueryHandle {
-        fn query(&self, _options: &LogQuery) -> Option<Box<dyn DynReadableSource>> {
+        fn query(&self, _options: &LogQuery) -> Option<Box<dyn DynQuerySource>> {
             let snapshot = self.logs.lock().unwrap().clone();
             Some(Box::new(VecSource {
                 entries: snapshot.into_iter(),
@@ -836,20 +835,9 @@ mod tests {
         entries: std::vec::IntoIter<LogInfo>,
     }
 
-    impl ReadableSource<LogInfo> for VecSource {
-        async fn pull(
-            &mut self,
-            controller: &mut ReadableStreamDefaultController<LogInfo>,
-        ) -> StreamResult<()> {
-            match self.entries.next() {
-                Some(entry) => {
-                    let _ = controller.enqueue(entry);
-                }
-                None => {
-                    let _ = controller.close();
-                }
-            }
-            Ok(())
+    impl QuerySource for VecSource {
+        async fn next(&mut self) -> TransportResult<Option<LogInfo>> {
+            Ok(self.entries.next())
         }
     }
 
@@ -977,7 +965,7 @@ mod tests {
         entries: Arc<Mutex<Vec<(LogInfo, Option<String>)>>>,
     }
     impl Transport for CapturingSink {
-        async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+        async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
             self.entries
                 .lock()
                 .unwrap()
@@ -1466,7 +1454,7 @@ mod tests {
     }
 
     impl Transport for PermittedTransport {
-        async fn log(&mut self, _entry: FormattedEntry) -> StreamResult<()> {
+        async fn log(&mut self, _entry: FormattedEntry) -> TransportResult<()> {
             let _ = self.permits.next().await;
             Ok(())
         }
@@ -1632,7 +1620,7 @@ mod tests {
             seen: Arc<Mutex<Vec<String>>>,
         }
         impl Transport for Wrapped {
-            async fn log(&mut self, entry: FormattedEntry) -> StreamResult<()> {
+            async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
                 let message = entry.info.message.clone();
                 self.inner.log(entry).await?;
                 self.seen.lock().unwrap().push(message);

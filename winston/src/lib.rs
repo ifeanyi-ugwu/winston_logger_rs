@@ -24,6 +24,6 @@ pub use pipeline::{
     TransportStats,
 };
 pub use winston_transport::{
-    BoxedReadableSource, DrainReceipt, DynIngestHandle, DynQueryHandle, DynReadableSource,
-    FanOutStats, LogQuery, Transport,
+    BoxedQuerySource, DrainReceipt, DynIngestHandle, DynQueryHandle, DynQuerySource, FanOutStats,
+    LogQuery, QuerySource, Transport, TransportError, TransportResult,
 };

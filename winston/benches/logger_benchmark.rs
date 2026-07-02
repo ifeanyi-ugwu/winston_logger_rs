@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use logform::{FinalizeExt, FormattedEntry, LogInfo};
 use std::sync::Arc;
-use whatwg_streams::StreamResult;
+use winston_transport::TransportResult;
 use winston::{
     default_spawner, pooled_spawner, single_threaded_spawner, Logger, LoggerOptions, SpawnFn,
 };
@@ -15,7 +15,7 @@ fn benchmark_logging(c: &mut Criterion) {
     #[derive(Clone)]
     struct NoOpTransport;
     impl Transport for NoOpTransport {
-        async fn log(&mut self, _entry: FormattedEntry) -> StreamResult<()> {
+        async fn log(&mut self, _entry: FormattedEntry) -> TransportResult<()> {
             Ok(())
         }
     }
