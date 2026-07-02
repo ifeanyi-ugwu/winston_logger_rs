@@ -402,6 +402,11 @@ add a fourth corner. So the `.await` *is* the mechanism of cooperative lossless
 backpressure — a yield point in the caller's control flow — not removable
 ugliness. Delete it and saturation forces Drop or thread-park.
 
+Every mature logger resolves this triangle the same way — by picking a corner, and
+their "non-lossy" option is always thread-parking, never an async-cooperative
+`.await`. The survey is in
+[backpressure-prior-art.md](backpressure-prior-art.md).
+
 ### Two routes to the door
 
 **Route 1 — direct per-slot `send().await` (needs step A).** `log_async` fans out
@@ -517,3 +522,6 @@ level-gate and entry construction live inside the block, so laziness is preserve
   all of the above off the common case.
 - `docs/spawner-oversubscription-investigation.md` — the spawner (consumer-side)
   knob and why it doesn't reach the producer-side block.
+- [backpressure-prior-art.md](backpressure-prior-art.md) — how tracing-appender,
+  slog-async, zap, and zerolog handle the same sync-call backpressure tension
+  (they all pick a triangle corner; "lossless" always means block a thread).
