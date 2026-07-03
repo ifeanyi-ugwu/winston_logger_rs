@@ -563,6 +563,58 @@ impl Routing {
         }
     }
 
+    /// Async twin of [`dispatch_entry`]. Phase 1 is identical — non-blocking
+    /// `try_push` to every admitted slot, with drop policies resolved inline.
+    /// Phase 2 **awaits** each `Block`-saturated slot's mailbox (yielding the
+    /// task) instead of parking the caller's thread, and `join`s those waits so
+    /// a slow slot does not serialise the rest (ADR 0003's parallelism, ADR
+    /// 0009's cooperative backpressure).
+    ///
+    /// [`dispatch_entry`]: Routing::dispatch_entry
+    #[cfg(feature = "async-log")]
+    pub(crate) async fn dispatch_entry_async(&self, entry: &Arc<LogInfo>) {
+        // Stage 1: global transforms, once. Drop here skips every slot.
+        let enriched: Arc<LogInfo> = match &self.global_format {
+            Some(gf) => match gf.transform((**entry).clone()) {
+                Some(transformed) => Arc::new(transformed),
+                None => return,
+            },
+            None => Arc::clone(entry),
+        };
+
+        let mut deferred_blocks: Vec<(usize, SlotMessage)> = Vec::new();
+
+        // Phase 1: identical to the sync path.
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if !self.passes_level(&entry.level, slot.level.as_ref()) {
+                continue;
+            }
+            let Some(formatted) = self.format_for(slot, &enriched) else {
+                continue;
+            };
+            if let Some(deferred) = self.try_push_to_slot(slot, SlotMessage::Entry(formatted)) {
+                deferred_blocks.push((idx, deferred));
+            }
+        }
+
+        if deferred_blocks.is_empty() {
+            return;
+        }
+
+        // Phase 2: await room per Block-saturated slot, in parallel. Each future
+        // owns an `Arc` clone of its slot, so nothing borrows `self` across the
+        // await.
+        let sends = deferred_blocks.into_iter().map(|(idx, msg)| {
+            let slot = Arc::clone(&self.slots[idx]);
+            async move {
+                if slot.mailbox_tx.send(msg).await.is_ok() {
+                    slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        futures::future::join_all(sends).await;
+    }
+
     /// Non-blocking push of a prepared `Entry` message to a single slot.
     /// Returns `Some(msg)` only when the slot is `Block`-policy and the
     /// mailbox is full — caller must then call `push_blocking` in phase 2.
@@ -634,6 +686,29 @@ impl Routing {
         }
 
         self.dispatch_entry(&entry);
+    }
+
+    /// Async twin of [`process_entry`]: same empty-message gate and
+    /// no-transport buffering; a saturated `Block` slot is awaited rather than
+    /// blocked on. The `Logger::log_async` happy path runs through here.
+    ///
+    /// [`process_entry`]: Routing::process_entry
+    #[cfg(feature = "async-log")]
+    pub(crate) async fn process_entry_async(&self, entry: Arc<LogInfo>) {
+        if entry.message.is_empty() && entry.meta.is_empty() {
+            return;
+        }
+
+        if self.slots.is_empty() {
+            self.buffer.lock().unwrap().push_back(Arc::clone(&entry));
+            eprintln!(
+                "[winston] Attempt to write logs with no transports, which can increase memory usage: {}",
+                entry.message
+            );
+            return;
+        }
+
+        self.dispatch_entry_async(&entry).await;
     }
 
     /// Send `Flush` barriers into every slot, then block the calling

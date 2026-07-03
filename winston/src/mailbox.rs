@@ -157,9 +157,6 @@ impl<T> MailboxSender<T> {
     /// contract). A push only commits inside `try_push` under the queue lock, so
     /// a cancelled future never leaves a half-enqueued entry.
     #[cfg(feature = "async-log")]
-    // Introduced ahead of its first non-test caller, `Logger::log_async`
-    // (ADR 0009, Phase 1); drop the allow when that lands.
-    #[allow(dead_code)]
     pub(crate) async fn send(&self, mut msg: T) -> Result<(), SendError<T>> {
         loop {
             match self.try_push(msg) {

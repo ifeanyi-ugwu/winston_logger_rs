@@ -289,6 +289,26 @@ impl Logger {
         self.routing.load_full().process_entry(Arc::new(entry));
     }
 
+    /// Async dispatch to every slot — the cooperative twin of [`log`](Logger::log).
+    ///
+    /// Behaves exactly like `log`, except a saturated `OverflowPolicy::Block`
+    /// slot makes this **yield the task** (awaiting mailbox room) instead of
+    /// parking the calling thread. Use it on an async runtime, where parking a
+    /// worker on a slow `Block` sink would stall the executor (and deadlock a
+    /// single-threaded runtime); sync callers keep using [`log`](Logger::log).
+    ///
+    /// It awaits room to *enqueue*, never the sink *write* — the same hand-off
+    /// point as `log`. Cancelling the returned future while a slot is
+    /// backpressured drops that entry (ADR 0009's cancellation contract).
+    #[cfg(feature = "async-log")]
+    pub async fn log_async(&self, entry: LogInfo) {
+        if !self.is_level_enabled(&entry.level) {
+            return;
+        }
+        let routing = self.routing.load_full();
+        routing.process_entry_async(Arc::new(entry)).await;
+    }
+
     /// Constructs and logs an entry only if the level passes the filter.
     /// The closure is never called for levels that would be discarded.
     pub fn log_lazy(&self, level: &str, f: impl FnOnce() -> LogInfo) {
@@ -1606,6 +1626,87 @@ mod tests {
             let _ = a_permit_tx.unbounded_send(());
         }
         let _ = producer.join();
+    }
+
+    #[cfg(feature = "async-log")]
+    #[test]
+    fn test_log_async_delivers_through_block_slot() {
+        let transport = TestTransport::new();
+        let lt = LoggerTransport::new(transport.clone())
+            .with_queue_capacity(4)
+            .with_overflow_policy(OverflowPolicy::Block);
+        let logger = Logger::builder().transport(lt).build();
+
+        // Cap 4, 3 entries: every push succeeds in phase 1, exercising the
+        // async dispatch composition end to end (the await path is covered by
+        // the saturation test below and the mailbox unit tests).
+        futures::executor::block_on(async {
+            logger.log_async(LogInfo::new("info", "a")).await;
+            logger.log_async(LogInfo::new("info", "b")).await;
+            logger.log_async(LogInfo::new("info", "c")).await;
+        });
+        // flush() is sync (its own block_on) — call it outside the block_on.
+        logger.flush().unwrap();
+
+        let msgs: Vec<String> =
+            transport.get_logs().into_iter().map(|l| l.message).collect();
+        assert_eq!(msgs, vec!["a", "b", "c"]);
+    }
+
+    #[cfg(feature = "async-log")]
+    #[test]
+    fn test_log_async_yields_under_saturated_block_slot() {
+        // A gated sink stalls until permitted, so a cap-1 Block mailbox
+        // saturates and log_async must AWAIT room. If it parked the thread (or
+        // the async send never woke), this block_on would deadlock — completion
+        // proves the cooperative yield and the cross-thread wake work end to end.
+        struct GatedRecorder {
+            permits: futures::channel::mpsc::UnboundedReceiver<()>,
+            logs: Arc<Mutex<Vec<String>>>,
+        }
+        impl Transport for GatedRecorder {
+            async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
+                let _ = self.permits.next().await;
+                self.logs.lock().unwrap().push(entry.info.message.clone());
+                Ok(())
+            }
+        }
+
+        let (permit_tx, permits) = futures::channel::mpsc::unbounded::<()>();
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let transport = GatedRecorder {
+            permits,
+            logs: Arc::clone(&logs),
+        };
+        let lt = LoggerTransport::new(transport)
+            .with_queue_capacity(1)
+            .with_overflow_policy(OverflowPolicy::Block);
+        let logger = Logger::builder().transport(lt).build();
+
+        futures::executor::block_on(async {
+            let produce = async {
+                for i in 0..5 {
+                    logger
+                        .log_async(LogInfo::new("info", format!("m{i}")))
+                        .await;
+                }
+            };
+            // One permit per entry: exactly enough for all five sink writes,
+            // whenever they happen. Granting them lets the stalled sink drain,
+            // freeing mailbox room and waking the awaiting sends.
+            let unblock = async {
+                for _ in 0..5 {
+                    let _ = permit_tx.unbounded_send(());
+                }
+            };
+            futures::join!(produce, unblock);
+        });
+
+        logger.flush().unwrap();
+
+        let mut got = logs.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, vec!["m0", "m1", "m2", "m3", "m4"]);
     }
 
     #[test]
