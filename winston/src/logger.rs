@@ -1795,6 +1795,43 @@ mod tests {
         assert_eq!(logs.lock().unwrap().len() as u64, stats.dispatched_total);
     }
 
+    #[cfg(feature = "async-log")]
+    #[test]
+    fn test_log_async_macro_delivers() {
+        let transport = TestTransport::new();
+        let logger = Logger::builder().transport(transport.clone()).build();
+        futures::executor::block_on(async {
+            crate::log_async!(logger, info, "via macro").await;
+            crate::log_async!(logger, warn, "with meta", key = "val").await;
+        });
+        logger.flush().unwrap();
+
+        let logs = transport.get_logs();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].message, "via macro");
+        assert_eq!(logs[1].message, "with meta");
+        assert_eq!(
+            logs[1].meta.get("key").and_then(|v| v.as_str()),
+            Some("val")
+        );
+    }
+
+    // Generate `info_async!` to exercise the create_async_level_macros! generator.
+    #[cfg(feature = "async-log")]
+    crate::create_async_level_macros!(info);
+
+    #[cfg(feature = "async-log")]
+    #[test]
+    fn test_create_async_level_macros_generates_working_macro() {
+        let transport = TestTransport::new();
+        let logger = Logger::builder().transport(transport.clone()).build();
+        futures::executor::block_on(async {
+            info_async!(logger, "generated").await;
+        });
+        logger.flush().unwrap();
+        assert_eq!(transport.get_logs()[0].message, "generated");
+    }
+
     #[test]
     fn test_drop_oldest_evicts_head_and_delivers_newest() {
         let (permit_tx, permits) = futures::channel::mpsc::unbounded::<()>();

@@ -52,6 +52,15 @@ pub fn log(entry: logform::LogInfo) {
     global_logger().log(entry);
 }
 
+/// Async dispatch against the global logger — the cooperative twin of [`log`].
+/// Yields the task under a saturated `Block` slot instead of parking the
+/// thread. See [`Logger::log_async`](crate::Logger::log_async) for the
+/// semantics and the cancellation contract.
+#[cfg(feature = "async-log")]
+pub async fn log_async(entry: logform::LogInfo) {
+    global_logger().log_async(entry).await;
+}
+
 /// Level check against the global logger without constructing an entry.
 /// Returns `true` if the global logger is not yet initialized (let the later
 /// `log()` call handle the panic) or if the level passes the cached filter.

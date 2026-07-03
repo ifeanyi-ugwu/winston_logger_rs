@@ -15,6 +15,13 @@ pub use global::{
     add_transport, close, configure, flush, init, is_initialized, is_level_enabled, log,
     query, remove_transport, try_log,
 };
+#[cfg(feature = "async-log")]
+pub use global::log_async;
+// Re-exported so `create_async_level_macros!` can name-concat via `$crate::paste`
+// in downstream crates.
+#[cfg(feature = "async-log")]
+#[doc(hidden)]
+pub use paste;
 pub use logform as format;
 pub use logger::Logger;
 pub use logger_options::{LoggerOptions, OverflowPolicy};

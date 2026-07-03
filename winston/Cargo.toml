@@ -16,6 +16,7 @@ chrono = "0.4.38"
 crossbeam-channel = "0.5.13"
 event-listener = { version = "5", optional = true }
 futures.workspace = true
+paste = { version = "1", optional = true }
 log = { version = "0.4.28", optional = true }
 logform.workspace = true
 parking_lot = "0.12.3"
@@ -45,7 +46,7 @@ debug = true
 # mailbox `send` that yields the task (instead of parking the thread) under a
 # saturated `OverflowPolicy::Block` slot. Pulls in `event-listener`; off by
 # default so the standard build stays dependency-light (see ADR 0009).
-async-log = ["dep:event-listener"]
+async-log = ["dep:event-listener", "dep:paste"]
 log-backend = ["log"]
 #log-backend-kv = ["log-backend", "log/kv"]
 log-backend-kv = ["log-backend", "log/kv_unstable"]

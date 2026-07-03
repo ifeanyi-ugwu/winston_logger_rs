@@ -4257,6 +4257,7 @@ dependencies = [
  "log",
  "logform",
  "parking_lot",
+ "paste",
  "serde",
  "serde_json",
  "serial_test",
