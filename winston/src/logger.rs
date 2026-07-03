@@ -298,8 +298,24 @@ impl Logger {
     /// single-threaded runtime); sync callers keep using [`log`](Logger::log).
     ///
     /// It awaits room to *enqueue*, never the sink *write* — the same hand-off
-    /// point as `log`. Cancelling the returned future while a slot is
-    /// backpressured drops that entry (ADR 0009's cancellation contract).
+    /// point as `log`; await-until-durable is [`flush`](Logger::flush).
+    ///
+    /// # Cancellation
+    ///
+    /// Lossless under backpressure, **not** under cancellation. The awaiting
+    /// future holds the entry; if it is dropped (a `select!` loser, a `timeout`,
+    /// an aborted task) *while a slot is backpressured*, that slot's entry is
+    /// lost — never enqueued. An entry is only at risk while its target mailbox
+    /// is full; an un-backpressured `log_async` enqueues on the first poll and
+    /// cannot be cancel-lost.
+    ///
+    /// - **Counted, not silent** — a cancellation-loss increments the slot's
+    ///   [`cancelled_total`](crate::TransportStats::cancelled_total), distinct
+    ///   from `dropped_total` (policy drops).
+    /// - **Best-effort per transport** — on cancellation the entry stays in
+    ///   every transport that already accepted it and is dropped only for those
+    ///   still awaiting room; partial delivery across transports is possible.
+    /// - **No retry handle** — a cancelled `log_async` does not return the entry.
     #[cfg(feature = "async-log")]
     pub async fn log_async(&self, entry: LogInfo) {
         if !self.is_level_enabled(&entry.level) {
@@ -1707,6 +1723,76 @@ mod tests {
         let mut got = logs.lock().unwrap().clone();
         got.sort();
         assert_eq!(got, vec!["m0", "m1", "m2", "m3", "m4"]);
+    }
+
+    #[cfg(feature = "async-log")]
+    #[test]
+    fn test_log_async_cancellation_counts_and_does_not_enqueue() {
+        // A gated sink never drains during the test body, so a cap-1 Block
+        // mailbox saturates and further log_async futures park. Polling each
+        // once, then dropping the parked ones, must count each as a cancellation
+        // — and the entries it counted must never reach the sink.
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        struct GatedSink {
+            permits: futures::channel::mpsc::UnboundedReceiver<()>,
+            logs: Arc<Mutex<Vec<String>>>,
+        }
+        impl Transport for GatedSink {
+            async fn log(&mut self, entry: FormattedEntry) -> TransportResult<()> {
+                let _ = self.permits.next().await;
+                self.logs.lock().unwrap().push(entry.info.message.clone());
+                Ok(())
+            }
+        }
+
+        let (permit_tx, permits) = futures::channel::mpsc::unbounded::<()>();
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let lt = LoggerTransport::new(GatedSink {
+            permits,
+            logs: Arc::clone(&logs),
+        })
+        .with_queue_capacity(1)
+        .with_overflow_policy(OverflowPolicy::Block);
+        let logger = Logger::new(None);
+        let handle = logger.add_transport(lt);
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // A cap-1 Block mailbox + gated sink absorbs at most a few entries, so
+        // most of these park on their phase-2 send.
+        let futs: Vec<_> = (0..8)
+            .map(|i| Box::pin(logger.log_async(LogInfo::new("info", format!("m{i}")))))
+            .collect();
+
+        let mut parked = Vec::new();
+        for mut f in futs {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(()) => {}            // enqueued
+                Poll::Pending => parked.push(f), // backpressured
+            }
+        }
+        assert!(!parked.is_empty(), "some log_async should be backpressured");
+        let cancelled = parked.len() as u64;
+        drop(parked); // cancel the parked futures mid-await
+
+        let stats = logger.transport_stats(handle).expect("stats present");
+        // Each cancelled future is counted exactly once.
+        assert_eq!(stats.cancelled_total, cancelled);
+        // Every entry either dispatched or was cancelled — none lost or
+        // double-counted; cancellations are not policy drops.
+        assert_eq!(stats.dispatched_total + stats.cancelled_total, 8);
+        assert_eq!(stats.dropped_total, 0);
+
+        // Unblock the sink and flush: only the dispatched entries reach it —
+        // the cancelled ones were never enqueued.
+        for _ in 0..100 {
+            let _ = permit_tx.unbounded_send(());
+        }
+        logger.flush().unwrap();
+        assert_eq!(logs.lock().unwrap().len() as u64, stats.dispatched_total);
     }
 
     #[test]

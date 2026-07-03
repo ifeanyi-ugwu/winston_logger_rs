@@ -37,12 +37,19 @@ pub struct TransportStats {
     /// Entries dropped at the mailbox boundary because the mailbox was
     /// full and the slot's [`OverflowPolicy`] selected a drop variant.
     pub dropped_total: u64,
+    /// Entries lost when a `log_async` future was cancelled while this slot
+    /// was backpressured — the awaiting `send` dropped before it enqueued
+    /// (ADR 0009's cancellation contract). Distinct from `dropped_total`
+    /// (policy drops); always 0 for sync `log` and when the `async-log`
+    /// feature is off.
+    pub cancelled_total: u64,
 }
 
 #[derive(Default)]
 pub(crate) struct TransportStatsInner {
     dispatched_total: AtomicU64,
     dropped_total: AtomicU64,
+    cancelled_total: AtomicU64,
 }
 
 impl TransportStatsInner {
@@ -50,6 +57,37 @@ impl TransportStatsInner {
         TransportStats {
             dispatched_total: self.dispatched_total.load(Ordering::Relaxed),
             dropped_total: self.dropped_total.load(Ordering::Relaxed),
+            cancelled_total: self.cancelled_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Drop-guard for a per-slot async `send`: armed on entry, disarmed when the
+/// send returns. If the enclosing `log_async` future is cancelled (dropped)
+/// while the send is still awaiting room, this fires on drop and records the
+/// lost entry in `cancelled_total` — a cancellation is counted, not silently
+/// lost (ADR 0009). A completed or errored send disarms it first.
+#[cfg(feature = "async-log")]
+struct CancelGuard<'a> {
+    stats: &'a TransportStatsInner,
+    armed: bool,
+}
+
+#[cfg(feature = "async-log")]
+impl<'a> CancelGuard<'a> {
+    fn armed(stats: &'a TransportStatsInner) -> Self {
+        Self { stats, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "async-log")]
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stats.cancelled_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -607,7 +645,12 @@ impl Routing {
         let sends = deferred_blocks.into_iter().map(|(idx, msg)| {
             let slot = Arc::clone(&self.slots[idx]);
             async move {
-                if slot.mailbox_tx.send(msg).await.is_ok() {
+                // Count a cancellation (future dropped mid-await) unless the
+                // send returns first (ADR 0009's cancellation contract).
+                let mut guard = CancelGuard::armed(&slot.stats);
+                let sent = slot.mailbox_tx.send(msg).await;
+                guard.disarm();
+                if sent.is_ok() {
                     slot.stats.dispatched_total.fetch_add(1, Ordering::Relaxed);
                 }
             }
