@@ -14,6 +14,7 @@ categories = ["development-tools::debugging"]
 arc-swap = "1.7"
 chrono = "0.4.38"
 crossbeam-channel = "0.5.13"
+event-listener = { version = "5", optional = true }
 futures.workspace = true
 log = { version = "0.4.28", optional = true }
 logform.workspace = true
@@ -40,6 +41,11 @@ harness = false
 debug = true
 
 [features]
+# Opt-in async logging door: `Logger::log_async` / `info_async!` and the async
+# mailbox `send` that yields the task (instead of parking the thread) under a
+# saturated `OverflowPolicy::Block` slot. Pulls in `event-listener`; off by
+# default so the standard build stays dependency-light (see ADR 0009).
+async-log = ["dep:event-listener"]
 log-backend = ["log"]
 #log-backend-kv = ["log-backend", "log/kv"]
 log-backend-kv = ["log-backend", "log/kv_unstable"]
