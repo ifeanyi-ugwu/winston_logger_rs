@@ -29,6 +29,7 @@ winston_transport.workspace = true
 [dev-dependencies]
 criterion = "0.5.1"
 serial_test = "3.2.0"
+tokio = { workspace = true, features = ["macros"] }
 
 [[bench]]
 name = "logger_benchmark"
@@ -37,6 +38,10 @@ harness = false
 [[bench]]
 name = "queue_depth"
 harness = false
+
+[[example]]
+name = "async_backpressure"
+required-features = ["async-log"]
 
 [profile.bench]
 debug = true
