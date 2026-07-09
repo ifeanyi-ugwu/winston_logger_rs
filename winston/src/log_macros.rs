@@ -139,6 +139,58 @@ macro_rules! create_log_methods {
     };
 }
 
+/// Async twin of [`create_log_methods!`]: generates an `AsyncLoggerMethods`
+/// trait (and its impl on [`Logger`](crate::Logger)) with an
+/// `async fn ${level}_async` per level, dispatching through `log_async`. The
+/// `_async` suffix keeps them from colliding with the sync
+/// [`create_log_methods!`] methods; call them with `.await`. Opt-in behind the
+/// `async-log` feature.
+///
+/// ```ignore
+/// winston::create_async_log_methods!(info, warn, error);
+/// use winston::AsyncLoggerMethods as _; // bring the methods into scope
+/// logger.info_async("ready", None).await;
+/// ```
+#[cfg(feature = "async-log")]
+#[macro_export]
+macro_rules! create_async_log_methods {
+    ($($level:ident),* $(,)?) => {
+        $crate::paste::paste! {
+            #[allow(async_fn_in_trait)]
+            pub trait AsyncLoggerMethods {
+                $(
+                    async fn [<$level _async>](
+                        &self,
+                        message: &str,
+                        metadata: Option<Vec<(&'static str, serde_json::Value)>>,
+                    );
+                )*
+            }
+
+            impl AsyncLoggerMethods for $crate::Logger {
+                $(
+                    async fn [<$level _async>](
+                        &self,
+                        message: &str,
+                        metadata: Option<Vec<(&'static str, serde_json::Value)>>,
+                    ) {
+                        if self.is_level_enabled(stringify!($level)) {
+                            let mut entry =
+                                $crate::format::LogInfo::new(stringify!($level), message);
+                            if let Some(meta) = metadata {
+                                for (key, value) in meta {
+                                    entry = entry.with_meta(key, value);
+                                }
+                            }
+                            self.log_async(entry).await;
+                        }
+                    }
+                )*
+            }
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! create_level_macros {
     ($($level:ident),*) => {

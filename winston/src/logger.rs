@@ -282,6 +282,12 @@ impl Logger {
     /// Sync dispatch to every slot. Under `OverflowPolicy::Block` this
     /// parks the calling thread on the slot's `Condvar` until room appears
     /// — the slowest Block slot sets the producer's rate.
+    #[cfg_attr(
+        feature = "async-log",
+        doc = "",
+        doc = "On an async runtime, prefer [`log_async`](Logger::log_async), which yields the",
+        doc = "task under a saturated `Block` slot instead of parking the worker."
+    )]
     pub fn log(&self, entry: LogInfo) {
         if !self.is_level_enabled(&entry.level) {
             return;
@@ -1830,6 +1836,22 @@ mod tests {
         });
         logger.flush().unwrap();
         assert_eq!(transport.get_logs()[0].message, "generated");
+    }
+
+    // Generate the `AsyncLoggerMethods` trait to exercise the method generator.
+    #[cfg(feature = "async-log")]
+    crate::create_async_log_methods!(info);
+
+    #[cfg(feature = "async-log")]
+    #[test]
+    fn test_create_async_log_methods_generates_working_method() {
+        let transport = TestTransport::new();
+        let logger = Logger::builder().transport(transport.clone()).build();
+        futures::executor::block_on(async {
+            logger.info_async("via method", None).await;
+        });
+        logger.flush().unwrap();
+        assert_eq!(transport.get_logs()[0].message, "via method");
     }
 
     #[test]

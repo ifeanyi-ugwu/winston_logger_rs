@@ -48,6 +48,13 @@ pub fn is_initialized() -> bool {
     GLOBAL_LOGGER.get().is_some()
 }
 
+/// Log against the global logger.
+#[cfg_attr(
+    feature = "async-log",
+    doc = "",
+    doc = "On an async runtime, prefer [`log_async`](crate::log_async()), which yields the",
+    doc = "task under a saturated `Block` slot instead of parking the worker."
+)]
 pub fn log(entry: logform::LogInfo) {
     global_logger().log(entry);
 }
