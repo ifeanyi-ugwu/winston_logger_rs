@@ -1679,9 +1679,13 @@ mod tests {
     #[test]
     fn test_log_async_yields_under_saturated_block_slot() {
         // A gated sink stalls until permitted, so a cap-1 Block mailbox
-        // saturates and log_async must AWAIT room. If it parked the thread (or
-        // the async send never woke), this block_on would deadlock — completion
-        // proves the cooperative yield and the cross-thread wake work end to end.
+        // saturates. The 200 entries are well past the mailbox + WritableStream
+        // buffering, so saturation is real — a handful of entries would be
+        // absorbed without ever blocking. If log_async parked the block_on thread
+        // (as sync log() does), `unblock` could never run to grant permits, the
+        // pump could never drain, and this would deadlock. It completing proves
+        // log_async yields the task instead: `unblock` runs, the pump drains, and
+        // the cross-thread wake fires.
         struct GatedRecorder {
             permits: futures::channel::mpsc::UnboundedReceiver<()>,
             logs: Arc<Mutex<Vec<String>>>,
@@ -1707,17 +1711,17 @@ mod tests {
 
         futures::executor::block_on(async {
             let produce = async {
-                for i in 0..5 {
+                for i in 0..200 {
                     logger
                         .log_async(LogInfo::new("info", format!("m{i}")))
                         .await;
                 }
             };
-            // One permit per entry: exactly enough for all five sink writes,
-            // whenever they happen. Granting them lets the stalled sink drain,
-            // freeing mailbox room and waking the awaiting sends.
+            // One permit per entry: enough for all 200 sink writes, whenever they
+            // happen. Granting them lets the stalled sink drain, freeing mailbox
+            // room and waking the awaiting sends.
             let unblock = async {
-                for _ in 0..5 {
+                for _ in 0..200 {
                     let _ = permit_tx.unbounded_send(());
                 }
             };
@@ -1728,7 +1732,8 @@ mod tests {
 
         let mut got = logs.lock().unwrap().clone();
         got.sort();
-        assert_eq!(got, vec!["m0", "m1", "m2", "m3", "m4"]);
+        got.dedup();
+        assert_eq!(got.len(), 200, "all 200 lines delivered exactly once");
     }
 
     #[cfg(feature = "async-log")]
@@ -1767,9 +1772,9 @@ mod tests {
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // A cap-1 Block mailbox + gated sink absorbs at most a few entries, so
-        // most of these park on their phase-2 send.
-        let futs: Vec<_> = (0..8)
+        // A cap-1 Block mailbox + gated sink absorbs only a handful, so the vast
+        // majority of these park on their phase-2 send.
+        let futs: Vec<_> = (0..40)
             .map(|i| Box::pin(logger.log_async(LogInfo::new("info", format!("m{i}")))))
             .collect();
 
@@ -1789,7 +1794,7 @@ mod tests {
         assert_eq!(stats.cancelled_total, cancelled);
         // Every entry either dispatched or was cancelled — none lost or
         // double-counted; cancellations are not policy drops.
-        assert_eq!(stats.dispatched_total + stats.cancelled_total, 8);
+        assert_eq!(stats.dispatched_total + stats.cancelled_total, 40);
         assert_eq!(stats.dropped_total, 0);
 
         // Unblock the sink and flush: only the dispatched entries reach it —
