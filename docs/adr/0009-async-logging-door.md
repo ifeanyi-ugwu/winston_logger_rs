@@ -1,6 +1,6 @@
 # ADR 0009 — Async logging door (cooperative backpressure)
 
-**Status:** Accepted — phased rollout, not yet implemented (see [Rollout](#rollout-phased)).
+**Status:** Accepted and implemented (Phases 0–4; see [Rollout](#rollout-phased)).
 
 Adds the opt-in async path that [ADR 0002](0002-direct-dispatch-backpressure.md)
 scoped out. 0002 rejected *replacing* sync `log()` with `async fn log`; this ADR
@@ -205,6 +205,7 @@ the one precise way a log can still be lost.
 
 Each phase is independently shippable and its own commit set (lib / tests /
 examples split per repo discipline). The risky concurrency work is isolated first.
+**All five phases have landed.**
 
 - **Phase 0 — the waiter primitive.** `event-listener`-backed `send()`, feature-gated.
   No public API. Tested by a multi-producer async-send case that fails on the
@@ -215,9 +216,11 @@ examples split per repo discipline). The risky concurrency work is isolated firs
 - **Phase 2 — the cancellation contract.** `cancelled_total` + drop-guard, contract
   written onto `log_async`'s docs. Tested by cancelling a backpressured `log_async`
   and asserting the counter ticks and the entry did not land.
-- **Phase 3 — global + macros.** `global::log_async`; `create_async_level_macros!`.
-- **Phase 4 (optional) — polish.** Trait methods, an async-handler example on the
-  must-not-drop lane, doc cross-links.
+- **Phase 3 — global + macros.** `global::log_async`; the `log_async!` base macro
+  and the `create_async_level_macros!` generator (`info_async!`, via `paste`).
+- **Phase 4 — polish.** `create_async_log_methods!` (async trait methods), the
+  `winston/examples/async_backpressure.rs` current-thread-runtime example, and the
+  `log`↔`log_async` doc cross-links.
 
 ## References
 
